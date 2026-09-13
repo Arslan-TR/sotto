@@ -924,9 +924,19 @@ tag. The full operator procedure, including the rehearsal record you must comple
    it from GitHub Actions, which reads the repository secret `SOTTO_DELETION_METRICS_TOKEN` and
    the repository variable `SOTTO_PUBLIC_URL`; substitute your own equivalents:
 
+   **Pipe the value in; do not type it.** Whatever holds the copy, the token should reach it from
+   the secret store rather than through a command line, because an argument is visible to `ps`
+   while the command runs and stays in shell history afterwards. That is the same rule this
+   document applies to the deployment variable itself.
+
    ```sh
-   gh secret set SOTTO_DELETION_METRICS_TOKEN --body '<the same value as the deployment variable>'
-   gh variable set SOTTO_PUBLIC_URL --body 'https://your.domain'   # already set if you collect status
+   # Run where deploy/.env lives. `gh secret set` reads standard input when --body is omitted, so
+   # the value is never an argument and never echoed.
+   grep -m1 '^SOTTO_ORGANISATION_DELETION_METRICS_TOKEN=' .env | cut -d= -f2- \
+     | gh secret set SOTTO_DELETION_METRICS_TOKEN --repo <owner>/<repo>
+
+   # The URL is not a secret.
+   gh variable set SOTTO_PUBLIC_URL --body 'https://your.domain' --repo <owner>/<repo>
    ```
 
    Rotating the deployment's token means setting this one again. Nothing checks that they agree;
