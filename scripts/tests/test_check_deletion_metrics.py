@@ -66,12 +66,54 @@ class Parsing(unittest.TestCase):
         parsed = check.parse('some_metric{state="a\\"b"} 1')
         self.assertEqual(check.value(parsed, "some_metric", state='a"b'), 1.0)
 
-    def test_a_value_that_is_not_a_finite_number_is_dropped(self):
-        # NaN is the dangerous one: every threshold below compares with `>`, and `NaN > 0` is
-        # false, so keeping it would let an unreadable reading answer "nothing is wrong".
+    def test_a_value_that_is_not_a_finite_number_is_recorded_as_unreadable(self):
+        # NaN is the dangerous one: every threshold compares with `>`, and `NaN > 0` is false, so
+        # keeping it would let an unreadable reading answer "nothing is wrong". Dropping it
+        # silently does the same by a longer route, because an absent series reads as zero. So it
+        # is neither kept nor dropped: it is remembered as a thing that could not be read.
         for bad in ("NaN", "+Inf", "-Inf", "banana"):
             parsed = check.parse(f"sotto_organisation_deletion_purge_due_count {bad}")
             self.assertIsNone(check.value(parsed, check.ALWAYS_PRESENT), bad)
+            self.assertEqual(check.unreadable_watched(parsed), ["the count of operations due for purge"], bad)
+
+
+class UnreadableSeries(unittest.TestCase):
+    """A series that is present and unreadable is neither absent nor healthy.
+
+    On this exporter absence is health, so the two must not collapse into each other. The scenario
+    below is the one that matters: a scrape that looks complete, answers every rule with silence,
+    and reports that deletion is fine on the strength of a number nobody could read.
+    """
+
+    def test_an_unreadable_alerting_series_is_not_mistaken_for_an_absent_one(self):
+        payload = "\n".join(
+            [
+                "sotto_organisation_deletion_purge_due_count 0",
+                'sotto_organisation_deletion_operations{state="failed"} NaN',
+            ]
+        )
+        parsed = check.parse(payload)
+        self.assertTrue(check.is_exporter_output(parsed))
+        self.assertEqual(check.findings(parsed), [], "the rules genuinely cannot see it")
+        self.assertEqual(check.unreadable_watched(parsed), ["the count of failed operations"])
+
+    def test_an_unreadable_series_no_rule_reads_is_ignored(self):
+        # Rubbish in a metric nothing here looks at says nothing about deletion, and must not stop
+        # the three rules that can still be answered.
+        payload = "\n".join(
+            [
+                "sotto_organisation_deletion_purge_due_count 0",
+                "sotto_organisation_deletion_purge_duration_maximum_seconds NaN",
+                'sotto_organisation_deletion_attempts_total{metric="purge_attempts"} NaN',
+            ]
+        )
+        self.assertEqual(check.unreadable_watched(check.parse(payload)), [])
+
+    def test_an_unreadable_unconditional_gauge_is_still_the_exporter(self):
+        # Otherwise this reports "that was not the exporter" for a response that plainly was, and
+        # sends whoever reads it looking for a proxy problem instead of a broken counter.
+        parsed = check.parse("sotto_organisation_deletion_purge_due_count NaN")
+        self.assertTrue(check.is_exporter_output(parsed))
 
     def test_a_missing_series_reads_as_absent_rather_than_zero(self):
         self.assertIsNone(check.value(check.parse(QUIET), check.OPERATIONS, state="failed"))
@@ -223,6 +265,17 @@ class ExitCodes(unittest.TestCase):
 
     def test_an_unreachable_endpoint_is_two_not_an_alert(self):
         self.assertEqual(self.run_with(raises=urllib.error.URLError("no route")), 2)
+
+    def test_an_unreadable_alerting_series_is_two_not_zero(self):
+        # The whole point of the distinction: this scrape looks complete and answers every rule
+        # with silence, and without the check it exits 0 and says deletion is healthy.
+        payload = "\n".join(
+            [
+                "sotto_organisation_deletion_purge_due_count 0",
+                'sotto_organisation_deletion_operations{state="failed"} NaN',
+            ]
+        )
+        self.assertEqual(self.run_with(payload), 2)
 
     def test_a_response_that_is_not_the_exporter_is_two_not_zero(self):
         # The failure this whole check would otherwise have: a proxy error page parses to nothing,

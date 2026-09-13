@@ -24,6 +24,7 @@ written here reaches a public issue, so it carries counts and ages and nothing e
 """
 
 import argparse
+import dataclasses
 import http.client
 import os
 import re
@@ -59,14 +60,38 @@ SAMPLE = re.compile(
 LABEL = re.compile(r'(?P<key>[A-Za-z_][A-Za-z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
 
 
+@dataclasses.dataclass(frozen=True)
+class Reading:
+    """A parsed scrape: the series that were readable, and the keys of those that were not.
+
+    The two are kept apart because on this exporter they mean opposite things. A series that is
+    absent is healthy, since every per-state series comes from a `GROUP BY` over an empty table.
+    A series that is present and unreadable is not healthy and is not absent, and folding it into
+    the first would answer every threshold below with silence.
+    """
+
+    values: dict
+    unreadable: frozenset
+
+
+#: The series any rule below reads, with the words to use when one of them cannot be read.
+WATCHED = (
+    ((OPERATIONS, (("state", "failed"),)), "the count of failed operations"),
+    ((ALWAYS_PRESENT, ()), "the count of operations due for purge"),
+    ((OLDEST_AGE, (("state", "cancelling_billing"),)), "the age of the oldest billing cancellation"),
+)
+
+
 def parse(text):
-    """Prometheus text into `{(name, sorted label pairs): value}`.
+    """Prometheus text into a [`Reading`].
 
     Lenient about lines it does not recognise and strict about values. A sample whose value is not
-    a finite number is dropped rather than kept, because `NaN > 0` is false: keeping one would let
-    an unreadable reading answer every threshold below with "no, everything is fine".
+    a finite number is recorded as unreadable rather than kept: `NaN > 0` is false, so keeping one
+    would let it answer every threshold with "no, nothing is wrong". Dropping it silently would do
+    the same thing by a longer route, because an absent series is read as zero.
     """
-    reading = {}
+    values = {}
+    unreadable = set()
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -74,30 +99,42 @@ def parse(text):
         match = SAMPLE.match(line)
         if match is None:
             continue
-        try:
-            number = float(match.group("value"))
-        except ValueError:
-            continue
-        if number != number or number in (float("inf"), float("-inf")):
-            continue
         labels = tuple(
             sorted(
                 (found.group("key"), re.sub(r"\\(.)", r"\1", found.group("value")))
                 for found in LABEL.finditer(match.group("labels") or "")
             )
         )
-        reading[(match.group("name"), labels)] = number
-    return reading
+        key = (match.group("name"), labels)
+        try:
+            number = float(match.group("value"))
+        except ValueError:
+            unreadable.add(key)
+            continue
+        if number != number or number in (float("inf"), float("-inf")):
+            unreadable.add(key)
+            continue
+        values[key] = number
+    return Reading(values=values, unreadable=frozenset(unreadable))
 
 
 def value(reading, name, **labels):
     """One series, or None when it was not emitted."""
-    return reading.get((name, tuple(sorted(labels.items()))))
+    return reading.values.get((name, tuple(sorted(labels.items()))))
+
+
+def unreadable_watched(reading):
+    """The rules that cannot be decided from this scrape, in words. Empty when all of them can.
+
+    Only the series a rule actually reads. An unknown metric arriving as rubbish says nothing
+    about deletion and should not stop the three that can still be answered.
+    """
+    return [words for key, words in WATCHED if key in reading.unreadable]
 
 
 def is_exporter_output(reading):
     """Whether this reading came from the exporter at all. See ALWAYS_PRESENT."""
-    return value(reading, ALWAYS_PRESENT) is not None
+    return (ALWAYS_PRESENT, ()) in reading.values or (ALWAYS_PRESENT, ()) in reading.unreadable
 
 
 def findings(reading):
@@ -191,7 +228,16 @@ def main(argv=None):
         )
         return 2
 
-    print(f"read {len(reading)} series; retention operations due for purge: "
+    if blind := unreadable_watched(reading):
+        # Present but unreadable, which is neither absent nor fine. Saying nothing here would
+        # publish "no deletion needs attention" on the strength of a number nobody could read.
+        print(
+            f"the exporter answered but {', '.join(blind)} could not be read",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"read {len(reading.values)} series; retention operations due for purge: "
           f"{value(reading, ALWAYS_PRESENT):.0f}")
     problems = findings(reading)
     if not problems:
