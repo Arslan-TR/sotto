@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS cli_login_codes (
     expires_at TIMESTAMPTZ NOT NULL
 );
 
+-- The code branch sweeps expired rows on every callback; index the sweep like 0013 does for
+-- oauth_logins, so a flood of abandoned codes stays cheap instead of re-scanning the table.
+CREATE INDEX IF NOT EXISTS cli_login_codes_expires_at_idx ON cli_login_codes (expires_at);
+
 ALTER TABLE oauth_logins ADD COLUMN IF NOT EXISTS wants_code BOOLEAN NOT NULL DEFAULT FALSE;
 
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS via_legacy_cli BOOLEAN NOT NULL DEFAULT FALSE;
