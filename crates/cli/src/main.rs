@@ -607,6 +607,12 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
                 report.rotated.len(),
                 report.grants_deleted,
             );
+            if !report.orphaned.is_empty() {
+                eprintln!(
+                    "warning: {user_id} was the only member holding environment(s) {}; they were not re-keyed, and no remaining member holds a grant to them",
+                    report.orphaned.join(", ")
+                );
+            }
             for token in &report.revoked_tokens {
                 eprintln!(
                     "revoked machine token `{}` ({}) in environment {}; recreate it if the team still needs it",

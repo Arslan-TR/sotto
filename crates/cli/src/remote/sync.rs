@@ -1616,10 +1616,15 @@ mod tests {
         let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
 
         // Alice loses her own grant (another rotation dropped her): she can no longer open the env.
+        // Carol still holds it, so it is not Bob's alone and someone could still re-key it.
         api.state
             .borrow_mut()
             .grants
             .remove(&(env_id.clone(), "test-user".to_string()));
+        api.state.borrow_mut().grants.insert(
+            (env_id.clone(), "carol-user".to_string()),
+            "opaque".to_string(),
+        );
 
         // Removal is a hard failure naming the env - and Bob's membership survives it, so the
         // admin knows the offboarding did not happen rather than believing it succeeded.
@@ -1698,6 +1703,52 @@ mod tests {
             api.list_machine_tokens(&env_id).unwrap().is_empty(),
             "the removed member's token is revoked, not re-sealed and live"
         );
+    }
+
+    #[test]
+    fn removal_completes_when_the_member_alone_holds_an_env() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // An env only Bob holds: nobody else could re-key it, and nobody else can write to it.
+        api.state.borrow_mut().grants.insert(
+            ("zz-bob-alone".to_string(), "bob-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        // The removal completes rather than leaving Bob impossible to remove: the shared env is
+        // rotated, his own env is reported, and his grant to it goes with the membership.
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id]);
+        assert_eq!(report.orphaned, vec!["zz-bob-alone".to_string()]);
+        assert!(api
+            .member_env_grants(&org_id, "bob-user")
+            .unwrap()
+            .is_empty());
+        assert!(!api
+            .list_members(&org_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.user_id == "bob-user"));
     }
 
     #[test]

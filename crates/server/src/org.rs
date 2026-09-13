@@ -764,9 +764,11 @@ struct RemovalReceipt {
 /// Removal revokes every access path the member had, atomically: their `environment_grants` rows
 /// and every machine token they created in the org's environments are revoked in the same
 /// transaction as the membership delete, so a partial failure cannot leave a half-revoked state.
-/// The caller must hold a grant to every environment the target could decrypt (i.e. be able to
-/// re-key each one) - otherwise the removal fails with `409` naming those environments, rather
-/// than proceeding with silently skipped rotations.
+/// The caller must hold a grant to every environment the target could decrypt that someone else
+/// also holds - otherwise the removal fails with `409` naming those environments, rather than
+/// proceeding with silently skipped rotations. This checks for the grant row a caller able to
+/// re-key would have; the server cannot tell whether a sealed key opens, so it catches a client
+/// that skipped a rotation, not an admin set on getting past it.
 async fn remove_member(
     State(state): State<AppState>,
     user: AuthUser,
@@ -807,11 +809,16 @@ async fn remove_member(
 
     // The caller must be able to re-key every environment the target could decrypt: without a
     // rotation the target's cached vault keys stay valid, so an environment the caller cannot
-    // open is a hard failure naming it, never a silent skip.
+    // open is a hard failure naming it, never a silent skip. The exception is an environment
+    // nobody else holds: nobody could re-key it, and nobody else can write a secret there for the
+    // target's key to read, so demanding a rotation would only make the target unremovable.
     let target_envs: Vec<String> = sqlx::query_scalar(
         "SELECT eg.env_id FROM environment_grants eg \
          JOIN environments e ON eg.env_id = e.id JOIN projects p ON e.project_id = p.id \
-         WHERE p.org_id = $1 AND eg.user_id = $2 ORDER BY eg.env_id",
+         WHERE p.org_id = $1 AND eg.user_id = $2 \
+           AND EXISTS (SELECT 1 FROM environment_grants peer \
+                       WHERE peer.env_id = eg.env_id AND peer.user_id <> $2) \
+         ORDER BY eg.env_id",
     )
     .bind(&org_id)
     .bind(&target)

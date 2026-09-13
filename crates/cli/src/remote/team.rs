@@ -362,6 +362,10 @@ pub fn rotate_env(
 #[derive(Debug, Clone)]
 pub struct RemovalReport {
     pub rotated: Vec<String>,
+    /// Environments the member alone held a grant to. Nobody else could re-key them, and nobody
+    /// else can write a secret there for the member's cached key to read, so they are not rotated;
+    /// once the removal lands, no remaining member holds a grant to them.
+    pub orphaned: Vec<String>,
     pub revoked_tokens: Vec<super::api::RevokedTokenInfo>,
     pub grants_deleted: i64,
 }
@@ -371,7 +375,9 @@ pub struct RemovalReport {
 ///
 /// An environment this caller holds no grant to is a hard failure, not a warning: removing the
 /// member without re-keying it would leave their cached vault key valid. (The server enforces the
-/// same precondition, so an old client cannot silently skip either.)
+/// same precondition, so an old client cannot silently skip either.) The exception is an
+/// environment the member alone holds: nobody could re-key it and nobody else can write to it, so
+/// it is reported as orphaned rather than making the member impossible to remove.
 ///
 /// Every environment is checked before any is rotated. Rotation must re-seal the new vault key to
 /// every active machine token, the member's own included, and the server revokes those only at
@@ -383,13 +389,18 @@ pub fn remove_member(
     org_id: &str,
     user_id: &str,
 ) -> Result<RemovalReport> {
-    let envs = api.member_env_grants(org_id, user_id)?;
+    let mut to_rotate = Vec::new();
+    let mut orphaned = Vec::new();
     let mut blocked = Vec::new();
-    for env_id in &envs {
-        match api.get_grant(env_id)? {
+    for env_id in api.member_env_grants(org_id, user_id)? {
+        match api.get_grant(&env_id)? {
             // Open it as well: a grant we hold but cannot open would fail the rotation part way.
-            Some(grant) => vault::open_vault_key(keypair, &b64decode(&grant)?)?.zeroize(),
-            None => blocked.push(env_id.as_str()),
+            Some(grant) => {
+                vault::open_vault_key(keypair, &b64decode(&grant)?)?.zeroize();
+                to_rotate.push(env_id);
+            }
+            None if api.list_grant_holders(&env_id)? == [user_id] => orphaned.push(env_id),
+            None => blocked.push(env_id),
         }
     }
     if !blocked.is_empty() {
@@ -400,7 +411,7 @@ pub fn remove_member(
         )));
     }
     let mut rotated = Vec::new();
-    for env_id in envs {
+    for env_id in to_rotate {
         // Checked above, so `None` here means a concurrent rotation dropped our grant in between.
         if rotate_env(api, keypair, org_id, &env_id, Some(user_id))?.is_none() {
             return Err(Error::Conflict(format!(
@@ -413,6 +424,7 @@ pub fn remove_member(
     let receipt = api.remove_member(org_id, user_id)?;
     Ok(RemovalReport {
         rotated,
+        orphaned,
         revoked_tokens: receipt.revoked_tokens,
         grants_deleted: receipt.grants_deleted,
     })

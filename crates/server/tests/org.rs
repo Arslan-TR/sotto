@@ -863,3 +863,51 @@ async fn readded_member_starts_grantless() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn an_env_only_the_target_holds_does_not_block_removal() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("rm-sole-o", "rm-sole-p", "rm-sole-e");
+    let owner = seed_org_env(&pool, o, p, e, "rm-sole-owner").await;
+    let target = fresh_session(&pool, "rm-sole-target", "rm-sole-target-s").await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("rm-sole-target", "admin"),
+    )
+    .await;
+    // The target creates their own project and env in the org, so they alone hold its grant.
+    let (tp, te) = ("rm-sole-tp", "rm-sole-te");
+    post(&pool, &target, "/projects", org_project_body(tp, o)).await;
+    post(
+        &pool,
+        &target,
+        &format!("/projects/{tp}/environments"),
+        env_body(te),
+    )
+    .await;
+    let holders: Vec<String> =
+        sqlx::query_scalar("SELECT user_id FROM environment_grants WHERE env_id = $1")
+            .bind(te)
+            .fetch_all(&pool)
+            .await
+            .expect("holders");
+    assert_eq!(holders, vec!["rm-sole-target".to_string()], "precondition");
+
+    // The owner cannot open it, and nobody else ever could, so there is nothing to re-key and
+    // nobody to protect: the removal goes through instead of 409ing forever, and the grant still
+    // dies with the membership.
+    let (status, body) = delete(&pool, &owner, &format!("/orgs/{o}/members/rm-sole-target")).await;
+    assert_eq!(status, StatusCode::OK, "removal: {body}");
+    let receipt: Value = serde_json::from_str(&body).expect("receipt json");
+    assert_eq!(receipt["grants_deleted"], 1);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM environment_grants WHERE env_id = $1")
+        .bind(te)
+        .fetch_one(&pool)
+        .await
+        .expect("count grants");
+    assert_eq!(left, 0, "no grant to the env survives the removal");
+}
