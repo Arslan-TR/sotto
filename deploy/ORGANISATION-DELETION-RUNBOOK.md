@@ -15,7 +15,9 @@ record.
 - Arrange alerting on the exporter, and test one notification without using a real deletion. If
   you run Prometheus, load [`ORGANISATION-DELETION-ALERTS.yml`](ORGANISATION-DELETION-ALERTS.yml).
   If you do not, `scripts/check-deletion-metrics` decides three of those five rules from a single
-  scrape; this repository runs it six-hourly from `.github/workflows/deletion-alerts.yml`. That
+  scrape, under any scheduler: it takes `--url`, reads the token from `DELETION_METRICS_TOKEN`,
+  and exits 0, 1 or 2 for nothing to do, something to do, and could not tell. This repository runs
+  it six-hourly from `.github/workflows/deletion-alerts.yml` as one worked example. That
   workflow reads its own copy of the token as the repository secret `SOTTO_DELETION_METRICS_TOKEN`
   and the target as the repository variable `SOTTO_PUBLIC_URL`, so setting
   `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` on the deployment alone leaves every scheduled run

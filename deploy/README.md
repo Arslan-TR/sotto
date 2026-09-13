@@ -913,12 +913,16 @@ tag. The full operator procedure, including the rehearsal record you must comple
    [alert rules](ORGANISATION-DELETION-ALERTS.yml); everyone else can use
    `scripts/check-deletion-metrics`, which decides three of those five rules from one scrape.
 
-   **The checker runs somewhere else, so it needs its own copy of the token.** Setting the
-   deployment variable alone is not enough, and the failure is quiet in the wrong way: every
-   scheduled run exits 2 and raises an alert saying it could not check, which reads like a broken
-   deployment rather than a missing secret. This repository runs the checker from GitHub Actions,
-   where it reads the repository secret `SOTTO_DELETION_METRICS_TOKEN` and the repository variable
-   `SOTTO_PUBLIC_URL`:
+   **The checker runs somewhere else, so it needs its own copy of the token.** Any scheduler will
+   do: the script takes `--url` and reads the token from `DELETION_METRICS_TOKEN`, so cron on a
+   separate host, a CI job, or whatever your fleet already uses are all equivalent. It exits 0
+   when nothing needs attention, 1 when something does, and 2 when it could not tell, which is
+   enough to drive a notification anywhere.
+
+   What matters is that wherever it runs has its own copy of the token, because setting the
+   deployment variable alone leaves the checker unable to reach the exporter. This repository runs
+   it from GitHub Actions, which reads the repository secret `SOTTO_DELETION_METRICS_TOKEN` and
+   the repository variable `SOTTO_PUBLIC_URL`; substitute your own equivalents:
 
    ```sh
    gh secret set SOTTO_DELETION_METRICS_TOKEN --body '<the same value as the deployment variable>'
