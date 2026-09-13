@@ -739,6 +739,13 @@ class Observation(unittest.TestCase):
         self.assertIsInstance(urllib.error.URLError("x"), probe.TRANSPORT_FAILURES)
         self.assertIsInstance(http.client.RemoteDisconnected("x"), probe.TRANSPORT_FAILURES)
         self.assertIsInstance(TimeoutError(), probe.TRANSPORT_FAILURES)
+        # IncompleteRead specifically, because the three above are all `OSError` subclasses:
+        # RemoteDisconnected is a ConnectionResetError as well as an HTTPException, so without
+        # this line the tuple could be narrowed to `(OSError,)` and every assertion here would
+        # still pass, while the half the comment above claims to cover quietly stopped being
+        # caught. It is the only one of the four that is an HTTPException and nothing else.
+        self.assertIsInstance(http.client.IncompleteRead(b""), probe.TRANSPORT_FAILURES)
+        self.assertNotIsInstance(http.client.IncompleteRead(b""), OSError)
 
     def test_a_broken_verdict_raises_rather_than_reporting_an_outage(self):
         # The failure this guards against is subtle and bad: a defect in our own code recorded
