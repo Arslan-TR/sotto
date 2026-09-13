@@ -6,6 +6,7 @@ where nothing is wrong; and a response that is not the exporter has to be told a
 is, because both parse to nothing and only one of them means everything is fine.
 """
 
+import http.client
 import importlib.machinery
 import importlib.util
 import io
@@ -265,6 +266,22 @@ class ExitCodes(unittest.TestCase):
 
     def test_an_unreachable_endpoint_is_two_not_an_alert(self):
         self.assertEqual(self.run_with(raises=urllib.error.URLError("no route")), 2)
+
+    def test_a_truncated_response_is_two_not_an_alert(self):
+        # Raised rather than provoked, because the exception type is the thing being tested.
+        # IncompleteRead is an HTTPException and not an OSError, so an `except OSError` handler
+        # lets it escape as a traceback: Python exits 1, and the workflow publishes a peer closing
+        # a socket as somebody's organisation stuck mid-delete.
+        self.assertEqual(self.run_with(raises=http.client.IncompleteRead(b"half")), 2)
+
+    def test_the_caught_types_are_the_ones_a_network_actually_raises(self):
+        for raised in (
+            urllib.error.URLError("x"),
+            http.client.IncompleteRead(b""),
+            http.client.RemoteDisconnected("x"),
+            TimeoutError(),
+        ):
+            self.assertIsInstance(raised, check.TRANSPORT_FAILURES, type(raised).__name__)
 
     def test_an_unreadable_alerting_series_is_two_not_zero(self):
         # The whole point of the distinction: this scrape looks complete and answers every rule

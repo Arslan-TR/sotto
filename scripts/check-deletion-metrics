@@ -54,6 +54,13 @@ ALWAYS_PRESENT = "sotto_organisation_deletion_purge_due_count"
 OPERATIONS = "sotto_organisation_deletion_operations"
 OLDEST_AGE = "sotto_organisation_deletion_oldest_age_seconds"
 
+#: What a network can do to a request, matching scripts/status-probe. `urllib.error.URLError` is
+#: an `OSError`, but a body that stops arriving part-way raises `http.client.IncompleteRead`, which
+#: is an `HTTPException` and is not. Catching only `OSError` therefore let a truncated response
+#: escape as a traceback, exit 1, and be published as a deletion needing attention: a peer closing
+#: a socket reported as somebody's organisation stuck mid-delete.
+TRANSPORT_FAILURES = (OSError, http.client.HTTPException)
+
 SAMPLE = re.compile(
     r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?[ \t]+(?P<value>\S+)$"
 )
@@ -216,8 +223,8 @@ def main(argv=None):
         # fact rather than a deletion problem. The body is not quoted back: it can echo a request.
         print(f"the exporter refused the request: HTTP {error.code}", file=sys.stderr)
         return 2
-    except OSError as error:
-        print(f"could not reach the exporter: {type(error).__name__}", file=sys.stderr)
+    except TRANSPORT_FAILURES as error:
+        print(f"could not read the exporter: {type(error).__name__}", file=sys.stderr)
         return 2
 
     reading = parse(text)
