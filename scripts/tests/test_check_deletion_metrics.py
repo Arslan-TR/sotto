@@ -232,6 +232,27 @@ class Fetching(unittest.TestCase):
             )
         )
 
+    def test_the_opener_fetch_builds_carries_the_refusal(self):
+        # The half the test above missed. Asserting that NoRedirects works says nothing about
+        # whether anything uses it: swapping the default opener back to `urlopen` left every other
+        # test passing while the bearer followed redirects again.
+        seen = {}
+
+        class FakeOpener:
+            def open(self, _request, timeout=None):
+                return io.BytesIO(QUIET.encode())
+
+        def build_opener(*handlers):
+            seen["handlers"] = handlers
+            return FakeOpener()
+
+        with unittest.mock.patch.object(urllib.request, "build_opener", build_opener):
+            check.fetch("https://example.test/ops/metrics", "tok_secret")
+        self.assertTrue(
+            any(handler is check.NoRedirects for handler in seen.get("handlers", ())),
+            f"fetch built its opener without NoRedirects: {seen}",
+        )
+
 
 class ExitCodes(unittest.TestCase):
     """0 is quiet, 1 needs a person, 2 could not tell. The workflow branches on the last two, and
