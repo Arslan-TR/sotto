@@ -47,6 +47,8 @@ pub async fn login(
         .ok_or_else(|| Error::NotConfigured("oauth is not configured".into()))?;
 
     validate_redirect(&params.redirect_uri, config.web_origin.as_deref())?;
+    // Fail closed on unknown modes: this parameter is browser-facing, so defaulting to the
+    // legacy branch would put sessions back in URLs for a crafted link.
     let wants_code = match params.mode.as_deref() {
         None => false,
         Some("code") => true,
