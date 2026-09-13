@@ -136,9 +136,16 @@ pub fn authorize(server: &str) -> Result<String> {
     eprintln!("If it doesn't open, visit:\n  {url}\n");
     open_browser(&url);
 
-    match accept_callback(&listener, &state)? {
+    resolve_grant(server, accept_callback(&listener, &state)?, &state)
+}
+
+/// Turn whatever the callback carried into the session token: a legacy session is used as-is,
+/// a code is exchanged for one. A separate seam so tests pin this dispatch without a browser;
+/// returning the code itself here would persist `sc_…` as the Bearer [REDACTED] and 401 every call.
+fn resolve_grant(server: &str, grant: CallbackGrant, state: &str) -> Result<String> {
+    match grant {
         CallbackGrant::Session(token) => Ok(token),
-        CallbackGrant::Code(code) => exchange_code(server, &code, &state),
+        CallbackGrant::Code(code) => exchange_code(server, &code, state),
     }
 }
 
@@ -298,6 +305,35 @@ mod tests {
             );
         });
         (base, rx)
+    }
+
+    #[test]
+    fn resolve_grant_returns_a_legacy_session_untouched() {
+        let token = resolve_grant(
+            "https://api.sotto.dev",
+            CallbackGrant::Session("st_old".into()),
+            "cli-state",
+        )
+        .expect("session passes through");
+        assert_eq!(token, "st_old");
+    }
+
+    #[test]
+    fn resolve_grant_exchanges_a_code_instead_of_returning_it() {
+        // An unparsable server URL means the exchange fails before any I/O, so this runs
+        // anywhere with no socket; what matters is that the code arm routes into the
+        // exchange (Err) rather than handing the code back as the token (Ok), which is
+        // what this returns if the dispatch regresses to passing the code straight through.
+        let err = resolve_grant(
+            "not a url",
+            CallbackGrant::Code("sc_abc".into()),
+            "cli-state",
+        )
+        .expect_err("code arm must attempt the exchange");
+        assert!(
+            matches!(err, Error::Network(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
