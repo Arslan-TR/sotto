@@ -602,16 +602,25 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
             let keypair = session::account_keypair(store, &master)?;
             let report = remote::team::remove_member(&client, &keypair, &org_id, &user_id)?;
+            // Each rotated environment already dropped the member's grant during rotation;
+            // `grants_deleted` counts only the rows the final DELETE removed, so the total
+            // is what the member actually lost.
+            let grants_revoked = report.rotated.len() + report.grants_deleted as usize;
             eprintln!(
-                "removed {user_id}; rotated {} environment(s)",
-                report.rotated.len()
+                "removed {user_id}; rotated {} environment(s), revoked {} grant(s)",
+                report.rotated.len(),
+                grants_revoked,
             );
-            if !report.skipped.is_empty() {
+            if !report.orphaned.is_empty() {
                 eprintln!(
-                    "warning: {} environment(s) you can't open were not rotated - ask a member \
-                     who holds them to run `sotto rotate`: {}",
-                    report.skipped.len(),
-                    report.skipped.join(", ")
+                    "warning: {user_id} was the only member holding environment(s) {}; they were not re-keyed, and no remaining member holds a grant to them",
+                    report.orphaned.join(", ")
+                );
+            }
+            for token in &report.revoked_tokens {
+                eprintln!(
+                    "revoked machine token `{}` ({}) in environment {}; recreate it if the team still needs it",
+                    token.name, token.token_id, token.env_id,
                 );
             }
             Ok(())
@@ -677,7 +686,12 @@ fn token_command(
         }
         TokenCommand::Ls => {
             for t in remote::SyncApi::list_machine_tokens(&client, &env.id)? {
-                println!("{}  {}", t.token_id, t.name);
+                println!(
+                    "{}  {}  {}",
+                    t.token_id,
+                    t.name,
+                    t.created_by.as_deref().unwrap_or("(unknown creator)")
+                );
             }
             Ok(())
         }
