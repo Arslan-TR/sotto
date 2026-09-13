@@ -317,6 +317,9 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Theme resolution degrades gracefully: an undeterminable data dir or an
+    // unreadable/corrupt config only means "no saved preference" (the nord default),
+    // never a startup failure for a purely cosmetic choice.
     let config_path = sotto_cli::paths::config_path().ok();
     let themes_dir = sotto_cli::paths::themes_path().ok();
     let theme = sotto_cli::theme::resolve_theme(
@@ -327,7 +330,8 @@ fn run() -> Result<()> {
     );
 
     // An unknown requested name falls back to `nord` inside `resolve_theme`; say so rather
-    // than silently restyling (stderr, so machine-readable stdout is unaffected).
+    // than silently restyling (stderr, so machine-readable stdout is unaffected). This lookup
+    // degrades like the one in `resolve_theme`: an unreadable config is "no preference".
     let configured_theme = config_path.as_deref().and_then(|p| {
         remote::config::GlobalConfig::load_from(p)
             .ok()

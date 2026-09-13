@@ -511,6 +511,8 @@ fn resolve_theme_with(
     themes_dir: Option<&Path>,
     plain: bool,
 ) -> Theme {
+    // An unreadable or corrupt config degrades to "no saved preference" rather than failing:
+    // a cosmetic choice must never break startup (custom themes skip silently likewise).
     let configured_name = config_path.and_then(|p| {
         GlobalConfig::load_from(p)
             .ok()
