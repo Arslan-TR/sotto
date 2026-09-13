@@ -490,6 +490,26 @@ async fn list_members(
     Ok(Json(members))
 }
 
+/// Delete a user's grants across an org's environments, joining through projects so their
+/// personal environments are untouched. Returns the rows removed.
+async fn delete_org_grants(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+    user_id: &str,
+) -> Result<u64> {
+    let deleted = sqlx::query(
+        "DELETE FROM environment_grants eg \
+         USING environments e, projects p \
+         WHERE eg.env_id = e.id AND e.project_id = p.id AND p.org_id = $1 AND eg.user_id = $2",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 /// `POST /orgs/{org_id}/members` - add an existing user (admin+). Granting `owner` requires the
 /// caller to be an owner. 409 if already a member; 404 if the user does not exist.
 async fn add_member(
@@ -544,6 +564,10 @@ async fn add_member(
 
     match inserted {
         Ok(Some(_)) => {
+            // A removal from before the revocation fix could leave this user's grant rows
+            // behind; without this delete, re-adding them would silently restore their old
+            // vault key. A rejoin starts grantless - only an explicit re-share restores access.
+            delete_org_grants(&mut tx, &org_id, &body.user_id).await?;
             audit::record_tx(
                 &mut tx,
                 &org_id,
@@ -625,6 +649,8 @@ async fn invite_member(
     if inserted.is_none() {
         return Err(Error::Conflict("user is already a member".into()));
     }
+    // Same stale-grant wipe as `add_member`: an invite is the other path back in.
+    delete_org_grants(&mut tx, &org_id, &target_id).await?;
     audit::record_tx(
         &mut tx,
         &org_id,
@@ -851,16 +877,7 @@ async fn remove_member(
 
     // The target's grants die with the membership: re-adding them later starts grantless, and
     // only an explicit re-share restores decryption capability.
-    let grants_deleted = sqlx::query(
-        "DELETE FROM environment_grants eg \
-         USING environments e, projects p \
-         WHERE eg.env_id = e.id AND e.project_id = p.id AND p.org_id = $1 AND eg.user_id = $2",
-    )
-    .bind(&org_id)
-    .bind(&target)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let grants_deleted = delete_org_grants(&mut tx, &org_id, &target).await?;
 
     // Every machine token the target created in this org's environments dies too: they saw the
     // raw token and generated the machine keypair, so only revocation evicts them. Personal

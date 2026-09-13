@@ -911,3 +911,140 @@ async fn an_env_only_the_target_holds_does_not_block_removal() {
         .expect("count grants");
     assert_eq!(left, 0, "no grant to the env survives the removal");
 }
+
+/// A removal from before the revocation fix deleted the membership but left the grant row. That
+/// is the stale state both rejoin tests below start from.
+async fn seed_stale_grant(pool: &PgPool, o: &str, e: &str, target_id: &str) {
+    sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1 AND user_id = $2")
+        .bind(o)
+        .bind(target_id)
+        .execute(pool)
+        .await
+        .expect("simulate a pre-fix removal");
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environment_grants WHERE env_id = $1 AND user_id = $2",
+    )
+    .bind(e)
+    .bind(target_id)
+    .fetch_one(pool)
+    .await
+    .expect("count grants");
+    assert_eq!(grants, 1, "precondition: the stale grant row survived");
+}
+
+#[tokio::test]
+async fn rejoining_by_add_wipes_stale_grants() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("rm-stale-o", "rm-stale-p", "rm-stale-e");
+    let owner = seed_org_env(&pool, o, p, e, "rm-stale-owner").await;
+    let target = fresh_session(&pool, "rm-stale-target", "rm-stale-target-s").await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("rm-stale-target", "member"),
+    )
+    .await;
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/environments/{e}/grants"),
+            grant_body("rm-stale-target")
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    seed_stale_grant(&pool, o, e, "rm-stale-target").await;
+
+    // Re-adding wipes the stale row instead of silently restoring the old vault key.
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/orgs/{o}/members"),
+            member_body("rm-stale-target", "member"),
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environment_grants WHERE env_id = $1 AND user_id = $2",
+    )
+    .bind(e)
+    .bind("rm-stale-target")
+    .fetch_one(&pool)
+    .await
+    .expect("count grants");
+    assert_eq!(grants, 0, "re-adding wipes the stale grant");
+    assert_eq!(
+        get(&pool, Some(&target), &format!("/environments/{e}/grant"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn rejoining_by_invite_wipes_stale_grants() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("rm-stinv-o", "rm-stinv-p", "rm-stinv-e");
+    let owner = seed_org_env(&pool, o, p, e, "rm-stinv-owner").await;
+    let target = fresh_session(&pool, "rm-stinv-target", "rm-stinv-target-s").await;
+    sqlx::query("UPDATE users SET email = $2 WHERE id = $1")
+        .bind("rm-stinv-target")
+        .bind("rm-stinv-target@example.test")
+        .execute(&pool)
+        .await
+        .expect("set email");
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("rm-stinv-target", "member"),
+    )
+    .await;
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/environments/{e}/grants"),
+            grant_body("rm-stinv-target")
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    seed_stale_grant(&pool, o, e, "rm-stinv-target").await;
+
+    // The invite path back in wipes the stale row too.
+    let (status, _) = post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/invites"),
+        r#"{"email":"rm-stinv-target@example.test"}"#.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environment_grants WHERE env_id = $1 AND user_id = $2",
+    )
+    .bind(e)
+    .bind("rm-stinv-target")
+    .fetch_one(&pool)
+    .await
+    .expect("count grants");
+    assert_eq!(grants, 0, "inviting back wipes the stale grant");
+    assert_eq!(
+        get(&pool, Some(&target), &format!("/environments/{e}/grant"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
