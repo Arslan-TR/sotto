@@ -44,8 +44,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check whether deletion alerting is configured
+        id: config
+        env:
+          DELETION_METRICS_TOKEN: ${{ secrets.SOTTO_DELETION_METRICS_TOKEN }}
+          BASE_URL: ${{ vars.SOTTO_PUBLIC_URL }}
+        run: |
+          set -euo pipefail
+          # Skip rather than fail when unconfigured, matching backup-freshness, so merging this
+          # cannot turn a healthy repository red. A fork inherits the schedule and not the secret,
+          # and so does this repository until the secret is set: filing an issue every six hours
+          # about a check nobody asked for is the alert fatigue the whole file exists to avoid.
+          #
+          # The cost is that a secret deleted later goes quiet rather than loud. That is the trade
+          # the sibling already makes, and the alternative punishes every fork for ever to catch
+          # one unlikely local mistake. An exporter that is configured and then stops answering
+          # still alerts, which is the case that matters.
+          if [ -z "${DELETION_METRICS_TOKEN:-}" ] || [ -z "${BASE_URL:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Deletion alerting is not configured; see deploy/README.md, Enabling" >&2
+            echo "organisation deletion. Both SOTTO_DELETION_METRICS_TOKEN and SOTTO_PUBLIC_URL" >&2
+            echo "are needed, and neither is inherited by a fork." >&2
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check the deletion exporter
         id: check
+        if: steps.config.outputs.configured == 'true'
         env:
           # Read-only by construction: the exporter exposes aggregate counts and ages, and
           # DELETION-METRICS.md records that no organisation id, provider message or secret value
@@ -57,10 +83,6 @@ jobs:
           BASE_URL: ${{ vars.SOTTO_PUBLIC_URL }}
         run: |
           set -uo pipefail
-          if [ -z "${BASE_URL:-}" ]; then
-            echo "SOTTO_PUBLIC_URL is not set; nothing to check. See deploy/README.md." >&2
-            exit 2
-          fi
           # Captured as well as streamed, so the alert can quote what actually went wrong rather
           # than telling a reader to go and find the log. The script prints counts and ages only.
           set +e
@@ -77,7 +99,7 @@ jobs:
       # outcome would leave a checkout failure invisible: the job red and no issue opened, on the
       # one kind of run where nobody is watching.
       - name: Open or update the alert
-        if: failure() && github.event_name == 'schedule'
+        if: failure() && steps.config.outputs.configured == 'true' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -121,8 +143,9 @@ jobs:
 
       - name: Close a resolved alert
         # On any success, dispatched included: confirming a fix by hand is the moment the alert
-        # should clear, not six hours later.
-        if: success()
+        # should clear, not six hours later. Gated on the configuration too, because otherwise
+        # removing the secret would close a standing alert rather than leaving it be.
+        if: success() && steps.config.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
