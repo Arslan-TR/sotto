@@ -1048,3 +1048,70 @@ async fn rejoining_by_invite_wipes_stale_grants() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn removal_ignores_a_departed_users_grant_when_checking_for_peers() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("rm-peer-o", "rm-peer-p", "rm-peer-e");
+    let owner = seed_org_env(&pool, o, p, e, "rm-peer-owner").await;
+    // An admin who holds no grant to the env, a member who does, and a departed user whose
+    // pre-fix removal left a stale grant row behind.
+    let admin = fresh_session(&pool, "rm-peer-admin", "rm-peer-admin-s").await;
+    ensure_user(&pool, "rm-peer-member", "rm-peer-member-s").await;
+    ensure_user(&pool, "rm-peer-ghost", "rm-peer-ghost-s").await;
+    for (user, role) in [
+        ("rm-peer-admin", "admin"),
+        ("rm-peer-member", "member"),
+        ("rm-peer-ghost", "member"),
+    ] {
+        post(
+            &pool,
+            &owner,
+            &format!("/orgs/{o}/members"),
+            member_body(user, role),
+        )
+        .await;
+    }
+    for user in ["rm-peer-member", "rm-peer-ghost"] {
+        assert_eq!(
+            post(
+                &pool,
+                &owner,
+                &format!("/environments/{e}/grants"),
+                grant_body(user)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1 AND user_id = $2")
+        .bind(o)
+        .bind("rm-peer-ghost")
+        .execute(&pool)
+        .await
+        .expect("simulate a pre-fix removal");
+    // The owner drops their own grant, so the target is the only remaining holder.
+    sqlx::query("DELETE FROM environment_grants WHERE env_id = $1 AND user_id = $2")
+        .bind(e)
+        .bind("rm-peer-owner")
+        .execute(&pool)
+        .await
+        .expect("drop the owners grant");
+
+    // The ghost's stale row must not count as a peer: nobody remaining can re-key the env, so
+    // the removal goes through instead of 409ing forever.
+    let (status, body) = delete(&pool, &admin, &format!("/orgs/{o}/members/rm-peer-member")).await;
+    assert_eq!(status, StatusCode::OK, "removal: {body}");
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environment_grants WHERE env_id = $1 AND user_id = $2",
+    )
+    .bind(e)
+    .bind("rm-peer-member")
+    .fetch_one(&pool)
+    .await
+    .expect("count grants");
+    assert_eq!(grants, 0, "the removed member's grant is gone");
+}

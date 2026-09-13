@@ -1599,11 +1599,14 @@ mod tests {
         let (store_a, master_a, _kit, project, config0) = real_device();
         let alice = device_keypair(&store_a, &master_a);
         let bob = sotto_core::wrap::generate_keypair();
+        let carol = sotto_core::wrap::generate_keypair();
         api.register_user("alice@example.test", "test-user", &alice.public);
         api.register_user("bob@example.test", "bob-user", &bob.public);
+        api.register_user("carol@example.test", "carol-user", &carol.public);
 
         let org_id = team::create_org(&api, &alice, "acme").unwrap();
         team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        team::invite(&api, &alice, &org_id, "carol@example.test").unwrap();
         let config = Config {
             org_id: Some(org_id.clone()),
             ..config0
@@ -1616,7 +1619,8 @@ mod tests {
         let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
 
         // Alice loses her own grant (another rotation dropped her): she can no longer open the env.
-        // Carol still holds it, so it is not Bob's alone and someone could still re-key it.
+        // Carol is a member and still holds it, so it is not Bob's alone and someone could
+        // still re-key it.
         api.state
             .borrow_mut()
             .grants
@@ -1752,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_removal_rotates_nothing() {
+    fn a_departed_holders_stale_grant_does_not_block_orphan_removal() {
         use crate::remote::team;
         let api = MockApi::default();
 
@@ -1764,6 +1768,49 @@ mod tests {
 
         let org_id = team::create_org(&api, &alice, "acme").unwrap();
         team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob's own env, plus a stale grant row for a departed non-member: nobody remaining but
+        // Bob holds it, so it is still his alone.
+        api.state.borrow_mut().grants.insert(
+            ("zz-bob-alone".to_string(), "bob-user".to_string()),
+            "opaque".to_string(),
+        );
+        api.state.borrow_mut().grants.insert(
+            ("zz-bob-alone".to_string(), "ghost-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id]);
+        assert_eq!(report.orphaned, vec!["zz-bob-alone".to_string()]);
+    }
+
+    #[test]
+    fn a_refused_removal_rotates_nothing() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        let carol = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+        api.register_user("carol@example.test", "carol-user", &carol.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        team::invite(&api, &alice, &org_id, "carol@example.test").unwrap();
         let config = Config {
             org_id: Some(org_id.clone()),
             ..config0

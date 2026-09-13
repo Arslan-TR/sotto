@@ -12,6 +12,8 @@
 //! ever holds sealed blobs. Invite and share flows also upsert the member's org-key copy, so
 //! whoever can decrypt an environment can also read its name.
 
+use std::collections::HashSet;
+
 use sotto_core::{names, vault, wrap};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -392,6 +394,13 @@ pub fn remove_member(
     let mut to_rotate = Vec::new();
     let mut orphaned = Vec::new();
     let mut blocked = Vec::new();
+    // Who counts as a holder for orphan detection: a pre-fix removal can leave a grant row for
+    // a departed user, and counting it would refuse a removal nobody remaining can re-key for.
+    let members: HashSet<String> = api
+        .list_members(org_id)?
+        .into_iter()
+        .map(|m| m.user_id)
+        .collect();
     for env_id in api.member_env_grants(org_id, user_id)? {
         match api.get_grant(&env_id)? {
             // Open it as well: a grant we hold but cannot open would fail the rotation part way.
@@ -399,8 +408,18 @@ pub fn remove_member(
                 vault::open_vault_key(keypair, &b64decode(&grant)?)?.zeroize();
                 to_rotate.push(env_id);
             }
-            None if api.list_grant_holders(&env_id)? == [user_id] => orphaned.push(env_id),
-            None => blocked.push(env_id),
+            None => {
+                let live: Vec<String> = api
+                    .list_grant_holders(&env_id)?
+                    .into_iter()
+                    .filter(|h| members.contains(h))
+                    .collect();
+                if live == [user_id] {
+                    orphaned.push(env_id);
+                } else {
+                    blocked.push(env_id);
+                }
+            }
         }
     }
     if !blocked.is_empty() {

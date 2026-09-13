@@ -837,12 +837,16 @@ async fn remove_member(
     // rotation the target's cached vault keys stay valid, so an environment the caller cannot
     // open is a hard failure naming it, never a silent skip. The exception is an environment
     // nobody else holds: nobody could re-key it, and nobody else can write a secret there for the
-    // target's key to read, so demanding a rotation would only make the target unremovable.
+    // target's key to read, so demanding a rotation would only make the target unremovable. Only
+    // current members count as holders here: a pre-fix removal can leave a grant row for a
+    // departed user, and counting it would 409 a removal nobody remaining can re-key for.
     let target_envs: Vec<String> = sqlx::query_scalar(
         "SELECT eg.env_id FROM environment_grants eg \
          JOIN environments e ON eg.env_id = e.id JOIN projects p ON e.project_id = p.id \
          WHERE p.org_id = $1 AND eg.user_id = $2 \
            AND EXISTS (SELECT 1 FROM environment_grants peer \
+                       JOIN organization_memberships m \
+                         ON m.org_id = $1 AND m.user_id = peer.user_id \
                        WHERE peer.env_id = eg.env_id AND peer.user_id <> $2) \
          ORDER BY eg.env_id",
     )
