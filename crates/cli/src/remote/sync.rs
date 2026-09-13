@@ -519,6 +519,8 @@ mod tests {
 
     struct MachineTokenRec {
         env_id: String,
+        name: String,
+        created_by: String,
         public_key: Vec<u8>,
         enc_vault_key: String,
         revoked: bool,
@@ -1033,26 +1035,54 @@ mod tests {
             Ok(super::super::api::RotateResponse { revision: new_rev })
         }
 
-        fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()> {
+        fn remove_member(
+            &self,
+            org_id: &str,
+            user_id: &str,
+        ) -> Result<super::super::api::RemovalReceipt> {
+            // Mirror the server: the grants die with the membership, and so does every token the
+            // target created. (The mock doesn't link projects to orgs, so this is user-global
+            // rather than org-scoped; close enough for client-flow tests. The 409 re-key
+            // precondition lives server-side and is covered by the server's own tests.)
             let mut s = self.state.borrow_mut();
             if let Some(org) = s.orgs.get_mut(org_id) {
                 org.members.remove(user_id);
             }
-            Ok(())
+            let before = s.grants.len();
+            s.grants.retain(|(_, uid), _| uid != user_id);
+            let grants_deleted = (before - s.grants.len()) as i64;
+            let mut revoked_tokens = Vec::new();
+            for (token_id, token) in s.machine_tokens.iter_mut() {
+                if token.created_by == user_id && !token.revoked {
+                    token.revoked = true;
+                    revoked_tokens.push(super::super::api::RevokedTokenInfo {
+                        token_id: token_id.clone(),
+                        name: token.name.clone(),
+                        env_id: token.env_id.clone(),
+                    });
+                }
+            }
+            Ok(super::super::api::RemovalReceipt {
+                revoked_tokens,
+                grants_deleted,
+            })
         }
 
         fn create_machine_token(
             &self,
             env_id: &str,
-            _name: &str,
+            name: &str,
             public_key: &str,
             enc_vault_key: &str,
         ) -> Result<super::super::api::CreatedMachineToken> {
+            let me = self.current_user();
             let token_id = uuid::Uuid::new_v4().to_string();
             self.state.borrow_mut().machine_tokens.insert(
                 token_id.clone(),
                 MachineTokenRec {
                     env_id: env_id.to_string(),
+                    name: name.to_string(),
+                    created_by: me,
                     public_key: b64decode(public_key)?,
                     enc_vault_key: enc_vault_key.to_string(),
                     revoked: false,
@@ -1075,8 +1105,9 @@ mod tests {
                 .filter(|(_, t)| t.env_id == env_id && !t.revoked)
                 .map(|(id, t)| super::super::api::MachineTokenInfo {
                     token_id: id.clone(),
-                    name: "ci".into(),
+                    name: t.name.clone(),
                     public_key: b64encode(&t.public_key),
+                    created_by: Some(t.created_by.clone()),
                 })
                 .collect();
             tokens.sort_by(|a, b| a.token_id.cmp(&b.token_id));
@@ -1557,6 +1588,115 @@ mod tests {
                 Err(Error::Conflict(_))
             ),
             "a member dropped from the grant set must not be able to push"
+        );
+    }
+
+    #[test]
+    fn removal_fails_when_the_caller_cannot_rekey_an_env() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Alice loses her own grant (another rotation dropped her): she can no longer open the env.
+        api.state
+            .borrow_mut()
+            .grants
+            .remove(&(env_id.clone(), "test-user".to_string()));
+
+        // Removal is a hard failure naming the env - and Bob's membership survives it, so the
+        // admin knows the offboarding did not happen rather than believing it succeeded.
+        let err = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap_err();
+        assert!(
+            matches!(&err, Error::Input(_)),
+            "expected Error::Input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&env_id),
+            "the error names the un-rotatable env: {err}"
+        );
+        assert!(
+            api.list_members(&org_id)
+                .unwrap()
+                .iter()
+                .any(|m| m.user_id == "bob-user"),
+            "a failed removal must retain the membership"
+        );
+        assert_eq!(
+            api.member_env_grants(&org_id, "bob-user").unwrap(),
+            vec![env_id],
+            "a failed removal must retain the grants"
+        );
+    }
+
+    #[test]
+    fn removal_report_carries_the_tokens_it_revoked() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob clones the env, then creates a machine token the team might share.
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            Some("acme"),
+            Some("dev"),
+            Some(&org_id),
+        )
+        .unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+
+        // Alice removes Bob: the rotation re-seals the token, then the removal revokes it and
+        // reports it, so the team knows what to recreate.
+        api.as_user("test-user");
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id.clone()]);
+        assert_eq!(report.revoked_tokens.len(), 1);
+        assert_eq!(report.revoked_tokens[0].name, "bob-ci");
+        assert_eq!(report.revoked_tokens[0].env_id, env_id);
+        assert!(
+            api.list_machine_tokens(&env_id).unwrap().is_empty(),
+            "the removed member's token is revoked, not re-sealed and live"
         );
     }
 
