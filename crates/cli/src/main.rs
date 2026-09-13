@@ -602,10 +602,14 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
             let keypair = session::account_keypair(store, &master)?;
             let report = remote::team::remove_member(&client, &keypair, &org_id, &user_id)?;
+            // Each rotated environment already dropped the member's grant during rotation;
+            // `grants_deleted` counts only the rows the final DELETE removed, so the total
+            // is what the member actually lost.
+            let grants_revoked = report.rotated.len() + report.grants_deleted as usize;
             eprintln!(
                 "removed {user_id}; rotated {} environment(s), revoked {} grant(s)",
                 report.rotated.len(),
-                report.grants_deleted,
+                grants_revoked,
             );
             if !report.orphaned.is_empty() {
                 eprintln!(
