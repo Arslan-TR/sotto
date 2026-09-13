@@ -372,26 +372,42 @@ pub struct RemovalReport {
 /// An environment this caller holds no grant to is a hard failure, not a warning: removing the
 /// member without re-keying it would leave their cached vault key valid. (The server enforces the
 /// same precondition, so an old client cannot silently skip either.)
+///
+/// Every environment is checked before any is rotated. Rotation must re-seal the new vault key to
+/// every active machine token, the member's own included, and the server revokes those only at
+/// `DELETE`, so a refusal after the first rotation would leave the member's tokens live on the new
+/// key until someone finished the removal.
 pub fn remove_member(
     api: &dyn SyncApi,
     keypair: &wrap::Keypair,
     org_id: &str,
     user_id: &str,
 ) -> Result<RemovalReport> {
-    let mut rotated = Vec::new();
-    let mut skipped = Vec::new();
-    for env_id in api.member_env_grants(org_id, user_id)? {
-        match rotate_env(api, keypair, org_id, &env_id, Some(user_id))? {
-            Some(_) => rotated.push(env_id),
-            None => skipped.push(env_id),
+    let envs = api.member_env_grants(org_id, user_id)?;
+    let mut blocked = Vec::new();
+    for env_id in &envs {
+        match api.get_grant(env_id)? {
+            // Open it as well: a grant we hold but cannot open would fail the rotation part way.
+            Some(grant) => vault::open_vault_key(keypair, &b64decode(&grant)?)?.zeroize(),
+            None => blocked.push(env_id.as_str()),
         }
     }
-    if !skipped.is_empty() {
+    if !blocked.is_empty() {
         return Err(Error::Input(format!(
             "cannot complete removal: you hold no grant to environment(s) {}; \
              ask a member who does to run `sotto rotate` on each, then retry",
-            skipped.join(", ")
+            blocked.join(", ")
         )));
+    }
+    let mut rotated = Vec::new();
+    for env_id in envs {
+        // Checked above, so `None` here means a concurrent rotation dropped our grant in between.
+        if rotate_env(api, keypair, org_id, &env_id, Some(user_id))?.is_none() {
+            return Err(Error::Conflict(format!(
+                "your grant to environment {env_id} was dropped during the removal; retry"
+            )));
+        }
+        rotated.push(env_id);
     }
     // Finally drop the membership; the server revokes their grants, tokens, and API access.
     let receipt = api.remove_member(org_id, user_id)?;

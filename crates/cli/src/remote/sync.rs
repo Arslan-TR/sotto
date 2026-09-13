@@ -1701,6 +1701,78 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_removal_rotates_nothing() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob clones the env Alice can open, and creates a machine token on it.
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            Some("acme"),
+            Some("dev"),
+            Some(&org_id),
+        )
+        .unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+        api.as_user("test-user");
+
+        // A second env, shared between Bob and Carol, that Alice cannot open.
+        for holder in ["bob-user", "carol-user"] {
+            api.state.borrow_mut().grants.insert(
+                ("zz-alice-cannot-open".to_string(), holder.to_string()),
+                "opaque".to_string(),
+            );
+        }
+        let bob_token = |api: &MockApi| {
+            let s = api.state.borrow();
+            let t = s.machine_tokens.values().find(|t| t.name == "bob-ci");
+            t.map(|t| (t.revoked, t.enc_vault_key.clone())).unwrap()
+        };
+        let before = bob_token(&api);
+
+        // The refusal comes before any rotation. Rotating the env Alice can open would re-seal the
+        // new key onto Bob's still-live token, which he would keep until someone finished the job.
+        let err = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap_err();
+        assert!(err.to_string().contains("zz-alice-cannot-open"), "{err}");
+        assert_eq!(
+            bob_token(&api),
+            before,
+            "no rotation re-sealed the member's token"
+        );
+        assert!(
+            api.member_env_grants(&org_id, "bob-user")
+                .unwrap()
+                .contains(&env_id),
+            "the env Alice could open was not rotated either"
+        );
+    }
+
+    #[test]
     fn machine_token_survives_rotation() {
         use crate::remote::{machine, team};
         let api = MockApi::default();
