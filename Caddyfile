@@ -51,6 +51,7 @@ www.{$SOTTO_DOMAIN} {
 				request>headers>Authorization delete
 				request>headers>Proxy-Authorization delete
 				resp_headers>Set-Cookie delete
+				resp_headers>Location delete
 			}
 		}
 	}
