@@ -908,8 +908,39 @@ tag. The full operator procedure, including the rehearsal record you must comple
 
 1. A managed backup or export lifecycle covering the configured recovery window, with a restore
    into an isolated scratch database rehearsed and recorded.
-2. `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` set from the deployment secret store, the
-   [alert rules](ORGANISATION-DELETION-ALERTS.yml) loaded, and one notification tested.
+2. `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` set from the deployment secret store, alerting on
+   the exporter arranged, and one notification tested. Prometheus deployments load the
+   [alert rules](ORGANISATION-DELETION-ALERTS.yml); everyone else can use
+   `scripts/check-deletion-metrics`, which decides three of those five rules from one scrape.
+
+   **The checker runs somewhere else, so it needs its own copy of the token.** Any scheduler will
+   do: the script takes `--url` and reads the token from `DELETION_METRICS_TOKEN`, so cron on a
+   separate host, a CI job, or whatever your fleet already uses are all equivalent. It exits 0
+   when nothing needs attention, 1 when something does, and 2 when it could not tell, which is
+   enough to drive a notification anywhere.
+
+   What matters is that wherever it runs has its own copy of the token, because setting the
+   deployment variable alone leaves the checker unable to reach the exporter. This repository runs
+   it from GitHub Actions, which reads the repository secret `SOTTO_DELETION_METRICS_TOKEN` and
+   the repository variable `SOTTO_PUBLIC_URL`; substitute your own equivalents:
+
+   **Pipe the value in; do not type it.** Whatever holds the copy, the token should reach it from
+   the secret store rather than through a command line, because an argument is visible to `ps`
+   while the command runs and stays in shell history afterwards. That is the same rule this
+   document applies to the deployment variable itself.
+
+   ```sh
+   # Run where deploy/.env lives. `gh secret set` reads standard input when --body is omitted, so
+   # the value is never an argument and never echoed.
+   grep -m1 '^SOTTO_ORGANISATION_DELETION_METRICS_TOKEN=' .env | cut -d= -f2- \
+     | gh secret set SOTTO_DELETION_METRICS_TOKEN --repo <owner>/<repo>
+
+   # The URL is not a secret.
+   gh variable set SOTTO_PUBLIC_URL --body 'https://your.domain' --repo <owner>/<repo>
+   ```
+
+   Rotating the deployment's token means setting this one again. Nothing checks that they agree;
+   a stale copy shows up as `401` from the exporter, reported as exit 2 rather than as an alert.
 3. `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` set from the deployment secret store, with the
    authenticated observation procedure reviewed and rehearsed.
 4. Billing configured and verified end to end: the provider's API version, restricted key, and
