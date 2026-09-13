@@ -14,6 +14,7 @@ import sys
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LOADER = importlib.machinery.SourceFileLoader(
@@ -163,6 +164,30 @@ class Fetching(unittest.TestCase):
 
     def test_the_request_is_bounded(self):
         self.assertTrue(0 < check.TIMEOUT_SECONDS <= 60)
+
+    def test_a_cleartext_url_is_refused_before_anything_is_sent(self):
+        def opener(*_args, **_kwargs):
+            raise AssertionError("a bearer must not reach a cleartext hop")
+
+        for url in ("http://example.test/ops/metrics", "ftp://example.test/x", "//example.test/x"):
+            with self.assertRaises(ValueError, msg=url):
+                check.fetch(url, "tok_secret", opener=opener)
+
+    def test_a_redirect_is_refused_rather_than_followed(self):
+        # urllib copies request headers onto a redirected request, so a 302 to another host
+        # arrives with the bearer intact. Asserted against the stock handler this replaces, so the
+        # test states the risk rather than restating the fix.
+        stock = urllib.request.HTTPRedirectHandler()
+        request = urllib.request.Request(
+            "https://good.example/ops/metrics", headers={"Authorization": "Bearer tok_secret"}
+        )
+        carried = stock.redirect_request(request, None, 302, "Found", {}, "https://elsewhere/x")
+        self.assertEqual(carried.get_header("Authorization"), "Bearer tok_secret")
+        self.assertIsNone(
+            check.NoRedirects().redirect_request(
+                request, None, 302, "Found", {}, "https://elsewhere/x"
+            )
+        )
 
 
 class ExitCodes(unittest.TestCase):
