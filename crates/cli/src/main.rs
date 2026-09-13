@@ -911,15 +911,17 @@ fn login(
     let me = remote::SyncApi::me(&client)?;
     remote::auth::store_session(keychain, &token)?;
 
-    // Preserve a previously configured web URL unless this login overrides it.
-    let existing_web =
-        remote::config::GlobalConfig::load_from(&config_path)?.and_then(|c| c.web_url);
+    // Preserve a previously configured web URL and theme unless this login overrides it.
+    let existing = remote::config::GlobalConfig::load_from(&config_path)?;
+    let existing_web = existing.as_ref().and_then(|c| c.web_url.clone());
+    let existing_theme = existing.as_ref().and_then(|c| c.theme.clone());
     let web_url = web_override
         .map(|w| w.trim_end_matches('/').to_string())
         .or(existing_web);
     remote::config::GlobalConfig {
-        server_url: server.clone(),
+        server_url: Some(server.clone()),
         web_url,
+        theme: existing_theme,
     }
     .save_to(&config_path)?;
     eprintln!("logged in to {server} (user {})", me.user_id);
