@@ -2,7 +2,7 @@
 //!
 //! `authorize` starts a one-shot `127.0.0.1` listener, sends the browser to the server's GitHub
 //! login with that loopback as the redirect target, and captures what the server hands back: a
-//! single-use code, swapped for the session over HTTPS - or the session itself from a server too
+//! single-use code, swapped for the session in a POST body - or the session itself from a server too
 //! old to speak codes. The pure pieces ([`authorize_url`], [`parse_callback`]) are unit-tested;
 //! the socket loop is thin.
 //! The session token is a bearer credential, so it lives in the OS keychain.
@@ -92,7 +92,9 @@ pub fn parse_callback(target: &str, expected_state: &str) -> Result<CallbackGran
         .ok_or_else(|| Error::Server("callback missing code or session".into()))
 }
 
-/// Swap a single-use login code for the session token, over HTTPS and never as a URL component.
+/// Swap a single-use login code for the session token, in a POST body and never as a URL
+/// component. Transport encryption follows the configured server URL's scheme (S-15's
+/// territory); this function's guarantee is only that the code never appears in a URL.
 pub fn exchange_code(server: &str, code: &str, state: &str) -> Result<String> {
     #[derive(serde::Deserialize)]
     struct ExchangeResponse {

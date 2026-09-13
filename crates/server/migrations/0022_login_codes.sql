@@ -2,8 +2,8 @@
 --
 -- The OAuth callback used to hand the CLI its 30-day session token in the redirect URL, which
 -- put it in the Caddy access log (reproduced) and in browser history. The callback now hands
--- back a short-lived, single-use code instead, and the CLI exchanges it for the session over
--- HTTPS. Only the code's BLAKE2b hash is stored, so a database leak cannot be replayed.
+-- back a short-lived, single-use code instead, and the CLI exchanges it for the session in
+-- a POST body. Only the code's BLAKE2b hash is stored, so a database leak cannot be replayed.
 --
 -- `oauth_logins.wants_code` records whether the CLI asked for the code branch (`mode=code` at
 -- login); its absence means a legacy CLI that still expects the token in the URL.
