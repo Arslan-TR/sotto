@@ -9,12 +9,17 @@
 # engine. `.github/workflows/deletion-alerts.yml` runs it six-hourly and raises a labelled issue.
 #
 # The other two, SottoOrganisationDeletionWorkerRaces and SottoOrganisationDeletionPurgeFailed,
-# are deliberately not implemented there. Both read the change in a monotonic counter over an
-# hour, which needs the previous reading kept somewhere between runs, and both carry thresholds
-# (`> 3` per hour, `for: 15m`) written before any deletion had ever been requested. There is
-# nothing yet to calibrate them against, and an alert nobody can calibrate is one that gets
-# ignored. Implement them when a deployment has enough deletion throughput to tune them, or load
-# this file into Prometheus if you already run one.
+# are deliberately not implemented there, and for one shared reason: both read `increase(...)`
+# over an hour, which is the change in a monotonic counter, and deciding that needs the previous
+# reading kept somewhere between runs. A single scrape cannot answer either.
+#
+# WorkerRaces additionally needs a threshold nobody can yet choose. `> 3` reclaimed leases or
+# rejected compare-and-sets per hour was written before any deletion had ever been requested, and
+# an alert nobody can calibrate is one that gets ignored. PurgeFailed has no such problem: its
+# threshold is `> 0`, because any failed purge matters. It is held back only by the history.
+#
+# Implement them when a deployment has the throughput to tune the first and somewhere to keep a
+# previous reading for both, or load this file into Prometheus if you already run one.
 
 groups:
   - name: sotto-organisation-deletion
