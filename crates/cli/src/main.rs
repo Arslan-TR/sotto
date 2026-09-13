@@ -317,6 +317,17 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
+    // keychain, config, or password. This is the CI path, so it returns before theme
+    // resolution: machine output is never styled and must not depend on the config file.
+    if let Ok(token) = std::env::var("SOTTO_TOKEN") {
+        match &cli.command {
+            Command::Run { args } => return machine_run(&token, args.clone()),
+            Command::Export { format, reveal } => return machine_export(&token, *format, *reveal),
+            _ => {} // every other command proceeds as a normal session
+        }
+    }
+
     // Theme resolution degrades gracefully: an undeterminable data dir or an
     // unreadable/corrupt config only means "no saved preference" (the nord default),
     // never a startup failure for a purely cosmetic choice.
@@ -357,16 +368,6 @@ fn run() -> Result<()> {
         let config_path = sotto_cli::paths::config_path()?;
         let themes_dir = sotto_cli::paths::themes_path()?;
         return theme_command(command.as_ref(), &theme, &config_path, &themes_dir);
-    }
-
-    // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
-    // keychain, config, or password. This is the CI path.
-    if let Ok(token) = std::env::var("SOTTO_TOKEN") {
-        match &cli.command {
-            Command::Run { args } => return machine_run(&token, args.clone()),
-            Command::Export { format, reveal } => return machine_export(&token, *format, *reveal),
-            _ => {} // every other command proceeds as a normal session
-        }
     }
 
     let store_path = sotto_cli::paths::store_path()?;
