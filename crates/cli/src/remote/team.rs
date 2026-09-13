@@ -310,13 +310,15 @@ pub fn rotate_env(
             if Some(holder.as_str()) == revoke {
                 continue;
             }
-            let public_key_b64 = members
-                .iter()
-                .find(|m| m.user_id == holder)
-                .and_then(|m| m.public_key.clone())
-                .ok_or_else(|| {
-                    Error::Input(format!("cannot re-grant `{holder}`: no public key on file"))
-                })?;
+            let Some(member) = members.iter().find(|m| m.user_id == holder) else {
+                // Not a member: a pre-fix removal left a stale row behind. It grants nothing
+                // (access checks deny non-members), so rotation drops it instead of failing on
+                // it - otherwise one stale row would brick rotation for the whole environment.
+                continue;
+            };
+            let public_key_b64 = member.public_key.clone().ok_or_else(|| {
+                Error::Input(format!("cannot re-grant `{holder}`: no public key on file"))
+            })?;
             grants.push(GrantEntry {
                 user_id: holder,
                 enc_vault_key: b64encode(&vault::grant_vault_key(

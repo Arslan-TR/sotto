@@ -1807,6 +1807,49 @@ mod tests {
     }
 
     #[test]
+    fn rotation_drops_a_departed_holders_stale_grant() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // A stale grant row for a departed non-member on the shared env: rotation must drop it
+        // rather than abort on the missing public key, or no removal touching this env could
+        // complete.
+        api.state.borrow_mut().grants.insert(
+            (env_id.clone(), "ghost-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id.clone()]);
+        assert!(
+            !api.state
+                .borrow()
+                .grants
+                .contains_key(&(env_id, "ghost-user".to_string())),
+            "rotation drops the stale grant instead of failing on it"
+        );
+    }
+
+    #[test]
     fn a_refused_removal_rotates_nothing() {
         use crate::remote::team;
         let api = MockApi::default();
