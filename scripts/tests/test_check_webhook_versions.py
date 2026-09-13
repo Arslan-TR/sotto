@@ -7,6 +7,7 @@ in a public repository where the log and the issue it raises are both world-read
 """
 
 import contextlib
+import http.client
 import importlib.machinery
 import importlib.util
 import io
@@ -250,6 +251,25 @@ class ExitCodes(unittest.TestCase):
 
     def test_a_dropped_connection_is_two_not_drift(self):
         self.assertEqual(self.run_with(raises=urllib.error.URLError("no route")), 2)
+
+    def test_a_truncated_response_is_two_not_drift(self):
+        # The gap this suite had. `fetch_endpoints` calls `json.load(response)`, and a body that
+        # stops arriving raises `IncompleteRead` from the read inside it. That is an
+        # `HTTPException` and not an `OSError`, so the original handler let it escape: Python
+        # exits 1, which this script means as drift, and the workflow published a dropped
+        # connection as a live billing endpoint sending a version the server rejects.
+        self.assertEqual(self.run_with(raises=http.client.IncompleteRead(b"half")), 2)
+
+    def test_the_caught_types_are_the_ones_a_network_actually_raises(self):
+        # Raised rather than provoked, because the exception type is the thing being tested. The
+        # same assertion guards scripts/status-probe and scripts/check-deletion-metrics.
+        for raised in (
+            urllib.error.URLError("x"),
+            http.client.IncompleteRead(b""),
+            http.client.RemoteDisconnected("x"),
+            TimeoutError(),
+        ):
+            self.assertIsInstance(raised, check.TRANSPORT_FAILURES, type(raised).__name__)
 
     def test_malformed_json_is_two_and_does_not_quote_the_body(self):
         broken = json.JSONDecodeError("Expecting value", "sk_live_leaked_in_a_body", 0)

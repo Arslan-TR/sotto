@@ -23,6 +23,7 @@ world-readable, and an endpoint's full URL is the one part of its record worth n
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -43,6 +44,11 @@ HANDLED_EVENTS = frozenset(
 )
 
 CONSTANT = "ACCEPTED_WEBHOOK_API_VERSIONS"
+
+#: What a network can do to a request, matching scripts/status-probe and
+#: scripts/check-deletion-metrics. Kept as a named tuple rather than written inline so the three
+#: cannot drift apart: this script had only `OSError` for long enough to ship.
+TRANSPORT_FAILURES = (OSError, http.client.HTTPException)
 
 # Matching scripts/status-probe. Without one, urlopen waits for ever: a stalled connection would
 # hold this job until the Actions timeout kills the whole thing, and a killed job never reaches
@@ -188,8 +194,14 @@ def main(argv=None):
         detail = "malformed JSON" if isinstance(error, json.JSONDecodeError) else error
         print(f"could not read the webhook endpoints: {detail}", file=sys.stderr)
         return 2
-    except OSError as error:
-        # urllib.error.URLError and socket.timeout both land here.
+    except TRANSPORT_FAILURES as error:
+        # `urllib.error.URLError` and `socket.timeout` are both `OSError`, which is what this
+        # caught originally, and the comment saying so was true and incomplete. A body that stops
+        # arriving part-way raises `http.client.IncompleteRead`, which is an `HTTPException` and
+        # is not an `OSError`, so it escaped every handler here as a traceback. Python exits 1 on
+        # that, and exit 1 is this script's word for drift, so a dropped connection was published
+        # as "a live Stripe webhook endpoint no longer sends a version this server accepts" and
+        # sent whoever read it to billing.rs for a problem that was a network blip.
         print(f"could not reach Stripe: {type(error).__name__}", file=sys.stderr)
         return 2
 
