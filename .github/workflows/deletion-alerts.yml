@@ -42,8 +42,10 @@ jobs:
       # A scheduled check nobody is watching needs somewhere for a failure to be seen.
       issues: write
     steps:
-      - uses: actions/checkout@v4
-
+      # First, and deliberately before the checkout: this reads two environment values and needs
+      # nothing from the repository. Ordered the other way, a checkout failure skipped it, left
+      # its output unset, and every gate below that asked for `== 'true'` went quiet. The job went
+      # red and no issue was opened, which is the exact shape this workflow exists to prevent.
       - name: Check whether deletion alerting is configured
         id: config
         env:
@@ -68,6 +70,9 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.configured == 'true'
 
       - name: Check the deletion exporter
         id: check
@@ -99,7 +104,11 @@ jobs:
       # outcome would leave a checkout failure invisible: the job red and no issue opened, on the
       # one kind of run where nobody is watching.
       - name: Open or update the alert
-        if: failure() && steps.config.outputs.configured == 'true' && github.event_name == 'schedule'
+        # `!= 'false'` rather than `== 'true'`, and the difference is the whole point: an unset
+        # output means the configuration step did not get to run, which is a failure to report,
+        # not a reason to stay quiet. Only a step that positively said "nobody configured this"
+        # silences the alert.
+        if: failure() && steps.config.outputs.configured != 'false' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
