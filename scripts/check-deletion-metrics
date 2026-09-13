@@ -9,6 +9,14 @@ deploy/ORGANISATION-DELETION-ALERTS.yml that a single scrape can decide, because
 computes them in SQL: an operation that has failed, a billing cancellation that has not converged,
 and a retention operation whose purge deadline has passed without the purge starting.
 
+What a poll cannot reproduce is the `for:` soak on those rules, which tells Prometheus to hold a
+condition for five or fifteen minutes before believing it. This fires on first sighting instead.
+Of the three, only the purge-deadline one can be briefly true on a healthy deployment: an
+operation crosses its deadline and the worker claims it on its next pass seconds later, so the
+window is seconds wide and a six-hourly sample is very unlikely to land in it. If one ever does,
+the next run closes the alert on its own. The case worth keeping is the one that does not clear,
+because an operation stuck past its deadline is a worker that has stopped.
+
 The other two rules need the change in a counter between two scrapes, so they need somewhere to
 keep the previous reading. They measure worker contention and purge-failure rate, and their
 thresholds were written before any deletion existed, so there is nothing yet to calibrate them
