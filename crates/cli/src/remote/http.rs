@@ -334,6 +334,15 @@ impl SyncApi for HttpClient {
             .bearer_auth(&self.token)
             .send()
             .map_err(net)?;
+        // A server older than the removal receipt answers `204` with no body. The member is gone
+        // and that server revoked nothing, so that is an empty receipt, not a parse failure to
+        // report after the removal has already happened.
+        if resp.status() == StatusCode::NO_CONTENT {
+            return Ok(RemovalReceipt {
+                revoked_tokens: Vec::new(),
+                grants_deleted: 0,
+            });
+        }
         parse(resp)
     }
 
@@ -400,5 +409,42 @@ impl SyncApi for HttpClient {
             return Ok(None);
         }
         parse::<GrantView>(resp).map(|g| Some(g.enc_vault_key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    use super::*;
+
+    /// Answer exactly one request with `response`, verbatim, and return the base URL to reach it.
+    fn serve_once(response: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Drain the request head first, or closing early can reset the client mid-send.
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("read request") <= 2 {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_204_removal_from_an_older_server_is_an_empty_receipt() {
+        let base = serve_once("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        let receipt = HttpClient::new(base, "session".into())
+            .remove_member("org", "user")
+            .expect("a 204 is a completed removal, not a parse failure");
+        assert!(receipt.revoked_tokens.is_empty());
+        assert_eq!(receipt.grants_deleted, 0);
     }
 }
