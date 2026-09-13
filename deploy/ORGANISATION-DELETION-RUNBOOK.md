@@ -15,9 +15,14 @@ record.
 - Arrange alerting on the exporter, and test one notification without using a real deletion. If
   you run Prometheus, load [`ORGANISATION-DELETION-ALERTS.yml`](ORGANISATION-DELETION-ALERTS.yml).
   If you do not, `scripts/check-deletion-metrics` decides three of those five rules from a single
-  scrape and needs nothing but the metrics token; the repository runs it six-hourly from
-  `.github/workflows/deletion-alerts.yml`. The remaining two rules need counter history and
-  thresholds no deployment has yet had the throughput to calibrate, and the rules file says so.
+  scrape; this repository runs it six-hourly from `.github/workflows/deletion-alerts.yml`. That
+  workflow reads its own copy of the token as the repository secret `SOTTO_DELETION_METRICS_TOKEN`
+  and the target as the repository variable `SOTTO_PUBLIC_URL`, so setting
+  `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` on the deployment alone leaves every scheduled run
+  unable to check, and rotating one means setting the other again. See
+  [README.md](README.md#enabling-organisation-deletion). The remaining two rules need counter
+  history and thresholds no deployment has yet had the throughput to calibrate, and the rules file
+  says so.
 - Run the backup script and restore the dump into an isolated scratch database. Complete the
   rehearsal record at the end of this document before enabling the client control.
 - Confirm that the configured billing provider's API version, restricted key, and webhook endpoint

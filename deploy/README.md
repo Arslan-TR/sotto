@@ -911,8 +911,22 @@ tag. The full operator procedure, including the rehearsal record you must comple
 2. `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` set from the deployment secret store, alerting on
    the exporter arranged, and one notification tested. Prometheus deployments load the
    [alert rules](ORGANISATION-DELETION-ALERTS.yml); everyone else can use
-   `scripts/check-deletion-metrics`, which decides three of those five rules from one scrape and
-   needs only the token. This repository runs it six-hourly and opens a labelled issue.
+   `scripts/check-deletion-metrics`, which decides three of those five rules from one scrape.
+
+   **The checker runs somewhere else, so it needs its own copy of the token.** Setting the
+   deployment variable alone is not enough, and the failure is quiet in the wrong way: every
+   scheduled run exits 2 and raises an alert saying it could not check, which reads like a broken
+   deployment rather than a missing secret. This repository runs the checker from GitHub Actions,
+   where it reads the repository secret `SOTTO_DELETION_METRICS_TOKEN` and the repository variable
+   `SOTTO_PUBLIC_URL`:
+
+   ```sh
+   gh secret set SOTTO_DELETION_METRICS_TOKEN --body '<the same value as the deployment variable>'
+   gh variable set SOTTO_PUBLIC_URL --body 'https://your.domain'   # already set if you collect status
+   ```
+
+   Rotating the deployment's token means setting this one again. Nothing checks that they agree;
+   a stale copy shows up as `401` from the exporter, reported as exit 2 rather than as an alert.
 3. `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` set from the deployment secret store, with the
    authenticated observation procedure reviewed and rehearsed.
 4. Billing configured and verified end to end: the provider's API version, restricted key, and
