@@ -357,15 +357,21 @@ pub fn rotate_env(
     ))
 }
 
-/// The outcome of removing a member: which environments were re-keyed, and which were skipped
-/// because this caller holds no grant to them (someone who does must rotate those).
+/// The outcome of removing a member: which environments were re-keyed, and what the server
+/// revoked (its receipt, so the team knows which shared machine tokens to recreate).
+#[derive(Debug, Clone)]
 pub struct RemovalReport {
     pub rotated: Vec<String>,
-    pub skipped: Vec<String>,
+    pub revoked_tokens: Vec<super::api::RevokedTokenInfo>,
+    pub grants_deleted: i64,
 }
 
 /// Remove a member from an org, first rotating every environment they could decrypt (dropping their
 /// grant) so their cached vault keys can't read future writes, then dropping their membership.
+///
+/// An environment this caller holds no grant to is a hard failure, not a warning: removing the
+/// member without re-keying it would leave their cached vault key valid. (The server enforces the
+/// same precondition, so an old client cannot silently skip either.)
 pub fn remove_member(
     api: &dyn SyncApi,
     keypair: &wrap::Keypair,
@@ -380,9 +386,20 @@ pub fn remove_member(
             None => skipped.push(env_id),
         }
     }
-    // Finally drop the membership, revoking their API access.
-    api.remove_member(org_id, user_id)?;
-    Ok(RemovalReport { rotated, skipped })
+    if !skipped.is_empty() {
+        return Err(Error::Input(format!(
+            "cannot complete removal: you hold no grant to environment(s) {}; \
+             ask a member who does to run `sotto rotate` on each, then retry",
+            skipped.join(", ")
+        )));
+    }
+    // Finally drop the membership; the server revokes their grants, tokens, and API access.
+    let receipt = api.remove_member(org_id, user_id)?;
+    Ok(RemovalReport {
+        rotated,
+        revoked_tokens: receipt.revoked_tokens,
+        grants_deleted: receipt.grants_deleted,
+    })
 }
 
 /// Create a machine token for an environment: generate the machine's X25519 keypair locally, open

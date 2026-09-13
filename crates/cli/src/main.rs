@@ -603,15 +603,14 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             let keypair = session::account_keypair(store, &master)?;
             let report = remote::team::remove_member(&client, &keypair, &org_id, &user_id)?;
             eprintln!(
-                "removed {user_id}; rotated {} environment(s)",
-                report.rotated.len()
+                "removed {user_id}; rotated {} environment(s), revoked {} grant(s)",
+                report.rotated.len(),
+                report.grants_deleted,
             );
-            if !report.skipped.is_empty() {
+            for token in &report.revoked_tokens {
                 eprintln!(
-                    "warning: {} environment(s) you can't open were not rotated - ask a member \
-                     who holds them to run `sotto rotate`: {}",
-                    report.skipped.len(),
-                    report.skipped.join(", ")
+                    "revoked machine token `{}` ({}) in environment {}; recreate it if the team still needs it",
+                    token.name, token.token_id, token.env_id,
                 );
             }
             Ok(())
@@ -677,7 +676,12 @@ fn token_command(
         }
         TokenCommand::Ls => {
             for t in remote::SyncApi::list_machine_tokens(&client, &env.id)? {
-                println!("{}  {}", t.token_id, t.name);
+                println!(
+                    "{}  {}  {}",
+                    t.token_id,
+                    t.name,
+                    t.created_by.as_deref().unwrap_or("(unknown creator)")
+                );
             }
             Ok(())
         }

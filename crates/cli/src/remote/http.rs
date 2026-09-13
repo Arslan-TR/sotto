@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use super::api::{
     AccountBundle, BatchRequest, BatchResponse, CreatedMachineToken, CreatedShare, EnvironmentInfo,
     GrantView, Invited, MachineTokenInfo, Me, MemberInfo, NewEnvironment, NewOrg, NewProject,
-    NewShare, OrgInfo, RotateRequest, RotateResponse, Snapshot, SyncApi,
+    NewShare, OrgInfo, RemovalReceipt, RotateRequest, RotateResponse, Snapshot, SyncApi,
 };
 
 /// Row shapes for the two "list of ids" endpoints (each returns `[{ "user_id"|"env_id": ... }]`).
@@ -327,14 +327,14 @@ impl SyncApi for HttpClient {
         parse(resp)
     }
 
-    fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()> {
+    fn remove_member(&self, org_id: &str, user_id: &str) -> Result<RemovalReceipt> {
         let resp = self
             .http
             .delete(self.url(&format!("/orgs/{org_id}/members/{user_id}")))
             .bearer_auth(&self.token)
             .send()
             .map_err(net)?;
-        ok(resp)
+        parse(resp)
     }
 
     fn grant_org_key(&self, org_id: &str, user_id: &str, enc_org_key: &str) -> Result<()> {
