@@ -1088,7 +1088,7 @@ fn theme_command(
         ThemeCommand::Set { name } => {
             if let Some(t) = sotto_cli::theme::find_theme(name, Some(themes_dir)) {
                 sotto_cli::theme::save_theme_preference(&t.name, config_path)?;
-                eprintln!("theme set to {}", current_theme.bold_accent(&t.name));
+                eprintln!("{}", set_confirmation(&t, current_theme.active));
                 Ok(())
             } else {
                 Err(Error::Input(format!(
@@ -1097,6 +1097,13 @@ fn theme_command(
             }
         }
     }
+}
+
+/// The `theme set` confirmation, painted with the just-set theme's palette (a preview of the
+/// new accent) and gated by the resolved theme's styling switch.
+fn set_confirmation(set: &sotto_cli::theme::Theme, active: bool) -> String {
+    let set = set.clone().with_active(active);
+    format!("theme set to {}", set.bold_accent(&set.name))
 }
 
 fn status(app: &App, cwd: &Path, json: bool, theme: &sotto_cli::theme::Theme) -> Result<()> {
@@ -1554,7 +1561,7 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{display_secret, Cli, Command, ThemeCommand};
+    use super::{display_secret, set_confirmation, Cli, Command, ThemeCommand};
 
     #[test]
     fn run_help_explains_command_forwarding() {
@@ -1665,6 +1672,19 @@ mod tests {
         // Bare `sotto theme` defaults to listing.
         let cli = Cli::try_parse_from(["sotto", "theme"]).expect("bare theme should parse");
         assert!(matches!(cli.command, Command::Theme { command: None }));
+    }
+
+    #[test]
+    fn set_confirmation_uses_the_new_theme_palette() {
+        use sotto_cli::theme::Theme;
+        let message = set_confirmation(&Theme::sordino(), true);
+        // Sordino's accent (#c7b47e) previews the just-set theme; nord's (#88c0d0) is the
+        // stale palette the confirmation used to borrow from the previously resolved theme.
+        assert!(message.contains("\x1b[38;2;199;180;126m"), "{message:?}");
+        assert!(!message.contains("\x1b[38;2;136;192;208m"), "{message:?}");
+
+        let plain = set_confirmation(&Theme::sordino(), false);
+        assert_eq!(plain, "theme set to sordino");
     }
 
     #[test]
