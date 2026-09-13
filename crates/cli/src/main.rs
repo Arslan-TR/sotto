@@ -39,6 +39,12 @@ struct Cli {
     /// Use this environment for this command (overrides the project's configured default).
     #[arg(long, global = true)]
     env: Option<String>,
+    /// Use this theme for output styling (nord, sordino, terminal, monochrome, tokyo-night, or custom).
+    #[arg(long, global = true)]
+    theme: Option<String>,
+    /// Disable all colour and styling in output.
+    #[arg(long, global = true)]
+    plain: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -216,6 +222,21 @@ enum Command {
         /// Shell to generate completions for.
         shell: clap_complete::Shell,
     },
+    /// Manage output themes.
+    Theme {
+        #[command(subcommand)]
+        command: Option<ThemeCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ThemeCommand {
+    /// List available themes (built-in presets and custom themes).
+    Ls,
+    /// Set the active theme.
+    Set { name: String },
+    /// Show the current active theme.
+    Current,
 }
 
 #[derive(Subcommand)]
@@ -294,6 +315,44 @@ fn run() -> Result<()> {
     if let Command::Completions { shell } = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
         return Ok(());
+    }
+
+    let config_path = sotto_cli::paths::config_path().ok();
+    let themes_dir = sotto_cli::paths::themes_path().ok();
+    let theme = sotto_cli::theme::resolve_theme(
+        cli.theme.as_deref(),
+        config_path.as_deref(),
+        themes_dir.as_deref(),
+        cli.plain,
+    );
+
+    // An unknown requested name falls back to `nord` inside `resolve_theme`; say so rather
+    // than silently restyling (stderr, so machine-readable stdout is unaffected).
+    let configured_theme = config_path.as_deref().and_then(|p| {
+        remote::config::GlobalConfig::load_from(p)
+            .ok()
+            .flatten()
+            .and_then(|c| c.theme)
+    });
+    let env_theme = std::env::var(sotto_cli::theme::THEME_ENV).ok();
+    if let Some(requested) = sotto_cli::theme::pick_theme_name(
+        cli.theme.as_deref(),
+        env_theme.as_deref(),
+        configured_theme.as_deref(),
+    ) {
+        if !theme.name.eq_ignore_ascii_case(requested) {
+            eprintln!(
+                "warning: unknown theme `{requested}`; falling back to `{}`",
+                theme.name
+            );
+        }
+    }
+
+    // Theme commands need neither the store nor the keychain.
+    if let Command::Theme { command } = &cli.command {
+        let config_path = sotto_cli::paths::config_path()?;
+        let themes_dir = sotto_cli::paths::themes_path()?;
+        return theme_command(command.as_ref(), &theme, &config_path, &themes_dir);
     }
 
     // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
@@ -402,7 +461,7 @@ fn run() -> Result<()> {
             eprintln!("locked");
             Ok(())
         }
-        Command::Status { json } => status(&app, &cwd, json),
+        Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
@@ -470,7 +529,11 @@ fn run() -> Result<()> {
             EnvCommand::Ls => {
                 let config = effective_config(&cwd, cli.env.as_deref())?;
                 for env in app.env_list(&config)? {
-                    let marker = if env == config.environment { "*" } else { " " };
+                    let marker = if env == config.environment {
+                        theme.marker()
+                    } else {
+                        " ".to_string()
+                    };
                     println!("{marker} {env}");
                 }
                 Ok(())
@@ -492,6 +555,7 @@ fn run() -> Result<()> {
             }
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
+        Command::Theme { .. } => unreachable!("theme commands are handled before store init"),
     }
 }
 
@@ -976,7 +1040,61 @@ fn read_share_passphrase() -> Result<Vec<u8>> {
         .map_err(|e| Error::Io(e.to_string()))
 }
 
-fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {
+fn theme_command(
+    command: Option<&ThemeCommand>,
+    current_theme: &sotto_cli::theme::Theme,
+    config_path: &Path,
+    themes_dir: &Path,
+) -> Result<()> {
+    match command.unwrap_or(&ThemeCommand::Ls) {
+        ThemeCommand::Ls => {
+            let themes = sotto_cli::theme::available_themes(Some(themes_dir));
+            for t in themes {
+                // Swatches paint with each theme's own palette, but styling as a whole is
+                // still gated by the resolved theme: piped/`NO_COLOR` output stays plain.
+                let t = t.with_active(current_theme.active);
+                let is_current = t.name.eq_ignore_ascii_case(&current_theme.name);
+                let marker = if is_current {
+                    current_theme.marker()
+                } else {
+                    " ".to_string()
+                };
+                let padded_name = format!("{:<14}", t.name);
+                let styled_name = if is_current {
+                    current_theme.bold_accent(&padded_name)
+                } else {
+                    padded_name
+                };
+                let sample = format!(
+                    "{} {} {} {}",
+                    t.accent("accent"),
+                    t.success("success"),
+                    t.warning("warning"),
+                    t.error("error")
+                );
+                println!("{marker} {styled_name} {sample}");
+            }
+            Ok(())
+        }
+        ThemeCommand::Current => {
+            println!("{}", current_theme.name);
+            Ok(())
+        }
+        ThemeCommand::Set { name } => {
+            if let Some(t) = sotto_cli::theme::find_theme(name, Some(themes_dir)) {
+                sotto_cli::theme::save_theme_preference(&t.name, config_path)?;
+                eprintln!("theme set to {}", current_theme.bold_accent(&t.name));
+                Ok(())
+            } else {
+                Err(Error::Input(format!(
+                    "unknown theme `{name}`; run `sotto theme ls` to see available themes"
+                )))
+            }
+        }
+    }
+}
+
+fn status(app: &App, cwd: &Path, json: bool, theme: &sotto_cli::theme::Theme) -> Result<()> {
     // Only an actually-absent config is "no project"; a present-but-invalid or unreadable config
     // is a real error and must not be reported as "none".
     let config = match Config::discover(cwd) {
@@ -1000,21 +1118,25 @@ fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {
     println!(
         "identity: {}",
         if status.initialized {
-            "set up"
+            theme.success("set up")
         } else {
-            "not set up"
+            theme.muted("not set up")
         }
     );
     println!(
         "session:  {}",
         if status.unlocked {
-            "unlocked"
+            theme.success("unlocked")
         } else {
-            "locked"
+            theme.muted("locked")
         }
     );
     match status.project {
-        Some((project, env)) => println!("project:  {project} ({env})"),
+        Some((project, env)) => println!(
+            "project:  {} ({})",
+            theme.bold_accent(&project),
+            theme.accent(&env)
+        ),
         None => println!("project:  none (no {} here)", config::CONFIG_FILE),
     }
     Ok(())
@@ -1427,7 +1549,7 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{display_secret, Cli, Command};
+    use super::{display_secret, Cli, Command, ThemeCommand};
 
     #[test]
     fn run_help_explains_command_forwarding() {
@@ -1494,6 +1616,50 @@ mod tests {
             );
             assert!(error.to_string().contains("Usage:"));
         }
+    }
+
+    #[test]
+    fn theme_and_plain_flags_parse_globally() {
+        let cli = Cli::try_parse_from(["sotto", "--theme", "sordino", "status"])
+            .expect("--theme should parse");
+        assert_eq!(cli.theme.as_deref(), Some("sordino"));
+        assert!(!cli.plain);
+
+        let cli =
+            Cli::try_parse_from(["sotto", "--plain", "status"]).expect("--plain should parse");
+        assert!(cli.plain);
+        assert!(cli.theme.is_none());
+    }
+
+    #[test]
+    fn theme_subcommands_parse() {
+        let cli = Cli::try_parse_from(["sotto", "theme", "ls"]).expect("theme ls should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Theme {
+                command: Some(ThemeCommand::Ls)
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "theme", "set", "sordino"])
+            .expect("theme set should parse");
+        let Command::Theme { command } = cli.command else {
+            panic!("expected theme command");
+        };
+        assert!(matches!(command, Some(ThemeCommand::Set { name }) if name == "sordino"));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "theme", "current"]).expect("theme current should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Theme {
+                command: Some(ThemeCommand::Current)
+            }
+        ));
+
+        // Bare `sotto theme` defaults to listing.
+        let cli = Cli::try_parse_from(["sotto", "theme"]).expect("bare theme should parse");
+        assert!(matches!(cli.command, Command::Theme { command: None }));
     }
 
     #[test]
