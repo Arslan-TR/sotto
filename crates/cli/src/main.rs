@@ -982,19 +982,28 @@ fn login(
 
     // Preserve a previously configured web URL and theme unless this login overrides it.
     let existing = remote::config::GlobalConfig::load_from(&config_path)?;
-    let existing_web = existing.as_ref().and_then(|c| c.web_url.clone());
-    let existing_theme = existing.as_ref().and_then(|c| c.theme.clone());
-    let web_url = web_override
-        .map(|w| w.trim_end_matches('/').to_string())
-        .or(existing_web);
-    remote::config::GlobalConfig {
-        server_url: Some(server.clone()),
-        web_url,
-        theme: existing_theme,
-    }
-    .save_to(&config_path)?;
+    login_config(existing.as_ref(), server.clone(), web_override).save_to(&config_path)?;
     eprintln!("logged in to {server} (user {})", me.user_id);
     Ok(())
+}
+
+/// Build the config `login` persists: the verified server URL, the new `--web` origin or the
+/// kept one, and whatever theme was already saved. Login must never reset the user's theme.
+fn login_config(
+    existing: Option<&remote::config::GlobalConfig>,
+    server: String,
+    web_override: Option<&str>,
+) -> remote::config::GlobalConfig {
+    let (existing_web, existing_theme) = existing
+        .map(|c| (c.web_url.clone(), c.theme.clone()))
+        .unwrap_or((None, None));
+    remote::config::GlobalConfig {
+        server_url: Some(server),
+        web_url: web_override
+            .map(|w| w.trim_end_matches('/').to_string())
+            .or(existing_web),
+        theme: existing_theme,
+    }
 }
 
 /// Seal a secret, upload it as a share link, and print the link (the fragment key never leaves).
@@ -1561,7 +1570,7 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{display_secret, set_confirmation, Cli, Command, ThemeCommand};
+    use super::{display_secret, login_config, set_confirmation, Cli, Command, ThemeCommand};
 
     #[test]
     fn run_help_explains_command_forwarding() {
@@ -1685,6 +1694,33 @@ mod tests {
 
         let plain = set_confirmation(&Theme::sordino(), false);
         assert_eq!(plain, "theme set to sordino");
+    }
+
+    #[test]
+    fn login_config_keeps_the_saved_theme() {
+        use sotto_cli::remote::config::GlobalConfig;
+        let existing = GlobalConfig {
+            server_url: Some("https://old.example".into()),
+            web_url: Some("https://app.example".into()),
+            theme: Some("sordino".into()),
+        };
+        let merged = login_config(Some(&existing), "https://new.example".into(), None);
+        assert_eq!(merged.server_url.as_deref(), Some("https://new.example"));
+        assert_eq!(merged.web_url.as_deref(), Some("https://app.example"));
+        assert_eq!(merged.theme.as_deref(), Some("sordino"));
+
+        // A --web override wins and still keeps the theme; a fresh login starts clean.
+        let merged = login_config(
+            Some(&existing),
+            "https://new.example".into(),
+            Some("https://w.example/"),
+        );
+        assert_eq!(merged.web_url.as_deref(), Some("https://w.example"));
+        assert_eq!(merged.theme.as_deref(), Some("sordino"));
+
+        let fresh = login_config(None, "https://new.example".into(), None);
+        assert_eq!(fresh.theme, None);
+        assert_eq!(fresh.web_url, None);
     }
 
     #[test]
