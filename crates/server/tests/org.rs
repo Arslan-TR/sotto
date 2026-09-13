@@ -599,6 +599,13 @@ fn org_project_body(id: &str, org_id: &str) -> String {
     )
 }
 
+fn personal_project_body(id: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","enc_name":"{}"}}"#,
+        STANDARD.encode(b"project")
+    )
+}
+
 fn env_body(id: &str) -> String {
     format!(
         r#"{{"id":"{id}","enc_name":"{}","enc_vault_key":"{}"}}"#,
@@ -1114,4 +1121,88 @@ async fn removal_ignores_a_departed_users_grant_when_checking_for_peers() {
     .await
     .expect("count grants");
     assert_eq!(grants, 0, "the removed member's grant is gone");
+}
+
+#[tokio::test]
+async fn removal_leaves_personal_tokens_untouched() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("rm-pers-o", "rm-pers-p", "rm-pers-e");
+    let owner = seed_org_env(&pool, o, p, e, "rm-pers-owner").await;
+    let target = fresh_session(&pool, "rm-pers-target", "rm-pers-target-s").await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("rm-pers-target", "admin"),
+    )
+    .await;
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/environments/{e}/grants"),
+            grant_body("rm-pers-target")
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // One token on the org env, one on the target's own personal env.
+    let (status, body) = post(
+        &pool,
+        &target,
+        &format!("/environments/{e}/tokens"),
+        token_body("org-ci"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create org token: {body}");
+    let org_token = serde_json::from_str::<Value>(&body).expect("token json")["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+    post(
+        &pool,
+        &target,
+        "/projects",
+        personal_project_body("rm-pers-pp"),
+    )
+    .await;
+    post(
+        &pool,
+        &target,
+        "/projects/rm-pers-pp/environments",
+        env_body("rm-pers-pe"),
+    )
+    .await;
+    let (status, body) = post(
+        &pool,
+        &target,
+        "/environments/rm-pers-pe/tokens",
+        token_body("personal-ci"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create personal token: {body}");
+    let personal_token = serde_json::from_str::<Value>(&body).expect("token json")["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    assert_eq!(
+        delete(&pool, &owner, &format!("/orgs/{o}/members/rm-pers-target"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // The org token dies with the membership; the personal one is not the org's to revoke.
+    assert_eq!(
+        get(&pool, Some(&org_token), "/machine/grant").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&pool, Some(&personal_token), "/machine/grant").await.0,
+        StatusCode::OK,
+        "a personal token survives the org removal"
+    );
 }
