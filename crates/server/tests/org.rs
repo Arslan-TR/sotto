@@ -845,7 +845,7 @@ async fn readded_member_starts_grantless() {
         )
         .await
         .0,
-        StatusCode::OK
+        StatusCode::CREATED
     );
     let grants: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM environment_grants WHERE env_id = $1 AND user_id = $2",
