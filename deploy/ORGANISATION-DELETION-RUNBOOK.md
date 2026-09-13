@@ -12,8 +12,12 @@ record.
   a scrape URL or an access-loggable command history entry.
 - Keep `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` unset until the authenticated observation
   procedure below has been reviewed and rehearsed; it is a separate write-capable secret.
-- Load [`ORGANISATION-DELETION-ALERTS.yml`](ORGANISATION-DELETION-ALERTS.yml) into the monitoring
-  system and test one notification without using a real deletion.
+- Arrange alerting on the exporter, and test one notification without using a real deletion. If
+  you run Prometheus, load [`ORGANISATION-DELETION-ALERTS.yml`](ORGANISATION-DELETION-ALERTS.yml).
+  If you do not, `scripts/check-deletion-metrics` decides three of those five rules from a single
+  scrape and needs nothing but the metrics token; the repository runs it six-hourly from
+  `.github/workflows/deletion-alerts.yml`. The remaining two rules need counter history and
+  thresholds no deployment has yet had the throughput to calibrate, and the rules file says so.
 - Run the backup script and restore the dump into an isolated scratch database. Complete the
   rehearsal record at the end of this document before enabling the client control.
 - Confirm that the configured billing provider's API version, restricted key, and webhook endpoint

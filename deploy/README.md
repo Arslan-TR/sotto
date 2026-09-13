@@ -908,8 +908,11 @@ tag. The full operator procedure, including the rehearsal record you must comple
 
 1. A managed backup or export lifecycle covering the configured recovery window, with a restore
    into an isolated scratch database rehearsed and recorded.
-2. `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` set from the deployment secret store, the
-   [alert rules](ORGANISATION-DELETION-ALERTS.yml) loaded, and one notification tested.
+2. `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` set from the deployment secret store, alerting on
+   the exporter arranged, and one notification tested. Prometheus deployments load the
+   [alert rules](ORGANISATION-DELETION-ALERTS.yml); everyone else can use
+   `scripts/check-deletion-metrics`, which decides three of those five rules from one scrape and
+   needs only the token. This repository runs it six-hourly and opens a labelled issue.
 3. `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` set from the deployment secret store, with the
    authenticated observation procedure reviewed and rehearsed.
 4. Billing configured and verified end to end: the provider's API version, restricted key, and
