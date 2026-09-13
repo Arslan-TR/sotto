@@ -1641,6 +1641,17 @@ mod tests {
             err.to_string().contains(&env_id),
             "the error names the un-rotatable env: {err}"
         );
+        // The recovery it prescribes must actually unblock a retry. Rotating would not: it
+        // preserves every holder and grants the remover nothing, so the retry would fail the
+        // same way forever. Being shared the env (or handing the removal over) does.
+        assert!(
+            err.to_string().contains("sotto grant"),
+            "the error points at sharing: {err}"
+        );
+        assert!(
+            !err.to_string().contains("rotate"),
+            "the error must not prescribe a futile rotation: {err}"
+        );
         assert!(
             api.list_members(&org_id)
                 .unwrap()

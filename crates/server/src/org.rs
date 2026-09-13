@@ -873,7 +873,8 @@ async fn remove_member(
         if !missing.is_empty() {
             return Err(Error::Conflict(format!(
                 "cannot complete removal: you hold no grant to environment(s) {}; \
-                 ask a member who does to rotate them first",
+                 ask a member who holds them to share each environment with you and retry, \
+                 or to perform the removal themselves",
                 missing.join(", ")
             )));
         }

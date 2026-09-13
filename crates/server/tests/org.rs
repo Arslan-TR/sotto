@@ -795,6 +795,13 @@ async fn removal_fails_when_the_caller_cannot_rekey() {
         "removal without re-key: {body}"
     );
     assert!(body.contains(e), "the 409 names the env: {body}");
+    // Rotating would not unblock a retry (it preserves every holder), so the recovery the 409
+    // prescribes must be sharing or handing the removal over.
+    assert!(body.contains("share"), "the 409 points at sharing: {body}");
+    assert!(
+        !body.contains("rotate"),
+        "the 409 must not prescribe a futile rotation: {body}"
+    );
     let (_, body) = get(&pool, Some(&owner), &format!("/orgs/{o}/members")).await;
     assert!(body.contains("rm-rekey-member"), "membership retained");
     let grants: i64 = sqlx::query_scalar(

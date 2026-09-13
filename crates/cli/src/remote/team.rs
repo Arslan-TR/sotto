@@ -425,7 +425,8 @@ pub fn remove_member(
     if !blocked.is_empty() {
         return Err(Error::Input(format!(
             "cannot complete removal: you hold no grant to environment(s) {}; \
-             ask a member who does to run `sotto rotate` on each, then retry",
+             ask a member who holds them to run `sotto grant <your-user-id>` in each and retry, \
+             or to run this removal themselves",
             blocked.join(", ")
         )));
     }
