@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Collect native Rust coverage with database tests enabled."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+VERSION = "cargo-llvm-cov 0.9.1"
+EXCLUDE = r"(^|/)(tests|examples)/"
+
+
+def command(args, capture=False):
+    result = subprocess.run(
+        args, cwd=ROOT, check=True, text=True,
+        stdout=subprocess.PIPE if capture else None,
+    )
+    return result.stdout.strip() if capture else None
+
+
+def validate_database():
+    if os.environ.get("SOTTO_RUN_DB_TESTS") != "1":
+        raise ValueError("coverage requires SOTTO_RUN_DB_TESTS=1")
+    try:
+        url = urlsplit(os.environ.get("DATABASE_URL", ""))
+        valid = (
+            url.scheme in ("postgres", "postgresql")
+            and url.hostname in ("localhost", "127.0.0.1", "::1")
+            and len(url.path) > 1
+            and not url.query
+            and not url.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(
+            "coverage requires a local disposable PostgreSQL DATABASE_URL without query parameters"
+        )
+
+
+def main():
+    # This directory belongs to this command. Never retain a prior successful report
+    # when today's preflight, tests or report generation fails.
+    output = ROOT / "target" / "coverage"
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    started = time.monotonic()
+    evidence = {
+        "status": "failed",
+        "scope": "native workspace, default features, database tests enabled",
+        "excluded_source_pattern": EXCLUDE,
+        "exclusions": [
+            "WASM/browser execution", "other operating systems/architectures",
+            "non-default features", "doctest coverage", "dependencies",
+            "scripts and deployment", "live external services",
+        ],
+    }
+    (output / "run.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    try:
+        validate_database()
+        evidence["tool"] = command(["cargo", "llvm-cov", "--version"], capture=True)
+        if evidence["tool"] != VERSION:
+            raise ValueError(f"coverage requires {VERSION}")
+        evidence["rustc"] = command(["rustc", "-vV"], capture=True)
+        evidence["commit"] = command(["git", "rev-parse", "HEAD"], capture=True)
+        evidence["working_tree_dirty"] = bool(command(
+            ["git", "status", "--porcelain"], capture=True,
+        ))
+        args = [
+            "cargo", "llvm-cov", "--workspace", "--locked", "--json", "--summary-only",
+            "--ignore-filename-regex", EXCLUDE, "--output-path", str(output / "summary.json"),
+            "--", "--test-threads=1",
+        ]
+        evidence["test_command"] = args
+        tests_started = time.monotonic()
+        # Normal llvm-cov execution cleans old profiles. Do not add --no-clean.
+        command(args)
+        evidence["test_and_build_seconds"] = round(time.monotonic() - tests_started, 2)
+        command([
+            "cargo", "llvm-cov", "report", "--html", "--ignore-filename-regex", EXCLUDE,
+            "--output-dir", str(output),
+        ])
+        summary = json.loads((output / "summary.json").read_text())
+        if not summary.get("data") or not (output / "html" / "index.html").is_file():
+            raise ValueError("coverage reports are incomplete")
+        evidence["status"] = "passed"
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"coverage failed: {error}", file=sys.stderr)
+        return 1
+    finally:
+        evidence["elapsed_seconds"] = round(time.monotonic() - started, 2)
+        (output / "run.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    print(f"Coverage reports: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

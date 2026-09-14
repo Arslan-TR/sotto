@@ -119,6 +119,11 @@ cargo test --workspace
 
 - When working on server or integration behaviour, use the existing crate test harnesses.
 
+- To collect native Rust coverage with database tests enabled, follow the
+  [coverage baseline guide](.ci/rust-coverage.md). It explains the disposable database,
+  pinned tool, report files and measurement exclusions. Coverage is used to find missing
+  behaviour checks; there is no minimum percentage gate.
+
 - Run the script policy tests too (Python 3.11 or newer; CI uses 3.12):
 
 ```sh

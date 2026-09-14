@@ -1,0 +1,64 @@
+name: Rust coverage
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native Rust coverage (Postgres)
+    runs-on: ubuntu-latest
+    # Baseline collection has no percentage threshold. Measure cold and warm runs
+    # before deciding where it fits in the required PR runtime budget.
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CARGO_TERM_COLOR: always
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      SOTTO_RUN_DB_TESTS: "1"
+      SOTTO_TELEMETRY: "off"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: coverage-0.9.1
+          workspaces: . -> target/llvm-cov-target
+      - name: Install pinned coverage tool
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Coverage runner regression tests
+        run: python3 -B -m unittest discover -s scripts/tests -p test_rust_coverage.py -v
+      - name: Native workspace coverage with Postgres
+        run: scripts/check-rust-coverage
+      - name: Retain reports and run status
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-coverage-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/coverage/
+          if-no-files-found: warn
+          retention-days: 14
