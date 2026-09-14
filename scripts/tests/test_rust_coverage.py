@@ -1,5 +1,6 @@
 """Exercise the coverage entry point without compiling the workspace."""
 
+import io
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,78 @@ class CoverageTests(unittest.TestCase):
         self.script = Path(self.directory.name) / "scripts" / SCRIPT.name
         self.script.parent.mkdir()
         self.script.write_text(SCRIPT.read_text())
+
+    def run_report_fixture(self, failure=None):
+        main = runpy.run_path(str(self.script))["main"]
+        output = Path(self.directory.name).resolve() / "target" / "coverage"
+        calls = []
+        # Same top-level shape as the retained LLVM JSON report; the runner checks
+        # availability, not individual line counts or a coverage percentage.
+        summary = {"type": "llvm.coverage.json.export", "version": "2.0.1",
+                   "data": [{"files": [], "totals": {"lines": {
+                       "count": 10, "covered": 8, "percent": 80.0,
+                   }}}]}
+
+        def command(args, **kwargs):
+            calls.append(args)
+            if args == ["cargo", "llvm-cov", "--version"]:
+                return "cargo-llvm-cov 0.9.1"
+            if args == ["git", "rev-parse", "HEAD"]:
+                return "fixture-commit"
+            if args == ["git", "status", "--porcelain"]:
+                return ""
+            if args == ["rustc", "-vV"]:
+                return "fixture-compiler"
+            if args[:3] == ["cargo", "llvm-cov", "--workspace"]:
+                self.assertIn("--json", args)
+                self.assertIn("--summary-only", args)
+                destination = Path(args[args.index("--output-path") + 1])
+                if failure != "missing summary":
+                    content = json.dumps(summary)
+                    if failure == "malformed JSON":
+                        content = "{"
+                    elif failure == "empty data":
+                        content = '{"data": []}'
+                    destination.write_text(content)
+                return None
+            self.assertEqual(args, [
+                "cargo", "llvm-cov", "report", "--html", "--ignore-filename-regex",
+                r"(^|/)(tests|examples)/", "--output-dir", str(output),
+            ])
+            if failure == "report command":
+                raise subprocess.CalledProcessError(9, args)
+            if failure != "missing HTML":
+                html = Path(args[args.index("--output-dir") + 1]) / "html"
+                html.mkdir()
+                (html / "index.html").write_text("<!doctype html><title>Coverage</title>")
+            return None
+
+        with patch.dict(main.__globals__, command=command), patch.dict(
+            os.environ, SOTTO_RUN_DB_TESTS="1", DATABASE_URL="postgres://localhost/disposable"
+        ), patch("sys.stdout", new_callable=io.StringIO), patch(
+            "sys.stderr", new_callable=io.StringIO
+        ):
+            result = main()
+        self.assertEqual(sum(args[:3] == ["cargo", "llvm-cov", "report"] for args in calls), 1)
+        return result, json.loads((output / "run.json").read_text())
+
+    def test_successful_reports_record_passing_evidence(self):
+        result, evidence = self.run_report_fixture()
+        self.assertEqual(result, 0)
+        self.assertEqual(evidence["status"], "passed")
+        self.assertEqual(evidence["commit"], "fixture-commit")
+        self.assertEqual(evidence["tool"], "cargo-llvm-cov 0.9.1")
+        self.assertFalse(evidence["working_tree_dirty"])
+        self.assertGreaterEqual(evidence["elapsed_seconds"], 0)
+
+    def test_failed_or_incomplete_reports_cannot_pass(self):
+        for failure in (
+            "report command", "missing summary", "malformed JSON", "empty data", "missing HTML",
+        ):
+            with self.subTest(failure=failure):
+                result, evidence = self.run_report_fixture(failure)
+                self.assertNotEqual(result, 0)
+                self.assertEqual(evidence["status"], "failed")
 
     def test_failed_test_run_cannot_leave_successful_evidence(self):
         module = runpy.run_path(str(SCRIPT))
