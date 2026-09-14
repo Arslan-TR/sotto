@@ -99,8 +99,13 @@ impl Color {
             _ => {}
         }
 
-        // Try hex RGB
+        // Try hex RGB. The slicer below indexes bytes, so require ASCII hexdigits before
+        // measuring: a multibyte value of length 3 or 6 (e.g. "€") would otherwise panic
+        // on a non-char-boundary instead of parsing as invalid.
         let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         if hex.len() == 6 {
             let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
             let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
@@ -588,6 +593,16 @@ mod tests {
     }
 
     #[test]
+    fn color_parsing_rejects_multibyte_input_without_panicking() {
+        // "€" is 3 bytes and "€abc" is 6 bytes: byte-length checks alone would route them
+        // into the hex slicer and panic on a non-char-boundary. They must return None.
+        assert_eq!(Color::parse("€"), None);
+        assert_eq!(Color::parse("€abc"), None);
+        assert_eq!(Color::parse("#€€"), None);
+        assert_eq!(Color::parse("é8"), None);
+    }
+
+    #[test]
     fn color_toml_round_trip() {
         #[derive(Debug, PartialEq, Serialize, Deserialize)]
         struct Wrap {
@@ -736,6 +751,17 @@ mod tests {
 
         // A missing directory yields no themes rather than an error.
         assert!(load_custom_themes(&dir.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn load_custom_themes_skips_multibyte_colours_without_panicking() {
+        // A 3-byte "€" colour reaches the hex slicer; it must be an invalid theme (skipped),
+        // not a panic that takes down every command resolving themes.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = custom_toml("name = \"bad\"").replace("#ffffff", "€");
+        std::fs::write(dir.path().join("bad.toml"), &bad).unwrap();
+        assert!(toml::from_str::<Theme>(&bad).is_err());
+        assert!(load_custom_themes(dir.path()).is_empty());
     }
 
     #[test]
