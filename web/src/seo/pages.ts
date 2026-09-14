@@ -107,7 +107,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         head: "Stay in sync.",
-        body: "Rotate a key in one place and everyone picks it up. Remove someone and the keys rotate away from them.",
+        body: "Change a value in one place, push, and teammates get it on their next pull. Remove someone and the keys rotate away from them.",
       },
     ],
     terminal: [
@@ -198,7 +198,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         head: "Rotate in one place.",
-        body: "Set the new value, push, and everyone picks it up. The leaked value dies everywhere at once.",
+        body: "Revoke the old key at the provider, set the new one, and push. Teammates get it on their next pull, and CI on its next run.",
       },
     ],
     terminal: [
@@ -220,7 +220,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         q: "Someone pasted a key in chat. Now what?",
-        a: "Rotate it: revoke the old key at the provider, set the new value, and push. Everyone picks it up, then delete the message.",
+        a: "Rotate it: revoke the old key at the provider, set the new value, and push. Teammates get it on their next pull. Then delete the message.",
       },
     ],
     closingTitle: "Keys change. Chat is forever.",
