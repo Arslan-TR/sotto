@@ -121,6 +121,23 @@ class CoverageTests(unittest.TestCase):
             self.assertEqual(json.loads((report / "run.json").read_text())["status"], "failed")
             self.assertFalse(any(args[:3] == ["cargo", "llvm-cov", "report"] for args in calls))
 
+    def test_unpinned_tool_version_fails_before_running_tests(self):
+        main = runpy.run_path(str(self.script))["main"]
+        for version in ("cargo-llvm-cov 0.9.0", "cargo-llvm-cov 0.9.2", ""):
+            with self.subTest(version=version), patch.dict(
+                os.environ, SOTTO_RUN_DB_TESTS="1", DATABASE_URL="postgres://localhost/disposable"
+            ), patch.dict(main.__globals__, command=lambda *args, **kwargs: version), patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as stderr:
+                self.assertNotEqual(main(), 0)
+                self.assertIn("requires cargo-llvm-cov 0.9.1", stderr.getvalue())
+                evidence = json.loads(
+                    (Path(self.directory.name) / "target/coverage/run.json").read_text()
+                )
+                self.assertEqual(evidence["status"], "failed")
+                self.assertEqual(evidence["tool"], version)
+                self.assertNotIn("test_command", evidence)
+
     def test_database_must_be_explicit_and_local(self):
         for url in (
             "", "postgres://remote.example/sotto",
