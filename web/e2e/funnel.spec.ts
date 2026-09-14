@@ -224,7 +224,7 @@ test.describe("landing page prerender (no scripting)", () => {
     {
       slug: "one-time-secret-links",
       h1: "One-time links that burn after reading.",
-      faq: "Can the link be opened twice?",
+      faq: "Can the secret be read twice?",
     },
     {
       slug: "share-api-keys-securely",

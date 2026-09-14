@@ -80,8 +80,8 @@ export const guidePages: SeoPageData[] = [
         a: "No. They open the link in a browser and read the secret once. No account, no install.",
       },
       {
-        q: "What happens after the link is opened?",
-        a: "The link burns on first view. Opening it a second time shows nothing.",
+        q: "What happens once it has been read?",
+        a: "The link burns. Anyone who tries it afterwards gets a message that it is no longer valid, and nothing else.",
       },
     ],
     closingTitle: "Stop pasting secrets into chat",
@@ -149,7 +149,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         head: "Send it anywhere.",
-        body: "Email, chat, ticket. The link is useless to anyone except the first opener.",
+        body: "Email, chat, ticket. The link is useless to anyone but its first reader.",
       },
       {
         head: "First view burns it.",
@@ -167,8 +167,8 @@ export const guidePages: SeoPageData[] = [
         a: "No. They open the link, read the secret, and the link burns. Nothing to install or sign up for.",
       },
       {
-        q: "Can the link be opened twice?",
-        a: "No. The first view burns it, unless you explicitly allowed more with `--views`. A spent link shows an empty page.",
+        q: "Can the secret be read twice?",
+        a: "No. The first read burns the link, unless you explicitly allowed more with `--views`. After that it only says the link is no longer valid.",
       },
       {
         q: "How is this different from emailing the secret?",
@@ -232,7 +232,7 @@ export const guidePages: SeoPageData[] = [
     description:
       "Send a password through a link that stops working after one read. No recipient account, no copy left in chat or email.",
     h1: "Send a password that can only be read once.",
-    lead: "Some secrets belong to one person, once: a wifi password, a door code, a temporary login. Sotto wraps them in a link that burns the first time it is opened.",
+    lead: "Some secrets belong to one person, once: a wifi password, a door code, a temporary login. Sotto wraps them in a link that burns the first time it is read.",
     ctaSecondary: { label: "Try a one-time link", href: "/one-time-secret-links" },
     stepsTitle: "One secret, one view",
     steps: [
@@ -260,8 +260,8 @@ export const guidePages: SeoPageData[] = [
         a: "No. She opens the link, reads the password, and the link burns. A browser is the whole requirement.",
       },
       {
-        q: "What if she opens it twice?",
-        a: "The second visit shows an empty page. If she needs it again, send a fresh link.",
+        q: "What if she opens it again later?",
+        a: "She gets a message that the link is no longer valid. If she needs the password again, send a fresh link.",
       },
       {
         q: "Can I add a passphrase on top?",
