@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   createGrant,
@@ -94,6 +94,9 @@ export function VaultView({
   const [orgRoles, setOrgRoles] = useState<Map<string, string>>(new Map());
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Selection loads can resolve out of order; only the latest generation may update the view.
+  const projectLoad = useRef(0);
+  const envLoad = useRef(0);
 
   /// The name-decryption key for a project: its org key when we hold one, else the master key.
   function nameKeyFor(orgId: string | null): Uint8Array {
@@ -136,6 +139,8 @@ export function VaultView({
   }, [master, encPrivateKeys]);
 
   async function selectProject(np: NamedProject) {
+    const load = ++projectLoad.current;
+    ++envLoad.current; // a project switch also invalidates any in-flight environment load
     setError(null);
     setNotice(null);
     setActiveProject(np);
@@ -147,15 +152,22 @@ export function VaultView({
     try {
       const key = nameKeyFor(np.project.orgId);
       const rows = await fetchEnvironments(np.project.id);
+      if (load !== projectLoad.current) {
+        return;
+      }
       setEnvs(
         rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
       );
     } catch (e) {
+      if (load !== projectLoad.current) {
+        return;
+      }
       setError(message(e));
     }
   }
 
   async function selectEnv(ne: NamedEnv) {
+    const load = ++envLoad.current;
     setError(null);
     setNotice(null);
     setOpenEnv(null);
@@ -166,12 +178,19 @@ export function VaultView({
       // Open via our OWN grant, not the env's inline key - on a shared env the inline key is the
       // creator's grant, which our keypair can't open.
       const grant = await fetchMyGrant(ne.env.id);
+      if (load !== envLoad.current) {
+        return;
+      }
       if (grant === null) {
         setError("you have no key for this environment - ask an admin to share it with you");
         return;
       }
       const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
-      const secrets = (await fetchSecrets(ne.env.id))
+      const rows = await fetchSecrets(ne.env.id);
+      if (load !== envLoad.current) {
+        return;
+      }
+      const secrets = rows
         .filter((entry) => !entry.deleted)
         .map((entry) => ({
           entry,
@@ -182,9 +201,16 @@ export function VaultView({
       // Org project: load the member list so the env can be shared from here.
       const orgId = activeProject?.project.orgId;
       if (orgId) {
-        setMembers(await fetchMembers(orgId));
+        const rows = await fetchMembers(orgId);
+        if (load !== envLoad.current) {
+          return;
+        }
+        setMembers(rows);
       }
     } catch (e) {
+      if (load !== envLoad.current) {
+        return;
+      }
       setError(message(e));
     }
   }
