@@ -14,16 +14,29 @@ rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov --version 0.9.1 --locked
 ```
 
-Start a disposable local Postgres database, then run:
+Start a local Postgres server and install its `createdb`/`dropdb` client commands.
+Create a fresh database for every run, including reruns. Adjust the example connection
+details to match your local server:
 
 ```sh
+sotto_coverage_db="sotto_coverage_$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+createdb --maintenance-db=postgres://sotto:sotto@localhost:5432/postgres \
+  --template=template0 "$sotto_coverage_db" && \
 SOTTO_RUN_DB_TESTS=1 \
-DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto \
+DATABASE_URL="postgres://sotto:sotto@localhost:5432/$sotto_coverage_db" \
 SOTTO_TELEMETRY=off \
 scripts/check-rust-coverage
 ```
 
-These tests modify database contents. Use a dedicated test database. The runner requires
+After inspecting the result, remove only the database created above:
+
+```sh
+dropdb --maintenance-db=postgres://sotto:sotto@localhost:5432/postgres "$sotto_coverage_db"
+```
+
+These tests modify database contents. Reusing a database can leave fixtures that affect
+later runs; a dedicated but reused database is not a fresh baseline. Creation must succeed
+before running coverage. CI already starts a fresh Postgres service for each job. The runner requires
 explicit opt-in and a localhost/loopback PostgreSQL URL without query parameters. It
 never reads `.env`. Existing DB test harnesses connect and migrate the supplied database;
 connection/migration errors fail the test run instead of generating a DB-free baseline.
