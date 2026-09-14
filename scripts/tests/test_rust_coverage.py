@@ -143,6 +143,8 @@ class CoverageTests(unittest.TestCase):
         for url in (
             "", "postgres://remote.example/sotto",
             "postgres://localhost/sotto?host=remote.example",
+            "postgres://localhost", "postgres://localhost/",
+            "postgres://localhost/sotto#fragment",
         ):
             with self.subTest(url=url):
                 env = os.environ.copy()
