@@ -62,7 +62,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         head: "It burns after reading.",
-        body: "The link works once, then it is gone. Nothing lingers in chat history.",
+        body: "The link works once, then stops working. All that is left in chat is a dead link.",
       },
     ],
     terminal: [
@@ -137,11 +137,11 @@ export const guidePages: SeoPageData[] = [
     slug: "one-time-secret-links",
     tabTitle: "One-time secret links that burn after reading | Sotto",
     description:
-      "Create a link that reveals a secret exactly once, then destroys it. No account needed for the recipient.",
+      "Create a link that reveals a secret exactly once, then stops working. No account needed for the recipient.",
     h1: "One-time links that burn after reading.",
-    lead: "Create a link that reveals a secret exactly once, then destroys it. Send credentials to a contractor, a client, or a future teammate without leaving a copy in your chat history.",
+    lead: "Create a link that reveals a secret exactly once, then stops working. Send credentials to a contractor, a client, or a future teammate without leaving a copy in your chat history.",
     ctaSecondary: { label: "How sharing works", href: "/share-secrets-securely" },
-    stepsTitle: "Send once, gone forever",
+    stepsTitle: "Send once, read once",
     steps: [
       {
         head: "Create the link.",
@@ -153,7 +153,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         head: "First view burns it.",
-        body: "The server deletes the secret the moment it is read. Forwarded links reveal nothing.",
+        body: "Once it is read, the server refuses every later request for it, so a forwarded link reveals nothing. The server never had the key.",
       },
     ],
     terminal: [
@@ -164,7 +164,7 @@ export const guidePages: SeoPageData[] = [
     faqs: [
       {
         q: "Does the recipient need an account?",
-        a: "No. They open the link, read the secret, and it is gone. Nothing to install or sign up for.",
+        a: "No. They open the link, read the secret, and the link burns. Nothing to install or sign up for.",
       },
       {
         q: "Can the link be opened twice?",
@@ -172,7 +172,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         q: "How is this different from emailing the secret?",
-        a: "Email keeps a copy forever, in your sent folder and theirs. A burn-after-reading link leaves no copy anywhere after it is read.",
+        a: "Email keeps a readable copy forever, in your sent folder and theirs. A burn-after-reading link stops working once it is read, and the server only ever held ciphertext it has no key for.",
       },
     ],
     closingTitle: "Send your first burning link",
@@ -230,8 +230,8 @@ export const guidePages: SeoPageData[] = [
     slug: "send-password-securely",
     tabTitle: "Send a password securely with a one-time link | Sotto",
     description:
-      "Send a password that deletes itself after one read. No recipient account, no copy left in chat or email.",
-    h1: "Send a password that deletes itself.",
+      "Send a password through a link that stops working after one read. No recipient account, no copy left in chat or email.",
+    h1: "Send a password that can only be read once.",
     lead: "Some secrets belong to one person, once: a wifi password, a door code, a temporary login. Sotto wraps them in a link that burns the first time it is opened.",
     ctaSecondary: { label: "Try a one-time link", href: "/one-time-secret-links" },
     stepsTitle: "One secret, one view",
@@ -246,7 +246,7 @@ export const guidePages: SeoPageData[] = [
       },
       {
         head: "First view burns it.",
-        body: "The moment it is read, the secret is gone from the server. Screenshots of the link are useless afterwards.",
+        body: "The moment it is read, the link stops working. Screenshots of it are useless afterwards.",
       },
     ],
     terminal: [
@@ -257,7 +257,7 @@ export const guidePages: SeoPageData[] = [
     faqs: [
       {
         q: "Does my mum need to install anything?",
-        a: "No. She opens the link, reads the password, and it is gone. A browser is the whole requirement.",
+        a: "No. She opens the link, reads the password, and the link burns. A browser is the whole requirement.",
       },
       {
         q: "What if she opens it twice?",

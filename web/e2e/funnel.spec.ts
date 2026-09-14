@@ -233,7 +233,7 @@ test.describe("landing page prerender (no scripting)", () => {
     },
     {
       slug: "send-password-securely",
-      h1: "Send a password that deletes itself.",
+      h1: "Send a password that can only be read once.",
       faq: "Does my mum need to install anything?",
     },
     {
