@@ -13,7 +13,11 @@
 import { guidePages, type SeoPageData, type SeoTerminalLine } from "./pages";
 
 function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 // Prose fields: escaped, with `backticks` promoted to <code>.
@@ -51,7 +55,10 @@ const NAV_LABELS: Record<string, string> = {
 function footerHtml(page: SeoPageData): string {
   const guides = guidePages
     .filter((other) => other.slug !== page.slug)
-    .map((other) => `<a href="/${other.slug}">${NAV_LABELS[other.slug] ?? other.slug}</a>`)
+    .map(
+      (other) =>
+        `<a href="/${escapeHtml(other.slug)}">${escapeHtml(NAV_LABELS[other.slug] ?? other.slug)}</a>`,
+    )
     .join("");
   return `<footer><nav aria-label="Guides">${guides}<a href="/#pricing">Pricing</a><a href="https://github.com/getsotto/sotto">GitHub</a></nav><p class="muted">Sotto: end-to-end encrypted secret sync. Apache-2.0.</p></footer>`;
 }
@@ -68,7 +75,7 @@ export function snapshotFor(page: SeoPageData): string {
     .join("");
   return `<main class="seo">
 <header class="mast"><a class="wordmark" href="/">Sotto</a><nav class="site" aria-label="Site"><a href="/#how">How it works</a><a href="/#pricing">Pricing</a><a href="https://github.com/getsotto/sotto">GitHub</a><a href="/app">Log in</a></nav></header>
-<section class="plain"><h1>${escapeHtml(page.h1)}</h1><p class="lead">${inline(page.lead)}</p><div class="cta-row"><a class="btn primary" href="/#start">Get Sotto</a><a class="btn ghost" href="${page.ctaSecondary.href}">${escapeHtml(page.ctaSecondary.label)}</a></div></section>
+<section class="plain"><h1>${escapeHtml(page.h1)}</h1><p class="lead">${inline(page.lead)}</p><div class="cta-row"><a class="btn primary" href="/#start">Get Sotto</a><a class="btn ghost" href="${escapeHtml(page.ctaSecondary.href)}">${escapeHtml(page.ctaSecondary.label)}</a></div></section>
 <section><h2>${escapeHtml(page.stepsTitle)}</h2><ol class="steps">${steps}</ol>${terminalHtml(page.terminal)}</section>
 <section><h2>Questions, answered</h2>${faqs}</section>
 <section><h2>${escapeHtml(page.closingTitle)}</h2><p>${inline(page.closingBody)}</p><div class="cta-row"><a class="btn primary" href="/#start">Get Sotto</a></div></section>
@@ -89,5 +96,6 @@ export function faqJsonLd(page: SeoPageData): string {
       acceptedAnswer: { "@type": "Answer", text: plain(faq.a) },
     })),
   });
-  return `<script type="application/ld+json">${json}</script>`;
+  // `<` is escaped so that no answer can close the script element early.
+  return `<script type="application/ld+json">${json.replace(/</g, "\\u003c")}</script>`;
 }
