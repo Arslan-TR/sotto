@@ -1,0 +1,134 @@
+/* Guide pages: the landing page's quiet-document voice, scoped to `main.seo`.
+ * Base elements (main, header, h1-h3, p, section, code) inherit the Sordino
+ * layer; everything here is what guides add: site nav, lead, steps, terminal
+ * transcript, faq, and calls to action. Tokens come from sordino.css.
+ */
+
+main.seo nav.site {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  font-size: var(--text-sm);
+}
+
+main.seo nav.site a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+main.seo nav.site a:hover {
+  color: var(--text-body);
+  text-decoration: underline;
+}
+
+main.seo p.lead {
+  font-size: var(--text-md);
+  color: var(--text-muted);
+}
+
+main.seo ol.steps {
+  margin: 0 0 var(--space-4);
+  padding-left: 1.3em;
+  max-width: var(--measure);
+}
+
+main.seo ol.steps li {
+  margin-bottom: var(--space-3);
+}
+
+main.seo pre.term {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.7;
+  color: var(--term-fg);
+  background: var(--term-bg);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+
+main.seo pre.term .dim {
+  color: var(--term-dim);
+}
+
+main.seo pre.term .value {
+  color: var(--term-value);
+  font-weight: var(--weight-bold);
+}
+
+main.seo .cta-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: var(--space-4);
+}
+
+main.seo .btn {
+  display: inline-block;
+  padding: 7px 18px;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-snug);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--ink);
+}
+
+main.seo .btn.primary {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+main.seo .btn.ghost {
+  border-color: var(--border-strong);
+  color: var(--text-body);
+  background: transparent;
+}
+
+main.seo details {
+  border-top: var(--border-hairline);
+  padding: var(--space-3) 0;
+  max-width: var(--measure);
+}
+
+main.seo details:last-of-type {
+  border-bottom: var(--border-hairline);
+}
+
+main.seo summary {
+  cursor: pointer;
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-base);
+}
+
+main.seo details p {
+  margin: var(--space-2) 0 var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-base);
+}
+
+main.seo footer {
+  margin-top: var(--space-6);
+  padding-top: var(--space-5);
+  border-top: var(--border-hairline);
+}
+
+main.seo footer nav {
+  display: flex;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+main.seo footer nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+main.seo footer nav a:hover {
+  text-decoration: underline;
+}

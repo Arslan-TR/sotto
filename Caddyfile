@@ -91,9 +91,12 @@ www.{$SOTTO_DOMAIN} {
 	}
 
 	# Everything else is the SPA, including client-side routes (/, /app, /s/:token, /auth/callback).
+	# The middle branch serves the prerendered guide files the build emits (`/<slug>` reads
+	# `/<slug>.html`), so crawlers get each guide's own snapshot and head tags. Anything else
+	# still falls back to the app shell, and React routes it client-side.
 	handle {
 		root * ./web/dist
-		try_files {path} /index.html
+		try_files {path} {path}.html /index.html
 		file_server
 
 		# Caching: Vite's content-hashed assets never change under the same name, so they may be

@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
+
+import { guidePages, type SeoPageData } from "./src/seo/pages";
+import { faqJsonLd, snapshotFor } from "./src/seo/snapshot";
 
 // Strict Content-Security-Policy for the web client. `wasm-unsafe-eval` is required to instantiate
 // WebAssembly; everything else is locked to same-origin with no inline scripts, no embedding, and
@@ -145,6 +150,12 @@ Sitemap: ${origin}/sitemap.xml
 }
 
 function sitemapXml(origin: string): string {
+  const guides = guidePages
+    .map(
+      (page) =>
+        `  <url>\n    <loc>${origin}/${page.slug}</loc>\n    <changefreq>monthly</changefreq>\n    <priority>0.8</priority>\n  </url>`,
+    )
+    .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
@@ -152,8 +163,99 @@ function sitemapXml(origin: string): string {
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
+${guides}
 </urlset>
 `;
+}
+
+// Guide pages (/<slug>): one prerendered HTML file each, derived from the
+// finished index.html so every route ships the same CSP, SRI hashes, and
+// origin handling. Each file swaps the snapshot and the head tags (title,
+// description, social, canonical) and appends its FAQ structured data.
+// Replacements use function replacers throughout, so `$` sequences in future
+// copy can never be misread as replacement patterns.
+function escHead(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function swapOnce(
+  html: string,
+  pattern: string | RegExp,
+  replacement: string,
+  what: string,
+): string {
+  const found = typeof pattern === "string" ? html.includes(pattern) : pattern.test(html);
+  if (!found) {
+    throw new Error(`sotto-seo-prerender: ${what} not found while building guide pages`);
+  }
+  return html.replace(pattern, () => replacement);
+}
+
+function guideFile(
+  base: string,
+  origin: string,
+  landingMount: string,
+  page: SeoPageData,
+): string {
+  const url = `${origin}/${page.slug}`;
+  const description = escHead(page.description);
+  const tabTitle = escHead(page.tabTitle);
+  let html = swapOnce(
+    base,
+    landingMount,
+    `<div id="root">${snapshotFor(page)}</div>`,
+    "landing mount point",
+  );
+  html = swapOnce(html, /<title>[^<]*<\/title>/, `<title>${tabTitle}</title>`, "title tag");
+  // The description tags span several source lines; the patterns tolerate
+  // any whitespace there and emit compact single-line replacements.
+  html = swapOnce(
+    html,
+    /<meta\s+name="description"\s+content="[^"]*"\s*\/>/,
+    `<meta name="description" content="${description}" />`,
+    "meta description",
+  );
+  html = swapOnce(
+    html,
+    /<meta property="og:title" content="[^"]*" \/>/,
+    `<meta property="og:title" content="${tabTitle}" />`,
+    "og:title tag",
+  );
+  html = swapOnce(
+    html,
+    /<meta\s+property="og:description"\s+content="[^"]*"\s*\/>/,
+    `<meta property="og:description" content="${description}" />`,
+    "og:description tag",
+  );
+  html = swapOnce(
+    html,
+    `<meta property="og:url" content="${origin}/" />`,
+    `<meta property="og:url" content="${url}" />`,
+    "og:url tag",
+  );
+  html = swapOnce(
+    html,
+    `<link rel="canonical" href="${origin}/" />`,
+    `<link rel="canonical" href="${url}" />`,
+    "canonical link",
+  );
+  html = swapOnce(
+    html,
+    /<meta name="twitter:title" content="[^"]*" \/>/,
+    `<meta name="twitter:title" content="${tabTitle}" />`,
+    "twitter:title tag",
+  );
+  html = swapOnce(
+    html,
+    /<meta\s+name="twitter:description"\s+content="[^"]*"\s*\/>/,
+    `<meta name="twitter:description" content="${description}" />`,
+    "twitter:description tag",
+  );
+  return swapOnce(html, "</head>", `${faqJsonLd(page)}\n  </head>`, "head closing tag");
 }
 const seoSnapshot = (statusUrl: string | undefined) => `<main class="landing">
 <header><span class="wordmark">Sotto</span><nav aria-label="Site"><a href="#how">How it works</a><a href="#trust">Trust</a><a href="#pricing">Pricing</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto">GitHub</a><a class="login" href="/app">Log in</a></nav></header>
@@ -188,7 +290,7 @@ sotto import .env            # optional: pull in an existing file, still encrypt
 sotto run -- npm start       # inject secrets into any command
 sotto login &amp;&amp; sotto push    # optional: sync ciphertext via getsotto.co.uk
 sotto share DATABASE_URL     # one-time link for a single secret</code></pre><p>Sotto works fully offline until you <code>sotto login</code>. Sync is a feature, not a requirement. The web vault at this address decrypts in your browser, with keys that never leave your devices.</p></section>
-<footer><nav aria-label="Footer"><a href="https://github.com/getsotto/sotto">GitHub</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto/releases">Releases</a><a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">Threat model</a><a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">Security policy</a><a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">Run your own</a>${statusLink(statusUrl)}<a href="/app">Log in</a></nav><p class="muted">Sotto takes its name from <em>sotto voce</em>: in a low voice, in confidence. Apache-2.0.</p></footer>
+<footer><nav aria-label="Guides"><a href="/share-secrets-securely">Share secrets</a><a href="/share-env-files">Share .env files</a><a href="/one-time-secret-links">One-time links</a><a href="/share-api-keys-securely">Share API keys</a><a href="/send-password-securely">Send passwords</a><a href="/self-hosted-secret-management">Self-hosting</a></nav><nav aria-label="Footer"><a href="https://github.com/getsotto/sotto">GitHub</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto/releases">Releases</a><a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">Threat model</a><a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">Security policy</a><a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">Run your own</a>${statusLink(statusUrl)}<a href="/app">Log in</a></nav><p class="muted">Sotto takes its name from <em>sotto voce</em>: in a low voice, in confidence. Apache-2.0.</p></footer>
 </main>`;
 
 // Tolerates reformatting of the root div (whitespace, extra attributes) but still fails
@@ -219,6 +321,18 @@ function seoPrerenderPlugin(): Plugin {
       const origin = publicOrigin();
       this.emitFile({ type: "asset", fileName: "robots.txt", source: robotsTxt(origin) });
       this.emitFile({ type: "asset", fileName: "sitemap.xml", source: sitemapXml(origin) });
+    },
+    // Guide files derive from the finished index.html on disk, not from the
+    // bundle: HTML transforms run after bundle generation, so this is the
+    // first hook that can see the transformed page with its CSP and SRI.
+    writeBundle(options) {
+      const dir = options.dir ?? "dist";
+      const origin = publicOrigin();
+      const base = readFileSync(join(dir, "index.html"), "utf8");
+      const landingMount = `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL)}</div>`;
+      for (const page of guidePages) {
+        writeFileSync(join(dir, `${page.slug}.html`), guideFile(base, origin, landingMount, page));
+      }
     },
   };
 }

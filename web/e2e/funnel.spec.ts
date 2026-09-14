@@ -206,6 +206,53 @@ test.describe("landing page prerender (no scripting)", () => {
       "https://status.example.test",
     );
   });
+
+  // One entry per guide route, loaded by file name: the bytes the build emits, which Caddy serves
+  // at the clean path. With scripting off, only the prerendered copy can satisfy these.
+  const guides = [
+    {
+      slug: "share-secrets-securely",
+      h1: "Share secrets securely.",
+      faq: "Can Sotto read the secrets I share?",
+    },
+    {
+      slug: "share-env-files",
+      h1: "Share .env files without the screenshot dance.",
+      faq: "Do I have to delete my .env file?",
+    },
+    {
+      slug: "one-time-secret-links",
+      h1: "One-time links that burn after reading.",
+      faq: "Can the secret be read twice?",
+    },
+    {
+      slug: "share-api-keys-securely",
+      h1: "Share API keys without pasting them into chat.",
+      faq: "How does CI get secrets?",
+    },
+    {
+      slug: "send-password-securely",
+      h1: "Send a password that can only be read once.",
+      faq: "Does my mum need to install anything?",
+    },
+    {
+      slug: "self-hosted-secret-management",
+      h1: "Secret management you can self-host.",
+      faq: "What leaves my box?",
+    },
+  ] as const;
+
+  for (const guide of guides) {
+    test(`${guide.slug} serves its own prerendered page`, async ({ page }) => {
+      await page.goto(`/${guide.slug}.html`);
+      await expect(page.getByRole("heading", { name: guide.h1, exact: true })).toBeVisible();
+      await expect(page.getByText(guide.faq, { exact: false })).toBeVisible();
+      await expect(page.locator('link[rel="canonical"]')).toHaveAttribute(
+        "href",
+        new RegExp(`/${guide.slug}$`),
+      );
+    });
+  }
 });
 
 test("the status link survives React replacing the snapshot", async ({ page }) => {
@@ -216,4 +263,25 @@ test("the status link survives React replacing the snapshot", async ({ page }) =
     "href",
     "https://status.example.test",
   );
+});
+
+test("guide routes render their page client-side", async ({ page }) => {
+  // The trailing slash is deliberate. vite preview, like the edge, answers `/<slug>` with the
+  // prerendered guide, so a broken router there is caught only if React replaces it before the
+  // assertion looks. `/<slug>/` gets the app shell, whose snapshot is the landing page, so only
+  // the router can put the guide on screen. One route stands in for all six; the per-file
+  // content is pinned by the no-scripting tests above.
+  await page.goto("/share-env-files/");
+  await expect(
+    page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Do I have to delete my .env file?", { exact: false }),
+  ).toBeVisible();
+  // The direct file address renders the same guide: without the suffix strip
+  // above, React would replace the prerendered guide with the landing page.
+  await page.goto("/share-env-files.html");
+  await expect(
+    page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
+  ).toBeVisible();
 });
