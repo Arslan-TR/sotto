@@ -131,7 +131,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "One vault, whole team",
-    closingBody: "Free for teams up to three. Import your .env in under a minute.",
+    closingBody: "Free for teams of up to three, with one shared project. Import your .env in under a minute.",
   },
   {
     slug: "one-time-secret-links",
@@ -224,7 +224,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "Keys change. Chat is forever.",
-    closingBody: "Free for personal use. Shared vaults for teams up to three.",
+    closingBody: "Free for personal use, and for teams of up to three sharing one project.",
   },
   {
     slug: "send-password-securely",
