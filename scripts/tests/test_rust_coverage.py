@@ -73,26 +73,39 @@ class CoverageTests(unittest.TestCase):
             os.environ, SOTTO_RUN_DB_TESTS="1", DATABASE_URL="postgres://localhost/disposable"
         ), patch("sys.stdout", new_callable=io.StringIO), patch(
             "sys.stderr", new_callable=io.StringIO
+        ), patch(
+            "time.monotonic", side_effect=[100.0, 101.0, 105.0, 110.0]
         ):
             result = main()
         self.assertEqual(sum(args[:3] == ["cargo", "llvm-cov", "report"] for args in calls), 1)
-        return result, json.loads((output / "run.json").read_text())
+        return result, json.loads((output / "run.json").read_text()), calls
 
     def test_successful_reports_record_passing_evidence(self):
-        result, evidence = self.run_report_fixture()
+        result, evidence, calls = self.run_report_fixture()
         self.assertEqual(result, 0)
         self.assertEqual(evidence["status"], "passed")
         self.assertEqual(evidence["commit"], "fixture-commit")
         self.assertEqual(evidence["tool"], "cargo-llvm-cov 0.9.1")
         self.assertFalse(evidence["working_tree_dirty"])
-        self.assertGreaterEqual(evidence["elapsed_seconds"], 0)
+        self.assertEqual(evidence["rustc"], "fixture-compiler")
+        self.assertEqual(evidence["test_command"], next(
+            args for args in calls if args[:3] == ["cargo", "llvm-cov", "--workspace"]
+        ))
+        self.assertEqual(evidence["excluded_source_pattern"], r"(^|/)(tests|examples)/")
+        self.assertEqual(evidence["exclusions"], [
+            "WASM/browser execution", "other operating systems/architectures",
+            "non-default features", "doctest coverage", "dependencies",
+            "scripts and deployment", "live external services",
+        ])
+        self.assertEqual(evidence["test_and_build_seconds"], 4.0)
+        self.assertEqual(evidence["elapsed_seconds"], 10.0)
 
     def test_failed_or_incomplete_reports_cannot_pass(self):
         for failure in (
             "report command", "missing summary", "malformed JSON", "empty data", "missing HTML",
         ):
             with self.subTest(failure=failure):
-                result, evidence = self.run_report_fixture(failure)
+                result, evidence, _ = self.run_report_fixture(failure)
                 self.assertNotEqual(result, 0)
                 self.assertEqual(evidence["status"], "failed")
 
