@@ -159,6 +159,14 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
       </section>
 
       <footer>
+        <nav aria-label="Guides">
+          <a href="/share-secrets-securely">Share secrets</a>
+          <a href="/share-env-files">Share .env files</a>
+          <a href="/one-time-secret-links">One-time links</a>
+          <a href="/share-api-keys-securely">Share API keys</a>
+          <a href="/send-password-securely">Send passwords</a>
+          <a href="/self-hosted-secret-management">Self-hosting</a>
+        </nav>
         <nav aria-label="Footer">
           <a href={REPO}>GitHub</a>
           <a href="#open-source">Contribute</a>
