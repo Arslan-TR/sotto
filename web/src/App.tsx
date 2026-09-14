@@ -28,7 +28,10 @@ function route():
   if (path === "/auth/callback") {
     return { name: "callback" };
   }
-  const guide = guideBySlug(path.replace(/^\/|\/$/g, ""));
+  // The edge also serves the prerendered files at their direct address
+  // (/<slug>.html); strip the suffix so scripting visitors get the guide
+  // React renders at the clean path, not the landing fallback.
+  const guide = guideBySlug(path.replace(/^\/|\/$/g, "").replace(/\.html$/, ""));
   if (guide !== undefined) {
     return { name: "guide", page: guide };
   }

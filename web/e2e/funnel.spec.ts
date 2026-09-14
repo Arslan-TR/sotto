@@ -278,4 +278,10 @@ test("guide routes render their page client-side", async ({ page }) => {
   await expect(
     page.getByText("Do I have to delete my .env file?", { exact: false }),
   ).toBeVisible();
+  // The direct file address renders the same guide: without the suffix strip
+  // above, React would replace the prerendered guide with the landing page.
+  await page.goto("/share-env-files.html");
+  await expect(
+    page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
+  ).toBeVisible();
 });
