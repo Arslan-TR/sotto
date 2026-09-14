@@ -207,9 +207,8 @@ test.describe("landing page prerender (no scripting)", () => {
     );
   });
 
-  // One entry per guide route. The preview server has no knowledge of the
-  // edge's clean-url fallback, so these read the emitted .html files directly -
-  // the same bytes Caddy serves at the clean path in production.
+  // One entry per guide route, loaded by file name: the bytes the build emits, which Caddy serves
+  // at the clean path. With scripting off, only the prerendered copy can satisfy these.
   const guides = [
     {
       slug: "share-secrets-securely",
@@ -267,11 +266,12 @@ test("the status link survives React replacing the snapshot", async ({ page }) =
 });
 
 test("guide routes render their page client-side", async ({ page }) => {
-  // The preview server answers the clean path with the app shell (it has no
-  // clean-url fallback), so this proves the router resolves the slug and React
-  // renders the guide. One route stands in for all six; the per-file content
-  // is pinned by the no-scripting tests above.
-  await page.goto("/share-env-files");
+  // The trailing slash is deliberate. vite preview, like the edge, answers `/<slug>` with the
+  // prerendered guide, so a broken router there is caught only if React replaces it before the
+  // assertion looks. `/<slug>/` gets the app shell, whose snapshot is the landing page, so only
+  // the router can put the guide on screen. One route stands in for all six; the per-file
+  // content is pinned by the no-scripting tests above.
+  await page.goto("/share-env-files/");
   await expect(
     page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
   ).toBeVisible();
