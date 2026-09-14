@@ -47,6 +47,7 @@ class CoverageTests(unittest.TestCase):
             if args[:3] == ["cargo", "llvm-cov", "--workspace"]:
                 self.assertIn("--json", args)
                 self.assertIn("--summary-only", args)
+                self.assertEqual(args[args.index("--") + 1:], ["--test-threads=1"])
                 destination = Path(args[args.index("--output-path") + 1])
                 if failure != "missing summary":
                     content = json.dumps(summary)
