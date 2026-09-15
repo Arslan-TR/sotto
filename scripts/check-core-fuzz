@@ -57,6 +57,10 @@ def resolve_seed(profile, requested=None):
                 raise CampaignError("CORE_FUZZ_SEED must be an integer") from error
     if value is None:
         value = FUZZ_SEED if profile == "pr" else secrets.randbelow(MAX_FUZZ_SEED) + 1
+    elif value > MAX_FUZZ_SEED:
+        # GitHub run IDs are wider than libFuzzer's 32-bit seed. Hash them into
+        # the accepted range while retaining the run identity in the evidence.
+        value = int.from_bytes(hashlib.sha256(str(value).encode()).digest()[:4], "big") or 1
     if not 0 < value <= MAX_FUZZ_SEED:
         raise CampaignError(f"fuzz seed must be between 1 and {MAX_FUZZ_SEED}")
     return value

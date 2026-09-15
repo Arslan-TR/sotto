@@ -51,6 +51,12 @@ class ParserTests(unittest.TestCase):
     def test_pr_seed_is_stable_when_unconfigured(self):
         self.assertEqual(runner.resolve_seed("pr"), runner.FUZZ_SEED)
 
+    def test_large_workflow_seed_is_folded_into_libfuzzer_range(self):
+        with patch.dict(runner.os.environ, {"CORE_FUZZ_SEED": "35002964852"}):
+            seed = runner.resolve_seed("nightly")
+        self.assertGreater(seed, 0)
+        self.assertLessEqual(seed, runner.MAX_FUZZ_SEED)
+
 
 class EvidenceTests(unittest.TestCase):
     def test_initial_status_is_failed(self):
