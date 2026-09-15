@@ -42,6 +42,7 @@ def parse_args(argv=None):
     parser.add_argument("--replay", type=Path)
     parser.add_argument("--sanitizer", choices=["address", "none"], default="address")
     parser.add_argument("--seed", type=lambda value: int(value, 0))
+    parser.add_argument("--corpus", type=Path, help="optional trusted corpus directory to add to tracked seeds")
     return parser.parse_args(argv)
 
 
@@ -115,7 +116,7 @@ def sha256_tree(path):
     return digest.hexdigest()
 
 
-def new_evidence(profile, target, output, sanitizer, rng_seed=FUZZ_SEED):
+def new_evidence(profile, target, output, sanitizer, rng_seed=FUZZ_SEED, corpus_source=None):
     lockfile = FUZZ_ROOT / "Cargo.lock"
     config = FUZZ_ROOT / "config.json"
     corpus = FUZZ_ROOT / "seeds" / target
@@ -139,6 +140,7 @@ def new_evidence(profile, target, output, sanitizer, rng_seed=FUZZ_SEED):
         "config_sha256": sha256_file(config),
         "lockfile_sha256": sha256_file(lockfile),
         "starting_corpus_sha256": sha256_tree(corpus),
+        "restored_corpus_sha256": sha256_tree(corpus_source) if corpus_source else None,
         "workflow": {
             "run_id": os.environ.get("GITHUB_RUN_ID"),
             "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
@@ -163,12 +165,19 @@ def failure_outcome(result):
     return "campaign_failure"
 
 
-def run_campaign(profile, target, output, evidence, sanitizer, replay=None, rng_seed=FUZZ_SEED):
+def run_campaign(
+    profile, target, output, evidence, sanitizer, replay=None, rng_seed=FUZZ_SEED, corpus_source=None
+):
     corpus = FUZZ_ROOT / "seeds" / target
     if not corpus.is_dir():
         raise CampaignError(f"missing seed corpus for {target}")
     seed_corpus = output / "corpus"
     shutil.copytree(corpus, seed_corpus)
+    if corpus_source is not None:
+        if not corpus_source.is_dir():
+            raise CampaignError(f"restored corpus does not exist: {corpus_source}")
+        shutil.copytree(corpus_source, seed_corpus, dirs_exist_ok=True)
+        evidence["campaign_corpus_sha256"] = sha256_tree(seed_corpus)
     artifacts = output / "artifacts"
     artifacts.mkdir()
     replay_results = []
@@ -245,7 +254,16 @@ def main(argv=None):
     try:
         write_evidence(evidence_path, evidence)
         evidence["rustc_version"] = ensure_pins()
-        run_campaign(args.profile, args.target, output, evidence, args.sanitizer, args.replay, rng_seed)
+        run_campaign(
+            args.profile,
+            args.target,
+            output,
+            evidence,
+            args.sanitizer,
+            args.replay,
+            rng_seed,
+            args.corpus,
+        )
     except (CampaignError, OSError, subprocess.TimeoutExpired) as error:
         evidence["error"] = str(error)
         if isinstance(error, subprocess.TimeoutExpired):

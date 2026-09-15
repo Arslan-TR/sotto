@@ -40,6 +40,8 @@ nonzero seed unless `--seed` or `CORE_FUZZ_SEED` supplies one.
 Trusted starter inputs live in `fuzz/seeds/<target>/`. The runner copies them into a fresh
 working corpus under `target/core-fuzz/`; the ignored `fuzz/corpus/` directory is reserved for
 local cargo-fuzz state and must not be used as evidence.
+An optional trusted generated corpus can be added to that fresh copy with `--corpus
+/path/to/corpus`; its digest is recorded alongside the tracked seed digest.
 
 For a one-input replay:
 

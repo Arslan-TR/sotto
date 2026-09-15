@@ -40,6 +40,10 @@ class ParserTests(unittest.TestCase):
         args = runner.parse_args(["--profile", "pr", "--target", "base32_codec", "--seed", "0xbeef"])
         self.assertEqual(args.seed, 0xBEEF)
 
+    def test_optional_corpus_can_be_selected(self):
+        args = runner.parse_args(["--profile", "pr", "--target", "base32_codec", "--corpus", "target/corpus"])
+        self.assertEqual(args.corpus, Path("target/corpus"))
+
     def test_nightly_seed_is_fresh_when_unconfigured(self):
         with patch.object(runner.secrets, "randbelow", return_value=0xBEEE):
             self.assertEqual(runner.resolve_seed("nightly"), 0xBEEF)
@@ -90,6 +94,19 @@ class EvidenceTests(unittest.TestCase):
             self.assertTrue(any("-timeout=10" in call.args[0] for call in mocked.call_args_list))
             self.assertTrue(any("-seed=23063" in call.args[0] for call in mocked.call_args_list))
             self.assertTrue(evidence["seed_replay"])
+
+    def test_campaign_adds_optional_corpus_to_fresh_working_copy(self):
+        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            restored = output / "restored"
+            restored.mkdir()
+            (restored / "generated").write_bytes(b"seed")
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none", corpus_source=restored)
+            with patch.object(runner, "command", return_value=result):
+                runner.run_campaign("pr", "base32_codec", output, evidence, "none", corpus_source=restored)
+            self.assertEqual((output / "corpus" / "generated").read_bytes(), b"seed")
+            self.assertIsNotNone(evidence["campaign_corpus_sha256"])
 
     def test_failed_seed_replay_does_not_pass(self):
         result = SimpleNamespace(returncode=1, stdout="", stderr="crash")
