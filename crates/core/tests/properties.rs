@@ -198,6 +198,17 @@ proptest! {
         prop_assert_eq!(separated_payload.as_slice(), payload.as_slice());
     }
 
+    /// The generic key API round-trips arbitrary bounded UTF-8 prefixes as well as named ones.
+    #[test]
+    fn arbitrary_prefix_round_trip(
+        prefix in unicode_string(32),
+        payload in prop::collection::vec(any::<u8>(), 0..=256),
+        version in any::<u8>(),
+    ) {
+        let encoded = format::encode_key(&prefix, version, &payload);
+        prop_assert_eq!(format::decode_key(&prefix, version, &encoded).expect("prefix round trip"), payload);
+    }
+
     /// Symmetric key wrapping round-trips.
     #[test]
     fn wrap_round_trip(kek in key(), k in key(), aad in bytes(64)) {

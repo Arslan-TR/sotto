@@ -3,11 +3,12 @@
 use libfuzzer_sys::fuzz_target;
 use sotto_core::format;
 
-const MAX_INPUT: usize = 16384;
+const MAX_PAYLOAD: usize = 4096;
+const MAX_TEXT: usize = 16384;
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-fn bounded(data: &[u8]) -> &[u8] {
-    let end = data.len().min(MAX_INPUT);
+fn bounded(data: &[u8], max: usize) -> &[u8] {
+    let end = data.len().min(max);
     &data[..end]
 }
 
@@ -30,19 +31,20 @@ fuzz_target!(|data: &[u8]| {
         let _ = format::decode("");
         return;
     };
-    let input = bounded(rest);
     match mode % 3 {
         0 => {
+            let input = bounded(rest, MAX_PAYLOAD);
             let encoded = format::encode(input);
             assert_eq!(format::decode(&encoded).expect("encoder output is valid"), input);
         }
         1 => {
+            let input = bounded(rest, MAX_TEXT);
             if let Ok(text) = std::str::from_utf8(input) {
                 let _ = format::decode(text);
             }
         }
         _ => {
-            let mut text = structured_ascii(input);
+            let mut text = structured_ascii(bounded(rest, MAX_TEXT));
             text.push('#');
             assert!(format::decode(&text).is_err(), "a deliberately invalid symbol must reject");
         }

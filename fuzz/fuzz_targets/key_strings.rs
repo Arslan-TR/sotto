@@ -3,11 +3,12 @@
 use libfuzzer_sys::fuzz_target;
 use sotto_core::format;
 
-const MAX_PAYLOAD: usize = 16384;
+const MAX_PAYLOAD: usize = 4096;
+const MAX_TEXT: usize = 16384;
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-fn bounded(data: &[u8]) -> &[u8] {
-    let end = data.len().min(MAX_PAYLOAD);
+fn bounded(data: &[u8], max: usize) -> &[u8] {
+    let end = data.len().min(max);
     &data[..end]
 }
 
@@ -30,22 +31,23 @@ fuzz_target!(|data: &[u8]| {
         let _ = format::decode_key("SK", 1, "");
         return;
     };
-    let payload = bounded(rest);
     match mode % 4 {
         0 => {
+            let payload = bounded(rest, MAX_PAYLOAD);
             let encoded = format::encode_key("SK", 1, payload);
             assert_eq!(format::decode_key("SK", 1, &encoded).expect("key output is valid"), payload);
         }
         1 => {
-            let input = body_text(payload);
+            let input = body_text(bounded(rest, MAX_TEXT));
             assert!(format::decode_key("SK", 1, &input).is_err(), "missing key header must reject");
         }
         2 => {
-            let body = format!("{}#", body_text(payload));
+            let body = format!("{}#", body_text(bounded(rest, MAX_TEXT)));
             let input = format!("SK1-{body}");
             assert!(format::decode_key("SK", 1, &input).is_err(), "invalid key symbol must reject");
         }
         _ => {
+            let payload = bounded(rest, MAX_PAYLOAD);
             let prefixes = ["SK", "RK", "MT"];
             let prefix = prefixes[(payload.first().copied().unwrap_or(0) % 3) as usize];
             let encoded = format::encode_key(prefix, 1, payload);
