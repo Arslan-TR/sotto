@@ -25,9 +25,10 @@ prefix (the generated body boundary is 16,384 bytes and the production payload b
 is 4,096 bytes), and writes a fresh record under
 `target/core-fuzz/`. It starts each record with `status: failed`, records the exact
 commit, command, toolchain, platform, configuration and lockfile digests, starting
-corpus digest, workflow identity and execution count, and changes status only after
-every tracked seed has replayed successfully and libFuzzer emits its completion marker
-and exits successfully. Logs are retained in the record. A timeout, signal, sanitizer
+corpus digest, workflow identity, execution count and reported active duration, and changes
+status only after every starting-corpus input has replayed successfully and libFuzzer emits
+its completion marker with the requested duration before exiting successfully. Logs are
+retained in the record. A timeout, signal, sanitizer
 failure, missing target, zero executions or missing completion marker remains
 failed/inconclusive. Each input also has a ten-second libFuzzer timeout so a single
 hang cannot consume the campaign budget. Seed replays have a two-minute process watchdog to
@@ -41,8 +42,10 @@ nonzero seed unless `--seed` or `CORE_FUZZ_SEED` supplies one.
 Trusted starter inputs live in `fuzz/seeds/<target>/`. The runner copies them into a fresh
 working corpus under `target/core-fuzz/`; the ignored `fuzz/corpus/` directory is reserved for
 local cargo-fuzz state and must not be used as evidence.
-An optional trusted generated corpus can be added to that fresh copy with `--corpus
-/path/to/corpus`; its digest is recorded alongside the tracked seed digest.
+An optional trusted generated corpus package can be added to that fresh copy with `--corpus
+/path/to/corpus-package`. The package contains a `manifest.json` and an `inputs/` directory;
+the manifest names the target, format and SHA-256 digest of every input. Its digest is recorded
+alongside the tracked seed digest, and every distinct input is replayed before mutation.
 
 For a one-input replay:
 

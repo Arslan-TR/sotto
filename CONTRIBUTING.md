@@ -136,6 +136,9 @@ For the focused encoding and envelope proofs, see the [Kani guide](.ci/kani.md).
 It documents the pinned verifier, reproduction command, input bounds and what the proofs
 do not establish. Keep normal tests alongside those proofs.
 
+- For the merge-required assurance checks, see the [assurance guide](.ci/assurance.md).
+  It explains same-run completion validation, the required-check manifest and local fixtures.
+
 ## Supply-chain policy
 
 This repository includes `deny.toml` for dependency and licence checks. Validate the supply-chain policy locally with:
