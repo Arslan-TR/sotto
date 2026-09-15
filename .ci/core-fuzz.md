@@ -20,8 +20,9 @@ scripts/check-core-fuzz --profile pr --target base32_codec
 scripts/check-core-fuzz --profile pr --target key_strings
 ```
 
-The runner bounds each fuzzer input at 16,384 bytes (the production payload boundary
-is 4,096 bytes) and writes a fresh record under
+The runner bounds each fuzzer input at 16,385 bytes, including its one-byte mode
+prefix (the generated body boundary is 16,384 bytes and the production payload boundary
+is 4,096 bytes), and writes a fresh record under
 `target/core-fuzz/`. It starts each record with `status: failed`, records the exact
 commit, command, toolchain, platform, configuration and lockfile digests, starting
 corpus digest, workflow identity and execution count, and changes status only after

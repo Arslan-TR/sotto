@@ -53,6 +53,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(config["cargo_fuzz"], "0.13.2")
         self.assertEqual(config["rust_toolchain"], runner.TOOLCHAIN)
         self.assertEqual(config["targets"], sorted(runner.TARGETS))
+        self.assertEqual(config["max_input_bytes"], runner.MAX_LEN)
 
     def test_corpus_digest_frames_paths_and_contents(self):
         with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as first, tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as second:

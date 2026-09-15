@@ -59,7 +59,7 @@ def ensure_pins():
         "cargo_fuzz": FUZZ_VERSION.removeprefix("cargo-fuzz "),
         "rust_toolchain": TOOLCHAIN,
         "targets": sorted(TARGETS),
-        "max_input_bytes": MAX_INPUT,
+        "max_input_bytes": MAX_LEN,
         "pr_seconds_per_target": PROFILES["pr"],
         "nightly_seconds_per_target": PROFILES["nightly"],
     }
