@@ -38,7 +38,7 @@
       "workflow": ".github/workflows/core-fuzz.yml",
       "completion": "codec assurance complete",
       "required_jobs": ["PR fuzz (base32_codec)", "PR fuzz (key_strings)"],
-      "ignored_jobs": ["PR fuzz (${{ matrix.target }})", "Nightly fuzz (base32_codec)", "Nightly fuzz (key_strings)"]
+      "ignored_jobs": ["PR fuzz (${{ matrix.target }})", "Nightly fuzz (${{ matrix.target }})", "Nightly fuzz (base32_codec)", "Nightly fuzz (key_strings)"]
     },
     "codec-nightly": {
       "workflow": ".github/workflows/core-fuzz.yml",

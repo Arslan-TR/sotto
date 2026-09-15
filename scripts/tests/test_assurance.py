@@ -50,6 +50,14 @@ class AssuranceTests(unittest.TestCase):
         with self.assertRaisesRegex(assurance.AssuranceError, "skipped"):
             assurance.validate_run(manifest, "kani", payload["run"], payload["jobs"])
 
+    def test_intentionally_skipped_profile_is_ignored(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["codec"]["required_jobs"]
+        ignored = manifest["groups"]["codec"]["ignored_jobs"][1]
+        payload = fixture("codec", names + [ignored], {**{name: "success" for name in names}, ignored: "skipped"})
+        verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+        self.assertEqual(verdict["status"], "passed")
+
     def test_duplicate_and_unexpected_jobs_fail(self):
         manifest = assurance.load_manifest()
         names = manifest["groups"]["kani"]["required_jobs"]
