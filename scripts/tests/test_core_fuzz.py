@@ -24,6 +24,7 @@ class ParserTests(unittest.TestCase):
 
     def test_execution_marker_is_parsed(self):
         self.assertEqual(runner._executions("#1 INITED\nDone 42 runs in 30 second(s)\n"), 42)
+        self.assertEqual(runner._completion("Done 42 runs in 30 second(s)\n"), (42, 30.0))
 
     def test_missing_marker_is_inconclusive(self):
         self.assertEqual(runner._executions("#1 INITED\n"), 0)
@@ -90,7 +91,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotEqual(evidence["rng_seed"], 0)
 
     def test_campaign_replays_seeds_and_sets_timeout(self):
-        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 30 second(s)\n", stderr="")
         with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             evidence = runner.new_evidence("pr", "base32_codec", output, "none")
@@ -102,7 +103,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertTrue(evidence["seed_replay"])
 
     def test_campaign_adds_optional_corpus_to_fresh_working_copy(self):
-        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 30 second(s)\n", stderr="")
         with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             restored = output / "restored"
@@ -167,6 +168,16 @@ class EvidenceTests(unittest.TestCase):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["outcome"], "incomplete_campaign")
 
+    def test_campaign_shorter_than_budget_does_not_pass(self):
+        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 1 second(s)\n", stderr="")
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", return_value=result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["outcome"], "incomplete_campaign")
+
     def test_failure_outcome_distinguishes_sanitizer_and_interruption(self):
         sanitizer = SimpleNamespace(returncode=1, stdout="", stderr="AddressSanitizer: heap-use-after-free")
         interrupted = SimpleNamespace(returncode=-9, stdout="", stderr="")
@@ -174,7 +185,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(runner.failure_outcome(interrupted), "interrupted")
 
     def test_campaign_signal_does_not_pass(self):
-        replay_ok = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        replay_ok = SimpleNamespace(returncode=0, stdout="Done 1 runs in 30 second(s)\n", stderr="")
         campaign_signal = SimpleNamespace(returncode=-9, stdout="", stderr="")
 
         def command_result(args, **_):
@@ -189,7 +200,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["outcome"], "interrupted")
 
     def test_campaign_crash_does_not_pass(self):
-        replay_ok = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        replay_ok = SimpleNamespace(returncode=0, stdout="Done 1 runs in 30 second(s)\n", stderr="")
         campaign_crash = SimpleNamespace(returncode=1, stdout="", stderr="panicked at fuzz target")
 
         def command_result(args, **_):
