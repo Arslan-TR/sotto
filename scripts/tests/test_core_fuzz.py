@@ -3,7 +3,10 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 loader = importlib.machinery.SourceFileLoader("core_fuzz", str(ROOT / "scripts/check-core-fuzz"))
@@ -42,6 +45,48 @@ class EvidenceTests(unittest.TestCase):
 
     def test_targets_are_explicit(self):
         self.assertEqual(runner.TARGETS, {"base32_codec", "key_strings"})
+
+    def test_config_declares_the_runner_pins(self):
+        config = __import__("json").loads((ROOT / "fuzz" / "config.json").read_text())
+        self.assertEqual(config["cargo_fuzz"], "0.13.2")
+        self.assertEqual(config["rust_toolchain"], runner.TOOLCHAIN)
+        self.assertEqual(config["targets"], sorted(runner.TARGETS))
+
+    def test_evidence_records_reproducibility_metadata(self):
+        evidence = runner.new_evidence("pr", "base32_codec", ROOT / "target" / "core-fuzz" / "x", "address")
+        for field in ("config_sha256", "lockfile_sha256", "starting_corpus_sha256", "workflow", "outcome"):
+            self.assertIn(field, evidence)
+
+    def test_campaign_replays_seeds_and_sets_timeout(self):
+        result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", return_value=result) as mocked:
+                runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["status"], "passed")
+            self.assertTrue(any("-timeout=10" in call.args[0] for call in mocked.call_args_list))
+            self.assertTrue(evidence["seed_replay"])
+
+    def test_failed_seed_replay_does_not_pass(self):
+        result = SimpleNamespace(returncode=1, stdout="", stderr="crash")
+        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", return_value=result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["status"], "failed")
+
+    def test_campaign_without_completion_marker_does_not_pass(self):
+        result = SimpleNamespace(returncode=0, stdout="#1 INITED\n", stderr="")
+        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", return_value=result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["status"], "failed")
 
 
 if __name__ == "__main__":

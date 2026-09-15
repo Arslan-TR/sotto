@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use sotto_core::format;
 
-const MAX_INPUT: usize = 4096;
+const MAX_INPUT: usize = 16384;
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 fn bounded(data: &[u8]) -> &[u8] {
@@ -42,8 +42,9 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         _ => {
-            let text = structured_ascii(input);
-            let _ = format::decode(&text);
+            let mut text = structured_ascii(input);
+            text.push('#');
+            assert!(format::decode(&text).is_err(), "a deliberately invalid symbol must reject");
         }
     }
 });

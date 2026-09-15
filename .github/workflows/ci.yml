@@ -26,6 +26,22 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  core-platform:
+    name: Core codec (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Core tests
+        run: cargo test -p sotto-core --all-targets
+
   readme-i18n:
     runs-on: ubuntu-latest
     steps:
@@ -310,7 +326,14 @@ jobs:
       - name: Reject skipped funnel tests
         working-directory: web
         run: |
-          node -e 'const report = require("./test-results/playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`funnel suite skipped ${skipped} test(s)`); process.exit(1); }'
+          node <<'NODE'
+          const report = require("./test-results/playwright.json");
+          const skipped = report.stats?.skipped ?? 0;
+          if (skipped !== 0) {
+            console.error(`funnel suite skipped ${skipped} test(s)`);
+            process.exit(1);
+          }
+          NODE
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()

@@ -20,12 +20,16 @@ scripts/check-core-fuzz --profile pr --target base32_codec
 scripts/check-core-fuzz --profile pr --target key_strings
 ```
 
-The runner bounds each input at 4,096 bytes and writes a fresh record under
+The runner bounds each fuzzer input at 16,384 bytes (the production payload boundary
+is 4,096 bytes) and writes a fresh record under
 `target/core-fuzz/`. It starts each record with `status: failed`, records the exact
-commit, command, toolchain, platform, seed/campaign limits and execution count, and
-changes status only after libFuzzer emits its completion marker and exits successfully.
-Logs are retained in the record. A timeout, signal, sanitizer failure, missing target,
-zero executions or missing completion marker remains failed/inconclusive.
+commit, command, toolchain, platform, configuration and lockfile digests, starting
+corpus digest, workflow identity and execution count, and changes status only after
+every tracked seed has replayed successfully and libFuzzer emits its completion marker
+and exits successfully. Logs are retained in the record. A timeout, signal, sanitizer
+failure, missing target, zero executions or missing completion marker remains
+failed/inconclusive. Each input also has a ten-second libFuzzer timeout so a single
+hang cannot consume the campaign budget.
 
 For a one-input replay:
 
@@ -59,7 +63,8 @@ reproducer in the private campaign record.
 Pull requests and pushes to `main` run both targets independently for 30 seconds each
 after seed replay. Nightly runs both targets for 30 minutes each with `fail-fast: false`.
 Manual dispatch selects either profile at the selected ref. Linux x86_64 is the
-sanitizer authority; native macOS/Windows source tests and WASM tests remain separate.
+sanitizer authority; native core source tests run on Ubuntu, macOS and Windows, and
+WASM tests remain separate.
 
 The workflow pins the cargo-fuzz release, Rust nightly, actions and the fuzz lockfile.
 It uploads each run record on success or failure for 14 days. A successful earlier run

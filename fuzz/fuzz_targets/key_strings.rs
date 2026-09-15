@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use sotto_core::format;
 
-const MAX_PAYLOAD: usize = 4096;
+const MAX_PAYLOAD: usize = 16384;
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 fn bounded(data: &[u8]) -> &[u8] {
@@ -38,20 +38,20 @@ fuzz_target!(|data: &[u8]| {
         }
         1 => {
             let input = body_text(payload);
-            let _ = format::decode_key("SK", 1, &input);
+            assert!(format::decode_key("SK", 1, &input).is_err(), "missing key header must reject");
         }
         2 => {
-            let body = body_text(payload);
+            let body = format!("{}#", body_text(payload));
             let input = format!("SK1-{body}");
-            let _ = format::decode_key("SK", 1, &input);
+            assert!(format::decode_key("SK", 1, &input).is_err(), "invalid key symbol must reject");
         }
         _ => {
             let prefixes = ["SK", "RK", "MT"];
             let prefix = prefixes[(payload.first().copied().unwrap_or(0) % 3) as usize];
             let encoded = format::encode_key(prefix, 1, payload);
             let wrong = format!("{prefix}2-{}", encoded.split_once('-').map_or("", |(_, body)| body));
-            let _ = format::decode_key(prefix, 1, &wrong);
-            let _ = format::decode_key("SK", 1, &encoded);
+            assert!(format::decode_key(prefix, 1, &wrong).is_err(), "wrong version must reject");
+            assert!(format::decode_key("SK", 1, &encoded).is_err() || prefix == "SK");
         }
     }
 });

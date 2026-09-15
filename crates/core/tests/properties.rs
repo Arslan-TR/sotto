@@ -5,7 +5,9 @@
 //! known-answer test in `vectors.rs`.
 
 use proptest::prelude::*;
-use sotto_core::{aead, format, kdf, vault, wrap};
+use sotto_core::{aead, format, kdf, vault, wrap, Error};
+
+const FORMAT_FIXTURES: &str = include_str!("fixtures/format.txt");
 
 fn key() -> impl Strategy<Value = [u8; 32]> {
     prop::array::uniform32(any::<u8>())
@@ -37,7 +39,12 @@ fn reference_encode(data: &[u8]) -> String {
         .collect()
 }
 
-fn reference_decode(input: &str) -> Result<Vec<u8>, ()> {
+#[derive(Debug, PartialEq, Eq)]
+enum ReferenceDecodeError {
+    InvalidSymbol,
+}
+
+fn reference_decode(input: &str) -> Result<Vec<u8>, ReferenceDecodeError> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let mut out = Vec::with_capacity(input.len() * 5 / 8 + 1);
     let mut accumulator = 0u16;
@@ -53,7 +60,7 @@ fn reference_decode(input: &str) -> Result<Vec<u8>, ()> {
             _ => ALPHABET
                 .iter()
                 .position(|&symbol| char::from(symbol) == upper)
-                .ok_or(())? as u8,
+                .ok_or(ReferenceDecodeError::InvalidSymbol)? as u8,
         };
         accumulator = (accumulator << 5) | value as u16;
         bits += 5;
@@ -64,6 +71,14 @@ fn reference_decode(input: &str) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(out)
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    assert!(hex.len().is_multiple_of(2));
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("fixture hex"))
+        .collect()
 }
 
 proptest! {
@@ -113,16 +128,16 @@ proptest! {
 
     /// Compare the production byte walk with the independent character-based decoder.
     #[test]
-    fn crockford_decode_matches_reference(input in unicode_string(64)) {
+    fn crockford_decode_matches_reference(input in unicode_string(4096)) {
         let expected = reference_decode(&input);
-        let actual = format::decode(&input).map_err(|_| ());
+        let actual = format::decode(&input).map_err(|_| ReferenceDecodeError::InvalidSymbol);
         prop_assert_eq!(actual, expected);
     }
 
     /// Arbitrary bounded ASCII strings are either decoded or rejected, never panicked on.
     /// This exercises malformed symbols, separators and empty input rather than only encoder output.
     #[test]
-    fn malformed_decode_inputs_do_not_panic(data in bytes(256)) {
+    fn malformed_decode_inputs_do_not_panic(data in bytes(4097)) {
         let input: String = data.into_iter().map(char::from).collect();
         let _ = format::decode(&input);
         let _ = format::decode_key("SK", 1, &input);
@@ -130,21 +145,21 @@ proptest! {
 
     /// Full-Unicode strings are either decoded or rejected, never panicked on.
     #[test]
-    fn malformed_unicode_decode_inputs_do_not_panic(input in unicode_string(256)) {
+    fn malformed_unicode_decode_inputs_do_not_panic(input in unicode_string(4096)) {
         let _ = format::decode(&input);
         let _ = format::decode_key("SK", 1, &input);
     }
 
     /// A valid key header forces generated malformed bodies through key validation.
     #[test]
-    fn malformed_key_bodies_do_not_panic(body in unicode_string(256)) {
+    fn malformed_key_bodies_do_not_panic(body in unicode_string(4096)) {
         let input = format!("SK1-{body}");
         let _ = format::decode_key("SK", 1, &input);
     }
 
     /// Versioned, checksummed key strings round-trip for any prefix/version/payload.
     #[test]
-    fn key_string_round_trip(payload in prop::collection::vec(any::<u8>(), 1..64), version in any::<u8>()) {
+    fn key_string_round_trip(payload in prop::collection::vec(any::<u8>(), 1..=4096), version in any::<u8>()) {
         let s = format::encode_key("SK", version, &payload);
         prop_assert_eq!(format::decode_key("SK", version, &s).expect("decode_key"), payload);
     }
@@ -153,7 +168,7 @@ proptest! {
     #[test]
     fn key_string_round_trip_for_supported_prefixes(
         prefix in prop_oneof![Just("SK".to_owned()), Just("RK".to_owned()), Just("MT".to_owned())],
-        payload in prop::collection::vec(any::<u8>(), 1..64),
+        payload in prop::collection::vec(any::<u8>(), 1..=4096),
         version in any::<u8>(),
     ) {
         let encoded = format::encode_key(&prefix, version, &payload);
@@ -218,4 +233,33 @@ proptest! {
 fn crockford_reference_handles_max_payload() {
     let data = vec![0xa5; 4096];
     assert_eq!(format::encode(&data), reference_encode(&data));
+}
+
+#[test]
+fn shared_format_fixtures_cover_success_and_rejection_stages() {
+    for line in FORMAT_FIXTURES
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+    {
+        let [kind, prefix, version, input, expected] = line
+            .split('|')
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("fixture columns");
+        let version = version.parse().expect("fixture version");
+        let result = format::decode_key(prefix, version, input);
+        if kind == "valid" {
+            assert_eq!(result.expect("valid fixture"), hex_bytes(expected));
+        } else {
+            let error = result.expect_err("rejected fixture");
+            let expected = match expected {
+                "key_prefix" => Error::KeyPrefix,
+                "invalid_symbol" => Error::Malformed("invalid base32 symbol"),
+                "key_short" => Error::Malformed("key too short"),
+                "checksum" => Error::Checksum,
+                other => panic!("unknown fixture expectation {other}"),
+            };
+            assert_eq!(error.to_string(), expected.to_string());
+        }
+    }
 }
