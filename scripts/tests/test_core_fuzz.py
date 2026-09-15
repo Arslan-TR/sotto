@@ -27,6 +27,12 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(runner._executions("#1 INITED\nDone 42 runs in 30 second(s)\n"), 42)
         self.assertEqual(runner._completion("Done 42 runs in 30 second(s)\n"), (42, 30.0))
 
+    def test_completion_rejects_trailing_text(self):
+        self.assertEqual(
+            runner._completion("Done 42 runs in 30 second(s) but the campaign stopped\n"),
+            (None, None),
+        )
+
     def test_missing_marker_is_inconclusive(self):
         self.assertEqual(runner._executions("#1 INITED\n"), 0)
 

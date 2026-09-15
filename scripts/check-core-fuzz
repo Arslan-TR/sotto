@@ -316,7 +316,10 @@ def _executions(stdout):
 
 
 def _completion(stdout):
-    pattern = re.compile(r"^Done\s+(\d+)\s+runs?\s+in\s+([0-9]+(?:\.[0-9]+)?)\s+second", re.IGNORECASE)
+    pattern = re.compile(
+        r"^Done\s+(\d+)\s+runs?\s+in\s+([0-9]+(?:\.[0-9]+)?)\s+second\(s\)\s*$",
+        re.IGNORECASE,
+    )
     for line in reversed(stdout.splitlines()):
         match = pattern.match(line.strip())
         if match:
