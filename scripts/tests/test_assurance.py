@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
+TEST_TARGET_ROOT = ROOT / "target"
+TEST_TARGET_ROOT.mkdir(exist_ok=True)
 loader = importlib.machinery.SourceFileLoader("assurance", str(ROOT / "scripts/check-assurance"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 assurance = importlib.util.module_from_spec(spec)
@@ -75,7 +77,7 @@ class AssuranceTests(unittest.TestCase):
             assurance.validate_run(manifest, "kani", payload["run"], payload["jobs"], expected_sha="abc123", expected_attempt=2)
 
     def test_jobs_file_path_produces_a_verdict(self):
-        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             path = Path(directory) / "run.json"
             names = assurance.load_manifest()["groups"]["kani"]["required_jobs"]
             path.write_text(json.dumps(fixture("kani", names)), encoding="utf-8")
