@@ -144,6 +144,8 @@ def validate_corpus_package(source, target):
         if relative in expected:
             raise CampaignError(f"restored corpus lists a duplicate path: {entry['path']}")
         expected[relative] = entry["sha256"]
+    if not expected:
+        raise CampaignError("restored corpus manifest has no inputs")
     actual = set()
     for path in source.rglob("*"):
         if path == manifest_path:
@@ -198,7 +200,9 @@ def new_evidence(profile, target, output, sanitizer, rng_seed=FUZZ_SEED, corpus_
 
 
 def write_evidence(path, evidence):
-    path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def failure_outcome(result):
@@ -241,6 +245,8 @@ def run_campaign(
     evidence["build_command"] = build_args
     build_result = command(build_args, timeout=300)
     evidence["build_exit_code"] = build_result.returncode
+    (output / "build.stdout.log").write_text(build_result.stdout, encoding="utf-8")
+    (output / "build.stderr.log").write_text(build_result.stderr, encoding="utf-8")
     if build_result.returncode != 0:
         evidence["outcome"] = failure_outcome(build_result)
         raise CampaignError(f"fuzz target build exited {build_result.returncode}")
