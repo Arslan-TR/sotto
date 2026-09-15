@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "github_actions_app_id": 15368,
+  "groups": {
+    "ci": {
+      "workflow": ".github/workflows/ci.yml",
+      "completion": "ci assurance complete",
+      "required_jobs": [
+        "test",
+        "readme-i18n",
+        "wasm",
+        "web",
+        "server",
+        "supply-chain",
+        "funnel regression suite (Launch gate 4)",
+        "Core codec (ubuntu-latest)",
+        "Core codec (macos-latest)",
+        "Core codec (windows-latest)",
+        "action consumer (ubuntu-latest)",
+        "action consumer (macos-latest)",
+        "action consumer (windows-latest)"
+      ],
+      "ignored_jobs": []
+    },
+    "kani": {
+      "workflow": ".github/workflows/kani.yml",
+      "completion": "kani assurance complete",
+      "required_jobs": ["core parser proofs"],
+      "ignored_jobs": []
+    },
+    "coverage": {
+      "workflow": ".github/workflows/coverage.yml",
+      "completion": "coverage assurance complete",
+      "required_jobs": ["native Rust coverage (Postgres)"],
+      "ignored_jobs": []
+    },
+    "codec": {
+      "workflow": ".github/workflows/core-fuzz.yml",
+      "completion": "codec assurance complete",
+      "required_jobs": ["PR fuzz (base32_codec)", "PR fuzz (key_strings)"],
+      "ignored_jobs": ["PR fuzz (${{ matrix.target }})", "Nightly fuzz (base32_codec)", "Nightly fuzz (key_strings)"]
+    },
+    "codec-nightly": {
+      "workflow": ".github/workflows/core-fuzz.yml",
+      "completion": "codec assurance complete",
+      "required_jobs": ["Nightly fuzz (base32_codec)", "Nightly fuzz (key_strings)"],
+      "ignored_jobs": ["PR fuzz (${{ matrix.target }})", "PR fuzz (base32_codec)", "PR fuzz (key_strings)"]
+    }
+  }
+}

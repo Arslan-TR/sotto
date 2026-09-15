@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Validate that the required jobs in one GitHub Actions run completed successfully."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MANIFEST = ROOT / ".ci" / "assurance-checks.json"
+
+
+class AssuranceError(Exception):
+    """The run could not produce a valid assurance verdict."""
+
+
+def load_manifest(path=DEFAULT_MANIFEST):
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AssuranceError(f"cannot read assurance manifest: {error}") from error
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("groups"), dict):
+        raise AssuranceError("unsupported assurance manifest")
+    return manifest
+
+
+def _job_names(jobs):
+    names = []
+    for job in jobs:
+        name = job.get("name")
+        if not isinstance(name, str) or not name:
+            raise AssuranceError("job has no name")
+        names.append(name)
+    return names
+
+
+def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, expected_attempt=None):
+    groups = manifest.get("groups", {})
+    if group_name not in groups:
+        raise AssuranceError(f"unknown assurance group: {group_name}")
+    group = groups[group_name]
+    errors = []
+    if run.get("workflow_path") != group["workflow"]:
+        errors.append("workflow path does not match manifest")
+    if expected_attempt is not None and run.get("run_attempt") != expected_attempt:
+        errors.append("run attempt does not match the requested attempt")
+    if expected_sha is not None and run.get("head_sha") != expected_sha:
+        errors.append("run source does not match the checked-out source")
+    if run.get("status") not in {"in_progress", "completed"}:
+        errors.append(f"run has unexpected status {run.get('status')!r}")
+
+    expected = set(group["required_jobs"])
+    ignored = set(group.get("ignored_jobs", []))
+    completion = group["completion"]
+    relevant = [job for job in jobs if job.get("name") not in ignored and job.get("name") != completion]
+    names = _job_names(relevant)
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        errors.append(f"duplicate job names: {', '.join(duplicates)}")
+    actual = set(names)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing:
+        errors.append(f"missing required jobs: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"unexpected jobs: {', '.join(unexpected)}")
+    for job in relevant:
+        if job.get("name") in expected and job.get("conclusion") != "success":
+            errors.append(f"{job['name']} concluded {job.get('conclusion')!r}")
+    if errors:
+        raise AssuranceError("; ".join(errors))
+    return {
+        "status": "passed",
+        "group": group_name,
+        "workflow": group["workflow"],
+        "run_id": run.get("id"),
+        "run_attempt": run.get("run_attempt"),
+        "head_sha": run.get("head_sha"),
+        "jobs": sorted(expected),
+    }
+
+
+def _get_json(url, token):
+    request = Request(url, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        raise AssuranceError(f"GitHub API request failed: {error}") from error
+
+
+def fetch_run(repository, run_id, token):
+    base = f"https://api.github.com/repos/{repository}/actions/runs/{run_id}"
+    run = _get_json(base, token)
+    jobs = []
+    page = 1
+    while True:
+        payload = _get_json(f"{base}/jobs?filter=latest&per_page=100&page={page}", token)
+        page_jobs = payload.get("jobs")
+        if not isinstance(page_jobs, list):
+            raise AssuranceError("GitHub API returned no jobs list")
+        jobs.extend(page_jobs)
+        if len(page_jobs) < 100:
+            break
+        page += 1
+    return {
+        "id": run.get("id"),
+        "status": run.get("status"),
+        "run_attempt": run.get("run_attempt"),
+        "head_sha": run.get("head_sha"),
+        "workflow_path": run.get("path"),
+    }, jobs
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--group", required=True)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID", "0")))
+    parser.add_argument("--run-attempt", type=int, default=int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")))
+    parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY"))
+    parser.add_argument("--expected-sha", default=os.environ.get("GITHUB_SHA"))
+    parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
+    parser.add_argument("--jobs-file", type=Path, help="validate a captured run instead of calling GitHub")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        manifest = load_manifest(args.manifest)
+        if args.jobs_file:
+            payload = json.loads(args.jobs_file.read_text(encoding="utf-8"))
+            run, jobs = payload["run"], payload["jobs"]
+        else:
+            if not args.repository or not args.token or not args.run_id:
+                raise AssuranceError("repository, token and run ID are required")
+            run, jobs = fetch_run(args.repository, args.run_id, args.token)
+        verdict = validate_run(
+            manifest,
+            args.group,
+            run,
+            jobs,
+            expected_sha=args.expected_sha,
+            expected_attempt=args.run_attempt,
+        )
+    except (AssuranceError, OSError, ValueError, KeyError, TypeError) as error:
+        print(f"assurance check failed: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(verdict, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
