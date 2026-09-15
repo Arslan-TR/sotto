@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -107,13 +108,62 @@ class EvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             restored = output / "restored"
-            restored.mkdir()
-            (restored / "generated").write_bytes(b"seed")
+            (restored / "inputs").mkdir(parents=True)
+            generated = restored / "inputs" / "generated"
+            generated.write_bytes(b"seed")
+            (restored / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "format": runner.CORPUS_FORMAT,
+                        "target": "base32_codec",
+                        "files": [{"path": "inputs/generated", "sha256": runner.sha256_file(generated)}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             evidence = runner.new_evidence("pr", "base32_codec", output, "none", corpus_source=restored)
             with patch.object(runner, "command", return_value=result):
                 runner.run_campaign("pr", "base32_codec", output, evidence, "none", corpus_source=restored)
-            self.assertEqual((output / "corpus" / "generated").read_bytes(), b"seed")
+            self.assertEqual(next((output / "corpus" / "restored").iterdir()).read_bytes(), b"seed")
             self.assertIsNotNone(evidence["campaign_corpus_sha256"])
+            self.assertTrue(any(item["input"].startswith("restored:") for item in evidence["seed_replay"]))
+
+    def test_invalid_restored_corpus_manifest_fails(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            restored = output / "restored"
+            restored.mkdir()
+            (restored / "manifest.json").write_text("{}", encoding="utf-8")
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none", corpus_source=restored)
+            with patch.object(runner, "command") as mocked:
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none", corpus_source=restored)
+            mocked.assert_not_called()
+
+    def test_restored_corpus_hash_mismatch_fails(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            restored = output / "restored"
+            (restored / "inputs").mkdir(parents=True)
+            generated = restored / "inputs" / "generated"
+            generated.write_bytes(b"seed")
+            (restored / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "format": runner.CORPUS_FORMAT,
+                        "target": "base32_codec",
+                        "files": [{"path": "inputs/generated", "sha256": "0" * 64}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none", corpus_source=restored)
+            with patch.object(runner, "command") as mocked:
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none", corpus_source=restored)
+            mocked.assert_not_called()
 
     def test_failed_seed_replay_does_not_pass(self):
         result = SimpleNamespace(returncode=1, stdout="", stderr="crash")

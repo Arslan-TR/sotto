@@ -26,6 +26,7 @@ MAX_INPUT = 16384
 MAX_LEN = MAX_INPUT + 1
 FUZZ_SEED = 0x5A17
 MAX_FUZZ_SEED = (1 << 32) - 1
+CORPUS_FORMAT = "sotto-core-fuzz-input-v1"
 
 
 class CampaignError(Exception):
@@ -43,7 +44,7 @@ def parse_args(argv=None):
     parser.add_argument("--replay", type=Path)
     parser.add_argument("--sanitizer", choices=["address", "none"], default="address")
     parser.add_argument("--seed", type=lambda value: int(value, 0))
-    parser.add_argument("--corpus", type=Path, help="optional trusted corpus directory to add to tracked seeds")
+    parser.add_argument("--corpus", type=Path, help="optional trusted corpus package to add to tracked seeds")
     return parser.parse_args(argv)
 
 
@@ -121,6 +122,47 @@ def sha256_tree(path):
     return digest.hexdigest()
 
 
+def validate_corpus_package(source, target):
+    if not source.is_dir():
+        raise CampaignError(f"restored corpus does not exist: {source}")
+    manifest_path = source / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise CampaignError(f"restored corpus manifest is invalid: {error}") from error
+    if manifest.get("schema_version") != 1 or manifest.get("format") != CORPUS_FORMAT:
+        raise CampaignError("restored corpus format is unsupported")
+    if manifest.get("target") != target or not isinstance(manifest.get("files"), list):
+        raise CampaignError("restored corpus target or file list is invalid")
+    expected = {}
+    for entry in manifest["files"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
+            raise CampaignError("restored corpus file entry is invalid")
+        relative = Path(entry["path"])
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("inputs",):
+            raise CampaignError(f"restored corpus path is outside inputs: {entry['path']}")
+        if relative in expected:
+            raise CampaignError(f"restored corpus lists a duplicate path: {entry['path']}")
+        expected[relative] = entry["sha256"]
+    actual = set()
+    for path in source.rglob("*"):
+        if path == manifest_path:
+            continue
+        if path.is_symlink():
+            raise CampaignError(f"restored corpus contains a symlink: {path}")
+        if path.is_file():
+            actual.add(path.relative_to(source))
+    if actual != set(expected):
+        raise CampaignError("restored corpus files do not match its manifest")
+    validated = []
+    for relative, digest in sorted(expected.items()):
+        path = source / relative
+        if sha256_file(path) != digest:
+            raise CampaignError(f"restored corpus hash mismatch: {relative}")
+        validated.append((relative, path, digest))
+    return validated
+
+
 def new_evidence(profile, target, output, sanitizer, rng_seed=FUZZ_SEED, corpus_source=None):
     lockfile = FUZZ_ROOT / "Cargo.lock"
     config = FUZZ_ROOT / "config.json"
@@ -178,11 +220,21 @@ def run_campaign(
         raise CampaignError(f"missing seed corpus for {target}")
     seed_corpus = output / "corpus"
     shutil.copytree(corpus, seed_corpus)
+    corpus_inputs = [
+        (f"tracked:{seed.name}", seed, sha256_file(seed))
+        for seed in sorted(path for path in corpus.iterdir() if path.is_file())
+    ]
     if corpus_source is not None:
-        if not corpus_source.is_dir():
-            raise CampaignError(f"restored corpus does not exist: {corpus_source}")
-        shutil.copytree(corpus_source, seed_corpus, dirs_exist_ok=True)
+        restored = validate_corpus_package(corpus_source, target)
+        restored_dir = seed_corpus / "restored"
+        restored_dir.mkdir()
+        for relative, path, digest in restored:
+            destination = restored_dir / f"{digest}-{path.name}"
+            shutil.copyfile(path, destination)
+            corpus_inputs.append((f"restored:{relative}", destination, digest))
         evidence["campaign_corpus_sha256"] = sha256_tree(seed_corpus)
+        evidence["restored_corpus_files"] = [str(relative) for relative, _, _ in restored]
+    evidence["corpus_inputs"] = [{"input": name, "sha256": digest} for name, _, digest in corpus_inputs]
     artifacts = output / "artifacts"
     artifacts.mkdir()
     build_args = ["cargo", f"+{TOOLCHAIN}", "fuzz", "build", "--sanitizer", sanitizer, target]
@@ -194,17 +246,21 @@ def run_campaign(
         raise CampaignError(f"fuzz target build exited {build_result.returncode}")
     replay_results = []
     if replay is None:
-        for seed in sorted(path for path in corpus.iterdir() if path.is_file()):
+        seen_digests = set()
+        for name, seed, digest in corpus_inputs:
+            if digest in seen_digests:
+                continue
+            seen_digests.add(digest)
             replay_args = [
                 "cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target,
                 str(seed), "--", "-runs=1", f"-seed={rng_seed}", f"-max_len={MAX_LEN}", "-timeout=10",
             ]
             replay_result = command(replay_args, timeout=120)
-            replay_results.append({"input": seed.name, "exit_code": replay_result.returncode})
+            replay_results.append({"input": name, "exit_code": replay_result.returncode, "sha256": digest})
             if replay_result.returncode != 0:
                 evidence["outcome"] = "seed_replay_failure"
                 evidence["seed_replay"] = replay_results
-                raise CampaignError(f"seed replay failed for {seed.name}")
+                raise CampaignError(f"seed replay failed for {name}")
     evidence["seed_replay"] = replay_results
     if replay is not None:
         if not replay.is_file():
@@ -272,7 +328,7 @@ def main(argv=None):
     except CampaignError as error:
         print(f"core fuzz failed: {error}", file=sys.stderr)
         return 1
-    evidence = new_evidence(args.profile, args.target, output, args.sanitizer, rng_seed)
+    evidence = new_evidence(args.profile, args.target, output, args.sanitizer, rng_seed, args.corpus)
     try:
         write_evidence(evidence_path, evidence)
         evidence["rustc_version"] = ensure_pins()
