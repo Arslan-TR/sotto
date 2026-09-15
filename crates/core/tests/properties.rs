@@ -175,6 +175,26 @@ proptest! {
         prop_assert_eq!(format::decode_key(&prefix, version, &encoded).expect("decode_key"), payload);
     }
 
+    /// Body-only case, separator and Crockford alias changes preserve a valid key payload.
+    #[test]
+    fn key_body_spelling_variations_preserve_payload(
+        prefix in prop_oneof![Just("SK".to_owned()), Just("RK".to_owned()), Just("MT".to_owned())],
+        payload in prop::collection::vec(any::<u8>(), 1..=256),
+    ) {
+        let encoded = format::encode_key(&prefix, 1, &payload);
+        let (head, body) = encoded.split_once('-').expect("key body");
+        let lower = format!("{head}-{}", body.to_ascii_lowercase());
+        prop_assert_eq!(format::decode_key(&prefix, 1, &lower).expect("lowercase body"), payload);
+
+        let aliases = body.replace('0', "o").replace('1', "i");
+        let alias_key = format!("{head}-{aliases}");
+        prop_assert_eq!(format::decode_key(&prefix, 1, &alias_key).expect("alias body"), payload);
+
+        let separated = body.chars().map(|c| format!("{c}-")).collect::<String>();
+        let separated_key = format!("{head}-{separated}");
+        prop_assert_eq!(format::decode_key(&prefix, 1, &separated_key).expect("separated body"), payload);
+    }
+
     /// Symmetric key wrapping round-trips.
     #[test]
     fn wrap_round_trip(kek in key(), k in key(), aad in bytes(64)) {

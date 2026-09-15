@@ -22,6 +22,7 @@ PROFILES = {"pr": 30, "nightly": 1800}
 PRODUCTION_MAX_PAYLOAD = 4096
 MAX_INPUT = 16384
 MAX_LEN = MAX_INPUT + 1
+FUZZ_SEED = 0x5A17
 
 
 class CampaignError(Exception):
@@ -108,6 +109,7 @@ def new_evidence(profile, target, output, sanitizer):
         "production_input_max_bytes": PRODUCTION_MAX_PAYLOAD,
         "fuzzer_input_max_bytes": MAX_LEN,
         "requested_seconds": PROFILES[profile],
+        "rng_seed": FUZZ_SEED,
         "output": str(output.relative_to(ROOT)),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "outcome": "inconclusive",
@@ -140,7 +142,7 @@ def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
         for seed in sorted(path for path in corpus.iterdir() if path.is_file()):
             replay_args = [
                 "cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target,
-                str(seed), "--", "-runs=1", f"-max_len={MAX_LEN}", "-timeout=10",
+                str(seed), "--", "-runs=1", f"-seed={FUZZ_SEED}", f"-max_len={MAX_LEN}", "-timeout=10",
             ]
             replay_result = command(replay_args, timeout=30)
             replay_results.append({"input": seed.name, "exit_code": replay_result.returncode})
@@ -151,12 +153,12 @@ def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
     if replay is not None:
         if not replay.is_file():
             raise CampaignError(f"replay input does not exist: {replay}")
-        command_args = ["cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target, str(replay), "--", "-runs=1", f"-max_len={MAX_LEN}", "-timeout=10"]
+        command_args = ["cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target, str(replay), "--", "-runs=1", f"-seed={FUZZ_SEED}", f"-max_len={MAX_LEN}", "-timeout=10"]
     else:
         command_args = [
             "cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target, str(seed_corpus), "--",
             f"-artifact_prefix={artifacts}/", f"-max_total_time={PROFILES[profile]}",
-            f"-max_len={MAX_LEN}", "-timeout=10", "-print_final_stats=1",
+            f"-seed={FUZZ_SEED}", f"-max_len={MAX_LEN}", "-timeout=10", "-print_final_stats=1",
         ]
     evidence["command"] = command_args
     started = time.monotonic()
@@ -195,16 +197,23 @@ def main(argv=None):
     output.mkdir(parents=True)
     evidence_path = output / "run.json"
     evidence = new_evidence(args.profile, args.target, output, args.sanitizer)
-    write_evidence(evidence_path, evidence)
     try:
+        write_evidence(evidence_path, evidence)
         evidence["rustc_version"] = ensure_pins()
         run_campaign(args.profile, args.target, output, evidence, args.sanitizer, args.replay)
     except (CampaignError, OSError, subprocess.TimeoutExpired) as error:
         evidence["error"] = str(error)
         print(f"core fuzz failed: {error}", file=sys.stderr)
-        write_evidence(evidence_path, evidence)
+        try:
+            write_evidence(evidence_path, evidence)
+        except OSError as write_error:
+            print(f"core fuzz evidence write failed: {write_error}", file=sys.stderr)
         return 1
-    write_evidence(evidence_path, evidence)
+    try:
+        write_evidence(evidence_path, evidence)
+    except OSError as error:
+        print(f"core fuzz evidence write failed: {error}", file=sys.stderr)
+        return 1
     print(f"Core fuzz evidence: {output}")
     return 0
 

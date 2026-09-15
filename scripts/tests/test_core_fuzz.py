@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+TEST_TARGET_ROOT = ROOT / "target"
+TEST_TARGET_ROOT.mkdir(exist_ok=True)
 loader = importlib.machinery.SourceFileLoader("core_fuzz", str(ROOT / "scripts/check-core-fuzz"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 runner = importlib.util.module_from_spec(spec)
@@ -54,23 +56,25 @@ class EvidenceTests(unittest.TestCase):
 
     def test_evidence_records_reproducibility_metadata(self):
         evidence = runner.new_evidence("pr", "base32_codec", ROOT / "target" / "core-fuzz" / "x", "address")
-        for field in ("config_sha256", "lockfile_sha256", "starting_corpus_sha256", "workflow", "outcome"):
+        for field in ("config_sha256", "lockfile_sha256", "starting_corpus_sha256", "workflow", "outcome", "rng_seed"):
             self.assertIn(field, evidence)
+        self.assertNotEqual(evidence["rng_seed"], 0)
 
     def test_campaign_replays_seeds_and_sets_timeout(self):
         result = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
-        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             evidence = runner.new_evidence("pr", "base32_codec", output, "none")
             with patch.object(runner, "command", return_value=result) as mocked:
                 runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["status"], "passed")
             self.assertTrue(any("-timeout=10" in call.args[0] for call in mocked.call_args_list))
+            self.assertTrue(any("-seed=23063" in call.args[0] for call in mocked.call_args_list))
             self.assertTrue(evidence["seed_replay"])
 
     def test_failed_seed_replay_does_not_pass(self):
         result = SimpleNamespace(returncode=1, stdout="", stderr="crash")
-        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             evidence = runner.new_evidence("pr", "base32_codec", output, "none")
             with patch.object(runner, "command", return_value=result):
@@ -78,9 +82,20 @@ class EvidenceTests(unittest.TestCase):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["status"], "failed")
 
+    def test_campaign_timeout_does_not_pass(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", side_effect=subprocess.TimeoutExpired("cargo", 30)):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["status"], "failed")
+
     def test_campaign_without_completion_marker_does_not_pass(self):
         result = SimpleNamespace(returncode=0, stdout="#1 INITED\n", stderr="")
-        with tempfile.TemporaryDirectory(dir=ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             evidence = runner.new_evidence("pr", "base32_codec", output, "none")
             with patch.object(runner, "command", return_value=result):
