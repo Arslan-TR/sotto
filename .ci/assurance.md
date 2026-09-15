@@ -14,9 +14,9 @@ neutral, cancelled, timed-out, duplicated or unexpected jobs fail the completion
 The codec workflow selects the PR or nightly group from the event; the skipped profile is
 not part of that invocation's expected set.
 
-The existing `sotto protect` ruleset keeps its current funnel and supply-chain requirements.
-The completion contexts are added only after the hosted checks and the ruleset read-back
-have been reviewed. Repository ruleset state is not represented by this document.
+The `sotto protect` ruleset requires the four completion contexts in addition to its existing
+funnel and supply-chain requirements. The live ruleset is the authority for enforcement; this
+document describes the contract those contexts implement.
 
 ## Local validator fixtures
 
