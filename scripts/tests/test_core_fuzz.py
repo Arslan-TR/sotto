@@ -54,6 +54,13 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(config["rust_toolchain"], runner.TOOLCHAIN)
         self.assertEqual(config["targets"], sorted(runner.TARGETS))
 
+    def test_corpus_digest_frames_paths_and_contents(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as first, tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as second:
+            first_path, second_path = Path(first), Path(second)
+            (first_path / "a").write_bytes(b"bc")
+            (second_path / "ab").write_bytes(b"c")
+            self.assertNotEqual(runner.sha256_tree(first_path), runner.sha256_tree(second_path))
+
     def test_evidence_records_reproducibility_metadata(self):
         evidence = runner.new_evidence("pr", "base32_codec", ROOT / "target" / "core-fuzz" / "x", "address")
         for field in ("config_sha256", "lockfile_sha256", "starting_corpus_sha256", "workflow", "outcome", "rng_seed"):
