@@ -139,6 +139,8 @@ mod verification {
                 .position(|&b| char::from(b) == upper)
                 .map(|p| p as u8),
         };
+        kani::cover!(expected.is_some());
+        kani::cover!(expected.is_none());
         assert_eq!(decode_symbol(c), expected);
     }
 }

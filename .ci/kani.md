@@ -10,7 +10,7 @@ separate from adding a workflow; this change does not configure branch protectio
 | Harness | Inputs and claim | Boundary |
 | --- | --- | --- |
 | `envelope::verification::header_validation_and_slicing` | Every byte value for lengths 0 through 64. Inputs shorter than 26 bytes reject first; only scheme 1/algorithm 1 pass the header check; returned nonce/ciphertext slices match the wire layout. | Structural parsing only; authentication and tag validity remain in AEAD. |
-| `format::verification::decode_symbol_total_and_compatible` | Every Unicode scalar is classified by the real decoder's symbol helper exactly as the Crockford alphabet and aliases specify. | Does not symbolically execute allocation-heavy whole-string round trips or prove `encode_key`/`decode_key`. Native property tests cover those behaviours. |
+| `format::verification::decode_symbol_total_and_compatible` | Every Unicode scalar is classified by the real decoder's symbol helper according to the current Crockford alphabet table and aliases. Reachability covers both accepted and rejected classes. | The proof checks the implementation against the maintained alphabet table; fixed golden vectors independently check the wire spelling. It does not symbolically execute allocation-heavy whole-string round trips or prove `encode_key`/`decode_key`. Native property tests cover those behaviours. |
 
 All safety and unwinding checks remain enabled. The envelope harness loop-unwind limit is 65.
 The symbol harness has no production loop to unwind. An insufficient limit is a proof failure,
@@ -21,7 +21,8 @@ validation. Native regression tests pin error precedence and the existing `Crypt
 error for a full header with a missing/short authentication tag.
 
 These proofs do not establish cryptographic security, authentication correctness,
-unbounded input safety, database concurrency, or correctness on every target. Existing
+unbounded input safety, absence of timing leaks, universal correctness, database concurrency,
+or correctness on every target. Existing
 crypto property tests and native/WASM vector checks remain necessary. Native Kani
 verification is not execution of the WASM artifact.
 
