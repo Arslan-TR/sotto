@@ -28,6 +28,7 @@ export interface SeoTerminalLine {
 
 export interface SeoPageData {
   slug: string;
+  navLabel: string;
   tabTitle: string;
   description: string;
   h1: string;
@@ -44,6 +45,7 @@ export interface SeoPageData {
 export const guidePages: SeoPageData[] = [
   {
     slug: "share-secrets-securely",
+    navLabel: "Share secrets",
     tabTitle: "Sotto: share secrets securely with end-to-end encryption",
     description:
       "Send passwords, tokens, and keys without pasting them into chat. Encrypted on your machine and readable through the complete link while it is active.",
@@ -89,6 +91,7 @@ export const guidePages: SeoPageData[] = [
   },
   {
     slug: "share-env-files",
+    navLabel: "Share .env files",
     tabTitle: "Share .env files with your team, encrypted | Sotto",
     description:
       "Your .env holds every key your app needs. Share it with your team encrypted end to end, never as a screenshot or a Slack paste again.",
@@ -135,6 +138,7 @@ export const guidePages: SeoPageData[] = [
   },
   {
     slug: "one-time-secret-links",
+    navLabel: "One-time links",
     tabTitle: "One-time secret links that burn after reading | Sotto",
     description:
       "Create a link that reveals a secret exactly once, then stops working. No account needed for the recipient.",
@@ -180,6 +184,7 @@ export const guidePages: SeoPageData[] = [
   },
   {
     slug: "share-api-keys-securely",
+    navLabel: "Share API keys",
     tabTitle: "Share API keys with your team, encrypted | Sotto",
     description:
       "API keys unlock billing, email, and infrastructure. Share them with teammates encrypted end to end, and rotate them in one place.",
@@ -228,6 +233,7 @@ export const guidePages: SeoPageData[] = [
   },
   {
     slug: "send-password-securely",
+    navLabel: "Send passwords",
     tabTitle: "Send a password securely with a one-time link | Sotto",
     description:
       "Send a password through a link that stops working after one read, without putting the password in chat or email. No recipient account needed.",
@@ -273,6 +279,7 @@ export const guidePages: SeoPageData[] = [
   },
   {
     slug: "self-hosted-secret-management",
+    navLabel: "Self-hosting",
     tabTitle: "Self-hosted secret management in one command | Sotto",
     description:
       "Run your own secret sync server with one docker compose file. Apache-2.0, ciphertext only, your keys never leave your devices.",
