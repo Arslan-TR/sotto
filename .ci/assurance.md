@@ -19,6 +19,11 @@ The `sotto protect` ruleset requires the four completion contexts in addition to
 funnel and supply-chain requirements. The live ruleset is the authority for enforcement; this
 document describes the contract those contexts implement.
 
+These completion jobs run in the ordinary pull request workflows and use the reviewed workflow
+revision. They enforce accidental omissions, skips and incomplete runs. They do not provide
+hostile-contributor isolation from a change that rewrites the workflow, manifest or validator;
+a future trusted default-branch workflow would be required for that threat model.
+
 ## Local validator fixtures
 
 The validator can inspect a captured run without making a GitHub API request:
