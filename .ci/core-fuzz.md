@@ -1,0 +1,73 @@
+# Core codec fuzzing
+
+The core fuzz workflow drives the real `sotto-core` format APIs with libFuzzer and
+AddressSanitizer on Linux. It covers base32 strings and versioned key strings. The
+fuzz package is isolated from the application workspace and has its own lockfile.
+
+## Reproduce locally
+
+Install the pinned tools and nightly compiler:
+
+```sh
+cargo +stable install --locked cargo-fuzz --version 0.13.2
+rustup toolchain install nightly-2025-11-21 --profile minimal
+```
+
+Run the 30-second PR profile for either target:
+
+```sh
+scripts/check-core-fuzz --profile pr --target base32_codec
+scripts/check-core-fuzz --profile pr --target key_strings
+```
+
+The runner bounds each input at 4,096 bytes and writes a fresh record under
+`target/core-fuzz/`. It starts each record with `status: failed`, records the exact
+commit, command, toolchain, platform, seed/campaign limits and execution count, and
+changes status only after libFuzzer emits its completion marker and exits successfully.
+Logs are retained in the record. A timeout, signal, sanitizer failure, missing target,
+zero executions or missing completion marker remains failed/inconclusive.
+
+For a one-input replay:
+
+```sh
+scripts/check-core-fuzz --profile pr --target key_strings \
+  --replay /path/to/failing-input
+```
+
+Replay does not claim a campaign completed; it only verifies the saved reproducer exits
+according to the target's assertion. Use synthetic inputs only. Never commit generated
+artifacts or promote a PR corpus into trusted nightly corpus storage.
+
+## Target modes
+
+`base32_codec` uses a mode byte followed by bounded payload data. It exercises encoder
+round trips, valid UTF-8 decoding and constructed valid/invalid Crockford symbols,
+separators and aliases.
+
+`key_strings` uses a mode byte followed by bounded data. It exercises `SK`, `RK` and
+`MT` versioned keys, arbitrary text, correctly shaped but malformed bodies, wrong
+versions and successful round trips. The target deliberately constructs valid headers
+so malformed bodies reach symbol, length and checksum validation.
+
+The properties and fixed WASM/native fixtures remain the deterministic oracle. A fuzz
+finding is not fixed by changing production validation to accept it. Minimise the saved
+input, add a normal regression test in a separate change, and retain the original
+reproducer in the private campaign record.
+
+## CI allocation
+
+Pull requests and pushes to `main` run both targets independently for 30 seconds each
+after seed replay. Nightly runs both targets for 30 minutes each with `fail-fast: false`.
+Manual dispatch selects either profile at the selected ref. Linux x86_64 is the
+sanitizer authority; native macOS/Windows source tests and WASM tests remain separate.
+
+The workflow pins the cargo-fuzz release, Rust nightly, actions and the fuzz lockfile.
+It uploads each run record on success or failure for 14 days. A successful earlier run
+cannot satisfy a later failed or incomplete invocation. This workflow does not create
+release holds or configure repository required-check settings; those remain separate
+assurance work.
+
+The local Apple Silicon ASAN binary currently hangs before libFuzzer prints its help or
+initialisation banner. Local smoke can use `--sanitizer none` to validate target logic;
+CI's Linux AddressSanitizer run is the sanitizer evidence and must be green before the
+campaign is considered complete.

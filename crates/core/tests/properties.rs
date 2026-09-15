@@ -15,6 +15,57 @@ fn bytes(max: usize) -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..max)
 }
 
+fn unicode_string(max_chars: usize) -> impl Strategy<Value = String> {
+    prop::collection::vec(any::<char>(), 0..max_chars).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn reference_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let output_len = (data.len() * 8).div_ceil(5);
+    (0..output_len)
+        .map(|index| {
+            let mut value = 0u8;
+            for offset in 0..5 {
+                let bit = index * 5 + offset;
+                value <<= 1;
+                if bit < data.len() * 8 {
+                    value |= (data[bit / 8] >> (7 - bit % 8)) & 1;
+                }
+            }
+            char::from(ALPHABET[value as usize])
+        })
+        .collect()
+}
+
+fn reference_decode(input: &str) -> Result<Vec<u8>, ()> {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut out = Vec::with_capacity(input.len() * 5 / 8 + 1);
+    let mut accumulator = 0u16;
+    let mut bits = 0u8;
+    for character in input.chars() {
+        if character == '-' {
+            continue;
+        }
+        let upper = character.to_ascii_uppercase();
+        let value = match upper {
+            'O' => 0,
+            'I' | 'L' => 1,
+            _ => ALPHABET
+                .iter()
+                .position(|&symbol| char::from(symbol) == upper)
+                .ok_or(())? as u8,
+        };
+        accumulator = (accumulator << 5) | value as u16;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
+
 proptest! {
     /// AEAD: decrypting what we encrypted (with the same aad) returns the plaintext.
     #[test]
@@ -54,6 +105,20 @@ proptest! {
         prop_assert_eq!(format::decode(&format::encode(&data)).expect("decode"), data);
     }
 
+    /// Compare production encoding against an independent bit-indexed oracle.
+    #[test]
+    fn crockford_encode_matches_reference(data in bytes(1025)) {
+        prop_assert_eq!(format::encode(&data), reference_encode(&data));
+    }
+
+    /// Compare the production byte walk with the independent character-based decoder.
+    #[test]
+    fn crockford_decode_matches_reference(input in unicode_string(64)) {
+        let expected = reference_decode(&input);
+        let actual = format::decode(&input).map_err(|_| ());
+        prop_assert_eq!(actual, expected);
+    }
+
     /// Arbitrary bounded ASCII strings are either decoded or rejected, never panicked on.
     /// This exercises malformed symbols, separators and empty input rather than only encoder output.
     #[test]
@@ -63,11 +128,36 @@ proptest! {
         let _ = format::decode_key("SK", 1, &input);
     }
 
+    /// Full-Unicode strings are either decoded or rejected, never panicked on.
+    #[test]
+    fn malformed_unicode_decode_inputs_do_not_panic(input in unicode_string(256)) {
+        let _ = format::decode(&input);
+        let _ = format::decode_key("SK", 1, &input);
+    }
+
+    /// A valid key header forces generated malformed bodies through key validation.
+    #[test]
+    fn malformed_key_bodies_do_not_panic(body in unicode_string(256)) {
+        let input = format!("SK1-{body}");
+        let _ = format::decode_key("SK", 1, &input);
+    }
+
     /// Versioned, checksummed key strings round-trip for any prefix/version/payload.
     #[test]
     fn key_string_round_trip(payload in prop::collection::vec(any::<u8>(), 1..64), version in any::<u8>()) {
         let s = format::encode_key("SK", version, &payload);
         prop_assert_eq!(format::decode_key("SK", version, &s).expect("decode_key"), payload);
+    }
+
+    /// Supported key prefixes retain their versioned round-trip behaviour.
+    #[test]
+    fn key_string_round_trip_for_supported_prefixes(
+        prefix in prop_oneof![Just("SK".to_owned()), Just("RK".to_owned()), Just("MT".to_owned())],
+        payload in prop::collection::vec(any::<u8>(), 1..64),
+        version in any::<u8>(),
+    ) {
+        let encoded = format::encode_key(&prefix, version, &payload);
+        prop_assert_eq!(format::decode_key(&prefix, version, &encoded).expect("decode_key"), payload);
     }
 
     /// Symmetric key wrapping round-trips.
@@ -122,4 +212,10 @@ proptest! {
         prop_assert!(vault::decrypt_value(&old, "env", "secret", version, &enc.enc_value, &rewrapped).is_err());
         prop_assert!(vault::decrypt_value(&new, "env", "secret", version, &enc.enc_value, &enc.enc_data_key).is_err());
     }
+}
+
+#[test]
+fn crockford_reference_handles_max_payload() {
+    let data = vec![0xa5; 4096];
+    assert_eq!(format::encode(&data), reference_encode(&data));
 }

@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Run a bounded core codec fuzz campaign and write auditable evidence."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+FUZZ_ROOT = ROOT / "fuzz"
+FUZZ_VERSION = "cargo-fuzz 0.13.2"
+TOOLCHAIN = "nightly-2025-11-21"
+TARGETS = {"base32_codec", "key_strings"}
+PROFILES = {"pr": 30, "nightly": 1800}
+MAX_PAYLOAD = 4096
+MAX_LEN = MAX_PAYLOAD + 1
+
+
+class CampaignError(Exception):
+    """The campaign did not produce valid completion evidence."""
+
+
+def command(args, *, timeout=None):
+    return subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", choices=sorted(PROFILES), required=True)
+    parser.add_argument("--target", choices=sorted(TARGETS), required=True)
+    parser.add_argument("--replay", type=Path)
+    parser.add_argument("--sanitizer", choices=["address", "none"], default="address")
+    return parser.parse_args(argv)
+
+
+def ensure_pins():
+    result = command(["cargo", "fuzz", "--version"])
+    if result.returncode != 0 or result.stdout.strip() != FUZZ_VERSION:
+        raise CampaignError(f"expected {FUZZ_VERSION}, got {result.stdout.strip()!r}")
+    if not (FUZZ_ROOT / "Cargo.lock").is_file():
+        raise CampaignError("fuzz/Cargo.lock is missing")
+
+
+def new_evidence(profile, target, output, sanitizer):
+    return {
+        "status": "failed",
+        "profile": profile,
+        "target": target,
+        "commit": command(["git", "rev-parse", "HEAD"]).stdout.strip(),
+        "working_tree_dirty": bool(command(["git", "status", "--porcelain"]).stdout.strip()),
+        "tool": FUZZ_VERSION,
+        "toolchain": TOOLCHAIN,
+        "sanitizer": sanitizer,
+        "platform": f"{sys.platform}/{os.uname().machine}",
+        "production_input_max_bytes": MAX_PAYLOAD,
+        "fuzzer_input_max_bytes": MAX_LEN,
+        "requested_seconds": PROFILES[profile],
+        "output": str(output.relative_to(ROOT)),
+    }
+
+
+def write_evidence(path, evidence):
+    path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+
+
+def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
+    corpus = FUZZ_ROOT / "corpus" / target
+    if not corpus.is_dir():
+        raise CampaignError(f"missing seed corpus for {target}")
+    seed_corpus = output / "corpus"
+    shutil.copytree(corpus, seed_corpus)
+    artifacts = output / "artifacts"
+    artifacts.mkdir()
+    if replay is not None:
+        if not replay.is_file():
+            raise CampaignError(f"replay input does not exist: {replay}")
+        command_args = ["cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target, str(replay), "--", "-runs=1", f"-max_len={MAX_LEN}"]
+    else:
+        command_args = [
+            "cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target, str(seed_corpus), "--",
+            f"-artifact_prefix={artifacts}/", f"-max_total_time={PROFILES[profile]}",
+            f"-max_len={MAX_LEN}", "-print_final_stats=1",
+        ]
+    evidence["command"] = command_args
+    started = time.monotonic()
+    result = command(command_args, timeout=PROFILES[profile] + 120)
+    evidence["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    evidence["exit_code"] = result.returncode
+    output_text = result.stdout + "\n" + result.stderr
+    evidence["completed_marker"] = "Done " in output_text
+    evidence["executions"] = _executions(output_text)
+    (output / "stdout.log").write_text(result.stdout, encoding="utf-8")
+    (output / "stderr.log").write_text(result.stderr, encoding="utf-8")
+    if replay is not None:
+        evidence["status"] = "passed" if result.returncode == 0 else "failed"
+        return
+    if result.returncode != 0:
+        raise CampaignError(f"fuzz target exited {result.returncode}")
+    if not evidence["completed_marker"] or not evidence["executions"]:
+        raise CampaignError("fuzz target produced no completion marker or execution count")
+    evidence["status"] = "passed"
+
+
+def _executions(stdout):
+    for line in reversed(stdout.splitlines()):
+        if line.startswith("Done "):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1])
+    return 0
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    output = ROOT / "target" / "core-fuzz" / f"{args.target}-{uuid.uuid4().hex}"
+    output.mkdir(parents=True)
+    evidence_path = output / "run.json"
+    evidence = new_evidence(args.profile, args.target, output, args.sanitizer)
+    write_evidence(evidence_path, evidence)
+    try:
+        ensure_pins()
+        run_campaign(args.profile, args.target, output, evidence, args.sanitizer, args.replay)
+    except (CampaignError, OSError, subprocess.TimeoutExpired) as error:
+        evidence["error"] = str(error)
+        print(f"core fuzz failed: {error}", file=sys.stderr)
+        write_evidence(evidence_path, evidence)
+        return 1
+    write_evidence(evidence_path, evidence)
+    print(f"Core fuzz evidence: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
