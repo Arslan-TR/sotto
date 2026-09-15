@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(format::decode_key("SK", 1, &encoded).expect("key output is valid"), payload);
         }
         1 => {
-            let input = body_text(bounded(rest, MAX_TEXT));
+            let input = format!("X{}", body_text(bounded(rest, MAX_TEXT)));
             assert!(format::decode_key("SK", 1, &input).is_err(), "missing key header must reject");
         }
         2 => {
