@@ -64,11 +64,12 @@ jobs:
       - name: Validate required codec jobs
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = schedule ] || [ "${{ inputs.profile }}" = nightly ]; then
-            scripts/check-assurance --group codec-nightly
+            scripts/check-assurance --group codec-nightly --expected-sha "$EXPECTED_SHA"
           else
-            scripts/check-assurance --group codec
+            scripts/check-assurance --group codec --expected-sha "$EXPECTED_SHA"
           fi
 
   nightly:

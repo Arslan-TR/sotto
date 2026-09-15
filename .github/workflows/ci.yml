@@ -377,4 +377,5 @@ jobs:
       - name: Validate required CI jobs
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: scripts/check-assurance --group ci
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: scripts/check-assurance --group ci --expected-sha "$EXPECTED_SHA"

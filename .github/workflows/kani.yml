@@ -60,4 +60,5 @@ jobs:
       - name: Validate required Kani jobs
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: scripts/check-assurance --group kani
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: scripts/check-assurance --group kani --expected-sha "$EXPECTED_SHA"
