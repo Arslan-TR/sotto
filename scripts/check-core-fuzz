@@ -177,6 +177,8 @@ def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
     if replay is not None:
         evidence["outcome"] = "replay_passed" if result.returncode == 0 else "replay_failed"
         evidence["status"] = "passed" if result.returncode == 0 else "failed"
+        if result.returncode != 0:
+            raise CampaignError(f"replay exited {result.returncode}")
         return
     if result.returncode != 0:
         raise CampaignError(f"fuzz target exited {result.returncode}")

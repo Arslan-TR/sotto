@@ -101,6 +101,18 @@ class EvidenceTests(unittest.TestCase):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["status"], "failed")
 
+    def test_failing_replay_returns_campaign_error(self):
+        result = SimpleNamespace(returncode=1, stdout="", stderr="crash")
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            replay = output / "reproducer"
+            replay.write_bytes(b"crash")
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", return_value=result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none", replay)
+            self.assertEqual(evidence["status"], "failed")
+
     def test_campaign_without_completion_marker_does_not_pass(self):
         result = SimpleNamespace(returncode=0, stdout="#1 INITED\n", stderr="")
         with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
