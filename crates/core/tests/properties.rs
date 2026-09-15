@@ -21,6 +21,22 @@ fn unicode_string(max_chars: usize) -> impl Strategy<Value = String> {
     prop::collection::vec(any::<char>(), 0..max_chars).prop_map(|chars| chars.into_iter().collect())
 }
 
+fn weighted_codec_string(max_chars: usize) -> impl Strategy<Value = String> {
+    let character = prop_oneof![
+        Just('0'),
+        Just('A'),
+        Just('Z'),
+        Just('-'),
+        Just('o'),
+        Just('i'),
+        Just('l'),
+        Just('U'),
+        Just('#'),
+        any::<char>(),
+    ];
+    prop::collection::vec(character, 0..max_chars).prop_map(|chars| chars.into_iter().collect())
+}
+
 fn reference_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let output_len = (data.len() * 8).div_ceil(5);
@@ -46,9 +62,7 @@ enum ReferenceDecodeError {
 
 fn reference_decode(input: &str) -> Result<Vec<u8>, ReferenceDecodeError> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let mut out = Vec::with_capacity(input.len() * 5 / 8 + 1);
-    let mut accumulator = 0u16;
-    let mut bits = 0u8;
+    let mut values = Vec::with_capacity(input.len());
     for character in input.chars() {
         if character == '-' {
             continue;
@@ -62,15 +76,22 @@ fn reference_decode(input: &str) -> Result<Vec<u8>, ReferenceDecodeError> {
                 .position(|&symbol| char::from(symbol) == upper)
                 .ok_or(ReferenceDecodeError::InvalidSymbol)? as u8,
         };
-        accumulator = (accumulator << 5) | value as u16;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((accumulator >> bits) as u8);
-            accumulator &= (1 << bits) - 1;
-        }
+        values.push(value);
     }
-    Ok(out)
+    let output_len = values.len() * 5 / 8;
+    Ok((0..output_len)
+        .map(|index| {
+            (0..8).fold(0u8, |byte, offset| {
+                let bit = index * 8 + offset;
+                let value = if bit < values.len() * 5 {
+                    (values[bit / 5] >> (4 - bit % 5)) & 1
+                } else {
+                    0
+                };
+                (byte << 1) | value
+            })
+        })
+        .collect())
 }
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
@@ -116,26 +137,25 @@ proptest! {
 
     /// Crockford base32 round-trips over arbitrary byte lengths (bit-packing correctness).
     #[test]
-    fn crockford_round_trip(data in bytes(256)) {
+    fn crockford_round_trip(data in bytes(4097)) {
         prop_assert_eq!(format::decode(&format::encode(&data)).expect("decode"), data);
     }
 
     /// Compare production encoding against an independent bit-indexed oracle.
     #[test]
-    fn crockford_encode_matches_reference(data in bytes(1025)) {
+    fn crockford_encode_matches_reference(data in bytes(4097)) {
         prop_assert_eq!(format::encode(&data), reference_encode(&data));
     }
 
     /// Compare the production byte walk with the independent character-based decoder.
     #[test]
-    fn crockford_decode_matches_reference(input in unicode_string(4096)) {
+    fn crockford_decode_matches_reference(input in weighted_codec_string(4096)) {
         let expected = reference_decode(&input);
         let actual = format::decode(&input).map_err(|_| ReferenceDecodeError::InvalidSymbol);
         prop_assert_eq!(actual, expected);
     }
 
-    /// Arbitrary bounded ASCII strings are either decoded or rejected, never panicked on.
-    /// This exercises malformed symbols, separators and empty input rather than only encoder output.
+    /// Bounded byte-derived strings are either decoded or rejected, never panicked on.
     #[test]
     fn malformed_decode_inputs_do_not_panic(data in bytes(4097)) {
         let input: String = data.into_iter().map(char::from).collect();
@@ -267,6 +287,34 @@ proptest! {
 fn crockford_reference_handles_max_payload() {
     let data = vec![0xa5; 4096];
     assert_eq!(format::encode(&data), reference_encode(&data));
+}
+
+#[test]
+fn crockford_reference_matches_fixed_vectors() {
+    assert_eq!(
+        reference_decode("NENTQ-AXBNE-NTQAX-BNENT-QAXBN-DDBW"),
+        Ok(vec![0xAB; 16].into_iter().chain([0x5A, 0xBE]).collect())
+    );
+    assert_eq!(reference_decode(""), Ok(Vec::new()));
+}
+
+#[test]
+fn crockford_payload_boundaries_and_patterns_round_trip() {
+    let lengths = [
+        0, 1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 4096,
+    ];
+    for length in lengths {
+        for data in [
+            vec![0; length],
+            vec![0xFF; length],
+            (0..length).map(|index| (index % 2) as u8).collect(),
+            (0..length).map(|index| index as u8).collect(),
+        ] {
+            let encoded = format::encode(&data);
+            assert_eq!(format::decode(&encoded).expect("boundary decode"), data);
+            assert_eq!(encoded, reference_encode(&data));
+        }
+    }
 }
 
 #[test]
