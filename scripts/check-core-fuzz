@@ -133,6 +133,17 @@ def write_evidence(path, evidence):
     path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
 
 
+def failure_outcome(result):
+    if result.returncode < 0:
+        return "interrupted"
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    if "addresssanitizer" in output or "sanitizer" in output:
+        return "sanitizer_failure"
+    if "assertion" in output or "panicked" in output:
+        return "assertion_failure"
+    return "campaign_failure"
+
+
 def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
     corpus = FUZZ_ROOT / "seeds" / target
     if not corpus.is_dir():
@@ -151,6 +162,7 @@ def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
             replay_result = command(replay_args, timeout=120)
             replay_results.append({"input": seed.name, "exit_code": replay_result.returncode})
             if replay_result.returncode != 0:
+                evidence["outcome"] = "seed_replay_failure"
                 evidence["seed_replay"] = replay_results
                 raise CampaignError(f"seed replay failed for {seed.name}")
     evidence["seed_replay"] = replay_results
@@ -178,11 +190,14 @@ def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
         evidence["outcome"] = "replay_passed" if result.returncode == 0 else "replay_failed"
         evidence["status"] = "passed" if result.returncode == 0 else "failed"
         if result.returncode != 0:
+            evidence["outcome"] = failure_outcome(result)
             raise CampaignError(f"replay exited {result.returncode}")
         return
     if result.returncode != 0:
+        evidence["outcome"] = failure_outcome(result)
         raise CampaignError(f"fuzz target exited {result.returncode}")
     if not evidence["completed_marker"] or not evidence["executions"]:
+        evidence["outcome"] = "incomplete_campaign"
         raise CampaignError("fuzz target produced no completion marker or execution count")
     evidence["status"] = "passed"
     evidence["outcome"] = "campaign_completed"
@@ -209,6 +224,10 @@ def main(argv=None):
         run_campaign(args.profile, args.target, output, evidence, args.sanitizer, args.replay)
     except (CampaignError, OSError, subprocess.TimeoutExpired) as error:
         evidence["error"] = str(error)
+        if isinstance(error, subprocess.TimeoutExpired):
+            evidence["outcome"] = "resource_timeout"
+        elif isinstance(error, OSError):
+            evidence["outcome"] = "infrastructure_failure"
         print(f"core fuzz failed: {error}", file=sys.stderr)
         try:
             write_evidence(evidence_path, evidence)
@@ -218,6 +237,7 @@ def main(argv=None):
     try:
         write_evidence(evidence_path, evidence)
     except OSError as error:
+        evidence["outcome"] = "evidence_write_failure"
         print(f"core fuzz evidence write failed: {error}", file=sys.stderr)
         return 1
     print(f"Core fuzz evidence: {output}")

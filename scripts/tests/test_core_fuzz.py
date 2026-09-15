@@ -123,6 +123,22 @@ class EvidenceTests(unittest.TestCase):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["status"], "failed")
 
+    def test_campaign_records_incomplete_outcome_for_zero_runs(self):
+        result = SimpleNamespace(returncode=0, stdout="Done 0 runs in 0 second(s)\n", stderr="")
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", return_value=result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["outcome"], "incomplete_campaign")
+
+    def test_failure_outcome_distinguishes_sanitizer_and_interruption(self):
+        sanitizer = SimpleNamespace(returncode=1, stdout="", stderr="AddressSanitizer: heap-use-after-free")
+        interrupted = SimpleNamespace(returncode=-9, stdout="", stderr="")
+        self.assertEqual(runner.failure_outcome(sanitizer), "sanitizer_failure")
+        self.assertEqual(runner.failure_outcome(interrupted), "interrupted")
+
 
 if __name__ == "__main__":
     unittest.main()
