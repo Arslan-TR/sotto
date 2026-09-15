@@ -173,6 +173,50 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(runner.failure_outcome(sanitizer), "sanitizer_failure")
         self.assertEqual(runner.failure_outcome(interrupted), "interrupted")
 
+    def test_campaign_signal_does_not_pass(self):
+        replay_ok = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        campaign_signal = SimpleNamespace(returncode=-9, stdout="", stderr="")
+
+        def command_result(args, **_):
+            return campaign_signal if any("-max_total_time=" in arg for arg in args) else replay_ok
+
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", side_effect=command_result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["outcome"], "interrupted")
+
+    def test_campaign_crash_does_not_pass(self):
+        replay_ok = SimpleNamespace(returncode=0, stdout="Done 1 runs in 0 second(s)\n", stderr="")
+        campaign_crash = SimpleNamespace(returncode=1, stdout="", stderr="panicked at fuzz target")
+
+        def command_result(args, **_):
+            return campaign_crash if any("-max_total_time=" in arg for arg in args) else replay_ok
+
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", side_effect=command_result):
+                with self.assertRaises(runner.CampaignError):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["outcome"], "assertion_failure")
+
+    def test_failed_final_evidence_write_does_not_pass(self):
+        writes = 0
+
+        def write_evidence(path, evidence):
+            nonlocal writes
+            writes += 1
+            if writes == 2:
+                raise OSError("disk full")
+
+        with patch.object(runner, "write_evidence", side_effect=write_evidence), patch.object(
+            runner, "ensure_pins", return_value="rustc test"
+        ), patch.object(runner, "run_campaign"):
+            self.assertEqual(runner.main(["--profile", "pr", "--target", "base32_codec"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
