@@ -144,7 +144,7 @@ def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
                 "cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target,
                 str(seed), "--", "-runs=1", f"-seed={FUZZ_SEED}", f"-max_len={MAX_LEN}", "-timeout=10",
             ]
-            replay_result = command(replay_args, timeout=30)
+            replay_result = command(replay_args, timeout=120)
             replay_results.append({"input": seed.name, "exit_code": replay_result.returncode})
             if replay_result.returncode != 0:
                 evidence["seed_replay"] = replay_results

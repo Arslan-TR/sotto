@@ -184,15 +184,18 @@ proptest! {
         let encoded = format::encode_key(&prefix, 1, &payload);
         let (head, body) = encoded.split_once('-').expect("key body");
         let lower = format!("{head}-{}", body.to_ascii_lowercase());
-        prop_assert_eq!(format::decode_key(&prefix, 1, &lower).expect("lowercase body"), payload);
+        let lower_payload = format::decode_key(&prefix, 1, &lower).expect("lowercase body");
+        prop_assert_eq!(lower_payload.as_slice(), payload.as_slice());
 
         let aliases = body.replace('0', "o").replace('1', "i");
         let alias_key = format!("{head}-{aliases}");
-        prop_assert_eq!(format::decode_key(&prefix, 1, &alias_key).expect("alias body"), payload);
+        let alias_payload = format::decode_key(&prefix, 1, &alias_key).expect("alias body");
+        prop_assert_eq!(alias_payload.as_slice(), payload.as_slice());
 
         let separated = body.chars().map(|c| format!("{c}-")).collect::<String>();
         let separated_key = format!("{head}-{separated}");
-        prop_assert_eq!(format::decode_key(&prefix, 1, &separated_key).expect("separated body"), payload);
+        let separated_payload = format::decode_key(&prefix, 1, &separated_key).expect("separated body");
+        prop_assert_eq!(separated_payload.as_slice(), payload.as_slice());
     }
 
     /// Symmetric key wrapping round-trips.

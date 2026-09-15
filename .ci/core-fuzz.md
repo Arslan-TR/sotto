@@ -29,7 +29,8 @@ every tracked seed has replayed successfully and libFuzzer emits its completion 
 and exits successfully. Logs are retained in the record. A timeout, signal, sanitizer
 failure, missing target, zero executions or missing completion marker remains
 failed/inconclusive. Each input also has a ten-second libFuzzer timeout so a single
-hang cannot consume the campaign budget. Campaigns use and record the fixed nonzero
+hang cannot consume the campaign budget. Seed replays have a two-minute process watchdog to
+allow sanitizer startup while keeping a bounded failure path. Campaigns use and record the fixed nonzero
 libFuzzer seed `0x5A17` for reproducible mutation sequences.
 
 For a one-input replay:
