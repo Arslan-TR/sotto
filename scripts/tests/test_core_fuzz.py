@@ -234,6 +234,21 @@ class EvidenceTests(unittest.TestCase):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["outcome"], "incomplete_campaign")
 
+    def test_campaign_allows_one_second_marker_rounding(self):
+        build = SimpleNamespace(returncode=0, stdout="", stderr="")
+        replay = SimpleNamespace(returncode=0, stdout="", stderr="")
+        campaign = SimpleNamespace(returncode=0, stdout="Done 1 runs in 29 second(s)\n", stderr="")
+
+        def command_result(args, **_kwargs):
+            return campaign if any("-max_total_time=" in arg for arg in args) else (build if "build" in args else replay)
+
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", side_effect=command_result):
+                runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            self.assertEqual(evidence["status"], "passed")
+
     def test_failure_outcome_distinguishes_sanitizer_and_interruption(self):
         sanitizer = SimpleNamespace(returncode=1, stdout="", stderr="AddressSanitizer: heap-use-after-free")
         interrupted = SimpleNamespace(returncode=-9, stdout="", stderr="")

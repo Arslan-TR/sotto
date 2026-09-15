@@ -27,7 +27,9 @@ is 4,096 bytes), and writes a fresh record under
 commit, command, toolchain, platform, configuration and lockfile digests, starting
 corpus digest, workflow identity, execution count and reported active duration, and changes
 status only after every starting-corpus input has replayed successfully and libFuzzer emits
-its completion marker with the requested duration before exiting successfully. Logs are
+its completion marker with the requested duration before exiting successfully. The marker
+reports whole seconds, so the runner permits at most one second of rounding: 29 reported
+seconds satisfies a 30-second request, while 28 does not. Logs are
 retained in the record. A timeout, signal, sanitizer
 failure, missing target, zero executions or missing completion marker remains
 failed/inconclusive. Each input also has a ten-second libFuzzer timeout so a single
