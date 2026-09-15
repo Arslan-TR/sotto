@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -47,3 +48,16 @@ jobs:
           path: target/kani-results/
           retention-days: 14
           if-no-files-found: warn
+
+  assurance-complete:
+    name: kani assurance complete
+    if: always()
+    needs: [core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Validate required Kani jobs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/check-assurance --group kani

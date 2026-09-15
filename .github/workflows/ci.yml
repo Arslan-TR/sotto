@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -361,3 +365,16 @@ jobs:
         run: scripts/check-cargo-audit
       - name: cargo-deny (advisories, bans, licences, sources)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  assurance-complete:
+    name: ci assurance complete
+    if: always()
+    needs: [test, core-platform, readme-i18n, action-consumer, wasm, web, server, funnel-e2e, supply-chain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Validate required CI jobs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/check-assurance --group ci

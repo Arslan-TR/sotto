@@ -16,6 +16,7 @@ on:
         default: pr
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -51,6 +52,24 @@ jobs:
           path: target/core-fuzz/
           retention-days: 14
           if-no-files-found: warn
+
+  assurance-complete:
+    name: codec assurance complete
+    if: always()
+    needs: [pr, nightly]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Validate required codec jobs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ] || [ "${{ inputs.profile }}" = nightly ]; then
+            scripts/check-assurance --group codec-nightly
+          else
+            scripts/check-assurance --group codec
+          fi
 
   nightly:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'nightly')
