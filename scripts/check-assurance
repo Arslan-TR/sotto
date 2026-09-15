@@ -38,7 +38,7 @@ def _job_names(jobs):
     return names
 
 
-def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, expected_attempt=None):
+def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, tested_sha=None, expected_attempt=None):
     groups = manifest.get("groups", {})
     if group_name not in groups:
         raise AssuranceError(f"unknown assurance group: {group_name}")
@@ -80,6 +80,7 @@ def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, expected
         "run_id": run.get("id"),
         "run_attempt": run.get("run_attempt"),
         "head_sha": run.get("head_sha"),
+        "tested_sha": tested_sha,
         "jobs": sorted(expected),
     }
 
@@ -123,7 +124,8 @@ def parse_args(argv=None):
     parser.add_argument("--run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID", "0")))
     parser.add_argument("--run-attempt", type=int, default=int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY"))
-    parser.add_argument("--expected-sha", default=os.environ.get("GITHUB_SHA"))
+    parser.add_argument("--expected-sha", help="expected workflow head SHA, when supplied")
+    parser.add_argument("--tested-sha", default=os.environ.get("GITHUB_SHA"))
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     parser.add_argument("--jobs-file", type=Path, help="validate a captured run instead of calling GitHub")
     return parser.parse_args(argv)
@@ -146,6 +148,7 @@ def main(argv=None):
             run,
             jobs,
             expected_sha=args.expected_sha,
+            tested_sha=args.tested_sha,
             expected_attempt=args.run_attempt,
         )
     except (AssuranceError, OSError, ValueError, KeyError, TypeError) as error:

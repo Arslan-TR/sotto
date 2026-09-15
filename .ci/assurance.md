@@ -7,7 +7,9 @@ jobs from its own GitHub Actions run and checks the versioned list in
 job for that event and run attempt concluded `success`.
 
 The completion job does not search for an older check with the same name. It binds the
-verdict to the current run ID, attempt, workflow path and source SHA. Missing, skipped,
+verdict to the current run ID, attempt and workflow path, and records both the API's PR head
+SHA and the checked-out SHA. A pull request can legitimately have different values because
+Actions tests its synthetic merge ref. Missing, skipped,
 neutral, cancelled, timed-out, duplicated or unexpected jobs fail the completion check.
 The codec workflow selects the PR or nightly group from the event; the skipped profile is
 not part of that invocation's expected set.
