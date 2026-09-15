@@ -35,23 +35,35 @@ fuzz_target!(|data: &[u8]| {
         0 => {
             let payload = bounded(rest, MAX_PAYLOAD);
             let encoded = format::encode_key("SK", 1, payload);
-            assert_eq!(format::decode_key("SK", 1, &encoded).expect("key output is valid"), payload);
+            assert_eq!(
+                format::decode_key("SK", 1, &encoded).expect("key output is valid"),
+                payload
+            );
         }
         1 => {
             let input = format!("X{}", body_text(bounded(rest, MAX_TEXT)));
-            assert!(format::decode_key("SK", 1, &input).is_err(), "missing key header must reject");
+            assert!(
+                format::decode_key("SK", 1, &input).is_err(),
+                "missing key header must reject"
+            );
         }
         2 => {
             let prefixes = ["SK", "RK", "MT"];
             let prefix = prefixes[(rest.first().copied().unwrap_or(0) % 3) as usize];
             let input = format!("{prefix}1-0");
-            assert!(matches!(format::decode_key(prefix, 1, &input), Err(Error::Malformed("key too short"))));
+            assert!(matches!(
+                format::decode_key(prefix, 1, &input),
+                Err(Error::Malformed("key too short"))
+            ));
         }
         3 => {
             let prefixes = ["SK", "RK", "MT"];
             let prefix = prefixes[(rest.first().copied().unwrap_or(0) % 3) as usize];
             let input = format!("{prefix}1-#");
-            assert!(matches!(format::decode_key(prefix, 1, &input), Err(Error::Malformed("invalid base32 symbol"))));
+            assert!(matches!(
+                format::decode_key(prefix, 1, &input),
+                Err(Error::Malformed("invalid base32 symbol"))
+            ));
         }
         4 => {
             let payload = bounded(rest, MAX_PAYLOAD);
@@ -60,19 +72,34 @@ fuzz_target!(|data: &[u8]| {
             let encoded = format::encode_key(prefix, 1, payload);
             let (head, body) = encoded.split_once('-').expect("encoded key body");
             let mut chars: Vec<char> = body.chars().collect();
-            let index = chars.iter().position(|character| *character != '-').expect("nonempty body");
+            let index = chars
+                .iter()
+                .position(|character| *character != '-')
+                .expect("nonempty body");
             chars[index] = if chars[index] == '0' { '1' } else { '0' };
             let mutated = format!("{head}-{}", chars.into_iter().collect::<String>());
-            assert!(format::decode_key(prefix, 1, &mutated).is_err(), "mutated checksum must reject");
+            assert!(
+                format::decode_key(prefix, 1, &mutated).is_err(),
+                "mutated checksum must reject"
+            );
         }
         _ => {
             let payload = bounded(rest, MAX_PAYLOAD);
             let prefixes = ["SK", "RK", "MT"];
             let prefix = prefixes[(payload.first().copied().unwrap_or(0) % 3) as usize];
             let encoded = format::encode_key(prefix, 1, payload);
-            let wrong = format!("{prefix}2-{}", encoded.split_once('-').map_or("", |(_, body)| body));
-            assert!(matches!(format::decode_key(prefix, 1, &wrong), Err(Error::KeyPrefix)));
-            assert!(matches!(format::decode_key("SK", 1, &encoded), Err(Error::KeyPrefix)) || prefix == "SK");
+            let wrong = format!(
+                "{prefix}2-{}",
+                encoded.split_once('-').map_or("", |(_, body)| body)
+            );
+            assert!(matches!(
+                format::decode_key(prefix, 1, &wrong),
+                Err(Error::KeyPrefix)
+            ));
+            assert!(
+                matches!(format::decode_key("SK", 1, &encoded), Err(Error::KeyPrefix))
+                    || prefix == "SK"
+            );
         }
     }
 });

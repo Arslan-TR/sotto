@@ -35,7 +35,10 @@ fuzz_target!(|data: &[u8]| {
         0 => {
             let input = bounded(rest, MAX_PAYLOAD);
             let encoded = format::encode(input);
-            assert_eq!(format::decode(&encoded).expect("encoder output is valid"), input);
+            assert_eq!(
+                format::decode(&encoded).expect("encoder output is valid"),
+                input
+            );
         }
         1 => {
             let input = bounded(rest, MAX_TEXT);
@@ -46,7 +49,10 @@ fuzz_target!(|data: &[u8]| {
         _ => {
             let mut text = structured_ascii(bounded(rest, MAX_TEXT));
             text.push('#');
-            assert!(format::decode(&text).is_err(), "a deliberately invalid symbol must reject");
+            assert!(
+                format::decode(&text).is_err(),
+                "a deliberately invalid symbol must reject"
+            );
         }
     }
 });
