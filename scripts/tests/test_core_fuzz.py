@@ -36,6 +36,17 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.parse_args(["--profile", "weekly", "--target", "base32_codec"])
 
+    def test_seed_can_be_selected_explicitly(self):
+        args = runner.parse_args(["--profile", "pr", "--target", "base32_codec", "--seed", "0xbeef"])
+        self.assertEqual(args.seed, 0xBEEF)
+
+    def test_nightly_seed_is_fresh_when_unconfigured(self):
+        with patch.object(runner.secrets, "randbelow", return_value=0xBEEE):
+            self.assertEqual(runner.resolve_seed("nightly"), 0xBEEF)
+
+    def test_pr_seed_is_stable_when_unconfigured(self):
+        self.assertEqual(runner.resolve_seed("pr"), runner.FUZZ_SEED)
+
 
 class EvidenceTests(unittest.TestCase):
     def test_initial_status_is_failed(self):

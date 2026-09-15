@@ -31,8 +31,11 @@ and exits successfully. Logs are retained in the record. A timeout, signal, sani
 failure, missing target, zero executions or missing completion marker remains
 failed/inconclusive. Each input also has a ten-second libFuzzer timeout so a single
 hang cannot consume the campaign budget. Seed replays have a two-minute process watchdog to
-allow sanitizer startup while keeping a bounded failure path. Campaigns use and record the fixed nonzero
-libFuzzer seed `0x5A17` for reproducible mutation sequences.
+allow sanitizer startup while keeping a bounded failure path. Pull request campaigns use and
+record the fixed nonzero libFuzzer seed `0x5A17` for reproducible mutation sequences. Nightly
+jobs set `CORE_FUZZ_SEED` to their unique GitHub run ID, so each run explores a fresh mutation
+sequence and records the seed in its evidence. Manual or local nightly runs generate a fresh
+nonzero seed unless `--seed` or `CORE_FUZZ_SEED` supplies one.
 
 Trusted starter inputs live in `fuzz/seeds/<target>/`. The runner copies them into a fresh
 working corpus under `target/core-fuzz/`; the ignored `fuzz/corpus/` directory is reserved for
