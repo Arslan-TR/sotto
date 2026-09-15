@@ -99,7 +99,7 @@ def sha256_tree(path):
 def new_evidence(profile, target, output, sanitizer):
     lockfile = FUZZ_ROOT / "Cargo.lock"
     config = FUZZ_ROOT / "config.json"
-    corpus = FUZZ_ROOT / "corpus" / target
+    corpus = FUZZ_ROOT / "seeds" / target
     return {
         "status": "failed",
         "profile": profile,
@@ -134,7 +134,7 @@ def write_evidence(path, evidence):
 
 
 def run_campaign(profile, target, output, evidence, sanitizer, replay=None):
-    corpus = FUZZ_ROOT / "corpus" / target
+    corpus = FUZZ_ROOT / "seeds" / target
     if not corpus.is_dir():
         raise CampaignError(f"missing seed corpus for {target}")
     seed_corpus = output / "corpus"

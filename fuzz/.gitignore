@@ -2,3 +2,5 @@ target
 artifacts
 coverage
 *.profraw
+
+corpus

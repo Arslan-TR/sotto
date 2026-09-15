@@ -34,6 +34,10 @@ hang cannot consume the campaign budget. Seed replays have a two-minute process 
 allow sanitizer startup while keeping a bounded failure path. Campaigns use and record the fixed nonzero
 libFuzzer seed `0x5A17` for reproducible mutation sequences.
 
+Trusted starter inputs live in `fuzz/seeds/<target>/`. The runner copies them into a fresh
+working corpus under `target/core-fuzz/`; the ignored `fuzz/corpus/` directory is reserved for
+local cargo-fuzz state and must not be used as evidence.
+
 For a one-input replay:
 
 ```sh
