@@ -57,8 +57,9 @@ separators and aliases.
 
 `key_strings` uses a mode byte followed by bounded data. It exercises `SK`, `RK` and
 `MT` versioned keys, arbitrary text, correctly shaped but malformed bodies, wrong
-versions and successful round trips. The target deliberately constructs valid headers
-so malformed bodies reach symbol, length and checksum validation.
+versions and successful round trips. Separate modes assert missing headers, invalid
+symbols, short bodies and checksum mutations after a valid header. The tracked seeds
+include NUL, whitespace, multibyte and combining text plus each rejection stage.
 
 The properties and fixed WASM/native fixtures remain the deterministic oracle. A fuzz
 finding is not fixed by changing production validation to accept it. Minimise the saved

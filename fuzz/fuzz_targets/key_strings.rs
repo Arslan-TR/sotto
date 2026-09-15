@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sotto_core::format;
+use sotto_core::{format, Error};
 
 const MAX_PAYLOAD: usize = 4096;
 const MAX_TEXT: usize = 16384;
@@ -31,7 +31,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = format::decode_key("SK", 1, "");
         return;
     };
-    match mode % 4 {
+    match mode % 6 {
         0 => {
             let payload = bounded(rest, MAX_PAYLOAD);
             let encoded = format::encode_key("SK", 1, payload);
@@ -42,9 +42,28 @@ fuzz_target!(|data: &[u8]| {
             assert!(format::decode_key("SK", 1, &input).is_err(), "missing key header must reject");
         }
         2 => {
-            let body = format!("{}#", body_text(bounded(rest, MAX_TEXT)));
-            let input = format!("SK1-{body}");
-            assert!(format::decode_key("SK", 1, &input).is_err(), "invalid key symbol must reject");
+            let prefixes = ["SK", "RK", "MT"];
+            let prefix = prefixes[(rest.first().copied().unwrap_or(0) % 3) as usize];
+            let input = format!("{prefix}1-0");
+            assert!(matches!(format::decode_key(prefix, 1, &input), Err(Error::Malformed("key too short"))));
+        }
+        3 => {
+            let prefixes = ["SK", "RK", "MT"];
+            let prefix = prefixes[(rest.first().copied().unwrap_or(0) % 3) as usize];
+            let input = format!("{prefix}1-#");
+            assert!(matches!(format::decode_key(prefix, 1, &input), Err(Error::Malformed("invalid base32 symbol"))));
+        }
+        4 => {
+            let payload = bounded(rest, MAX_PAYLOAD);
+            let prefixes = ["SK", "RK", "MT"];
+            let prefix = prefixes[(payload.first().copied().unwrap_or(0) % 3) as usize];
+            let encoded = format::encode_key(prefix, 1, payload);
+            let (head, body) = encoded.split_once('-').expect("encoded key body");
+            let mut chars: Vec<char> = body.chars().collect();
+            let index = chars.iter().position(|character| *character != '-').expect("nonempty body");
+            chars[index] = if chars[index] == '0' { '1' } else { '0' };
+            let mutated = format!("{head}-{}", chars.into_iter().collect::<String>());
+            assert!(format::decode_key(prefix, 1, &mutated).is_err(), "mutated checksum must reject");
         }
         _ => {
             let payload = bounded(rest, MAX_PAYLOAD);
@@ -52,8 +71,8 @@ fuzz_target!(|data: &[u8]| {
             let prefix = prefixes[(payload.first().copied().unwrap_or(0) % 3) as usize];
             let encoded = format::encode_key(prefix, 1, payload);
             let wrong = format!("{prefix}2-{}", encoded.split_once('-').map_or("", |(_, body)| body));
-            assert!(format::decode_key(prefix, 1, &wrong).is_err(), "wrong version must reject");
-            assert!(format::decode_key("SK", 1, &encoded).is_err() || prefix == "SK");
+            assert!(matches!(format::decode_key(prefix, 1, &wrong), Err(Error::KeyPrefix)));
+            assert!(matches!(format::decode_key("SK", 1, &encoded), Err(Error::KeyPrefix)) || prefix == "SK");
         }
     }
 });
