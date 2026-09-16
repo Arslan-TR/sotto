@@ -13,6 +13,7 @@ use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::{Zeroize, Zeroizing};
 
+use sotto_cli::clipboard;
 use sotto_cli::commands::App;
 use sotto_cli::config::{self, Config};
 use sotto_cli::dotenv;
@@ -121,6 +122,12 @@ enum Command {
         /// Protect the link with a passphrase (prompted; a second factor beyond the link).
         #[arg(long)]
         passphrase: bool,
+        /// Copy the generated share URL to the clipboard.
+        #[arg(short = 'c', long)]
+        copy: bool,
+        /// Disable the default clipboard copy in an interactive terminal.
+        #[arg(long)]
+        no_copy: bool,
     },
     /// Upload local changes for the active environment to the server.
     Push,
@@ -162,6 +169,9 @@ enum Command {
         /// Allow printing the secret to a terminal.
         #[arg(long)]
         reveal: bool,
+        /// Copy the secret to the clipboard instead of printing it.
+        #[arg(short = 'c', long, conflicts_with = "reveal")]
+        copy: bool,
     },
     /// List secret names in the active environment.
     Ls {
@@ -315,7 +325,30 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // The clipboard owner is an implementation detail, intercepted before Clap so it cannot
+    // appear in help or generated completions and cannot initialise the vault.
+    if std::env::args().nth(1).as_deref() == Some("__clipboard-helper") {
+        return clipboard::run_helper();
+    }
     let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Share {
+            copy: true,
+            no_copy: true,
+            ..
+        } => {
+            return Err(Error::Input("--copy conflicts with --no-copy".into()));
+        }
+        Command::Get {
+            copy: true,
+            reveal: true,
+            ..
+        } => {
+            return Err(Error::Input("--copy conflicts with --reveal".into()));
+        }
+        _ => {}
+    }
 
     // Completions need neither the store nor the keychain - handle before touching either.
     if let Command::Completions { shell } = &cli.command {
@@ -433,17 +466,34 @@ fn run() -> Result<()> {
             views,
             expire,
             passphrase,
+            copy,
+            no_copy,
         } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            share(&app, &keychain, &config, &name, views, expire, passphrase)
+            share(
+                &app,
+                &keychain,
+                &config,
+                &name,
+                ShareCommandOptions {
+                    views,
+                    expire,
+                    passphrase,
+                    copy,
+                    no_copy,
+                },
+            )
         }
         Command::Push => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let master = session::current_master_key(&keychain)?.ok_or(Error::Locked)?;
             let client = sync_client(&keychain)?;
-            let revision = remote::sync::push(&client, &store, master.as_bytes(), &config)?;
+            let revision = {
+                let _spinner = sotto_cli::feedback::spinner("Pushing...");
+                remote::sync::push(&client, &store, master.as_bytes(), &config)?
+            };
             eprintln!(
                 "pushed {}/{} - revision {revision}",
                 config.project, config.environment
@@ -453,7 +503,10 @@ fn run() -> Result<()> {
         Command::Pull => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             let client = sync_client(&keychain)?;
-            let revision = remote::sync::pull(&client, &store, &config)?;
+            let revision = {
+                let _spinner = sotto_cli::feedback::spinner("Pulling...");
+                remote::sync::pull(&client, &store, &config)?
+            };
             eprintln!(
                 "pulled {}/{} - revision {revision}",
                 config.project, config.environment
@@ -483,11 +536,20 @@ fn run() -> Result<()> {
             eprintln!("set {name} ({}/{})", config.project, config.environment);
             Ok(())
         }
-        Command::Get { name, reveal } => {
+        Command::Get { name, reveal, copy } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let mut value = app.get(&config, &name)?;
-            let result = write_value(&value, reveal);
+            let result = if copy {
+                match std::str::from_utf8(&value) {
+                    Ok(text) => clipboard::copy(text).map(|()| {
+                        eprintln!("Copied to clipboard; will attempt to clear after 45 seconds.");
+                    }),
+                    Err(_) => Err(Error::Input("clipboard requires valid UTF-8 text".into())),
+                }
+            } else {
+                write_value(&value, reveal)
+            };
             value.zeroize();
             result
         }
@@ -586,7 +648,10 @@ fn init(
 
     if store.get_identity()?.is_none() {
         let mut password = read_new_password()?;
-        let kit = session::init(store, keychain, &password, SESSION_TTL);
+        let kit = {
+            let _spinner = sotto_cli::feedback::spinner("Deriving key...");
+            session::init(store, keychain, &password, SESSION_TTL)
+        };
         password.zeroize();
         let kit = kit?;
         eprintln!();
@@ -870,30 +935,39 @@ fn setup(store: &Store, keychain: &dyn Keychain, cwd: &Path) -> Result<()> {
     }
     let (config, _dir) = Config::discover(cwd)?;
     let client = sync_client(keychain)?;
-    let bundle = remote::SyncApi::get_account(&client)?.ok_or_else(|| {
-        Error::Input(
-            "no account on the server; run `sotto init` then `sotto push` on your first device"
-                .into(),
-        )
-    })?;
+    let bundle = {
+        let _spinner = sotto_cli::feedback::spinner("Downloading account...");
+        remote::SyncApi::get_account(&client)?.ok_or_else(|| {
+            Error::Input(
+                "no account on the server; run `sotto init` then `sotto push` on your first device"
+                    .into(),
+            )
+        })?
+    };
 
     let mut secret_key = read_secret_key()?;
     let mut password = read_password("Master password: ")?;
-    let result = remote::sync::restore_account(
-        store,
-        keychain,
-        &bundle,
-        &secret_key,
-        &password,
-        SESSION_TTL,
-    );
+    let result = {
+        let _spinner = sotto_cli::feedback::spinner("Deriving key...");
+        remote::sync::restore_account(
+            store,
+            keychain,
+            &bundle,
+            &secret_key,
+            &password,
+            SESSION_TTL,
+        )
+    };
     secret_key.zeroize();
     password.zeroize();
     result?;
 
     let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
-    remote::sync::pull_environments(&client, store, master.as_bytes(), &config)?;
-    let revision = remote::sync::pull(&client, store, &config)?;
+    let revision = {
+        let _spinner = sotto_cli::feedback::spinner("Pulling environments...");
+        remote::sync::pull_environments(&client, store, master.as_bytes(), &config)?;
+        remote::sync::pull(&client, store, &config)?
+    };
     eprintln!(
         "set up {} ({}) from the server - revision {revision}",
         config.project, config.environment
@@ -924,7 +998,10 @@ fn reset(store: &Store, keychain: &dyn Keychain, yes: bool) -> Result<()> {
     }
 
     let mut password = read_new_password()?;
-    let kit = session::reinit(store, keychain, &password, SESSION_TTL);
+    let kit = {
+        let _spinner = sotto_cli::feedback::spinner("Deriving key...");
+        session::reinit(store, keychain, &password, SESSION_TTL)
+    };
     password.zeroize();
     let kit = kit?;
 
@@ -1013,42 +1090,75 @@ fn login_config(
 }
 
 /// Seal a secret, upload it as a share link, and print the link (the fragment key never leaves).
+struct ShareCommandOptions {
+    views: i32,
+    expire: Option<i64>,
+    passphrase: bool,
+    copy: bool,
+    no_copy: bool,
+}
+
 fn share(
     app: &App,
     keychain: &dyn Keychain,
     config: &Config,
     name: &str,
-    views: i32,
-    expire: Option<i64>,
-    passphrase: bool,
+    command: ShareCommandOptions,
 ) -> Result<()> {
     let mut value = app.get(config, name)?;
     let client = sync_client(keychain)?;
     let web_base = remote::config::web_base(&sotto_cli::paths::config_path()?)?;
 
-    let passphrase = if passphrase {
+    let passphrase = if command.passphrase {
         Some(read_share_passphrase()?)
     } else {
         None
     };
     let opts = remote::share::ShareOptions {
-        max_views: views,
-        ttl_seconds: expire,
+        max_views: command.views,
+        ttl_seconds: command.expire,
         passphrase,
     };
-    let result = remote::share::create(&client, &web_base, &value, &opts);
+    let result = {
+        let _spinner = sotto_cli::feedback::spinner("Creating share...");
+        remote::share::create(&client, &web_base, &value, &opts)
+    };
     value.zeroize();
     if let Some(mut passphrase) = opts.passphrase {
         passphrase.zeroize();
     }
-    let link = result?;
+    let mut link = result?;
 
     eprintln!(
-        "share link ({}/{}) - burns after {views} view(s):",
-        config.project, config.environment
+        "share link ({}/{}) - burns after {} view(s):",
+        config.project, config.environment, command.views
     );
     println!("{link}");
-    Ok(())
+    let automatic_copy = !command.no_copy
+        && !command.copy
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && std::env::var_os("CI").is_none();
+    let copy_result = if command.copy || automatic_copy {
+        match clipboard::copy(&link) {
+            Ok(()) => {
+                eprintln!("Copied to clipboard; will attempt to clear after 45 seconds.");
+                Ok(())
+            }
+            Err(error) if automatic_copy => {
+                eprintln!("warning: could not copy share link: {error}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("share created, but copying to clipboard failed: {error}");
+                Err(error)
+            }
+        }
+    } else {
+        Ok(())
+    };
+    link.zeroize();
+    copy_result
 }
 
 /// Read a share passphrase from a hidden prompt (never `SOTTO_PASSWORD`, which is the master).
@@ -1333,6 +1443,7 @@ fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
         return Err(Error::NoIdentity);
     }
     let mut password = read_password("Master password: ")?;
+    let _spinner = sotto_cli::feedback::spinner("Deriving key...");
     let result = session::unlock(store, keychain, &password, SESSION_TTL);
     password.zeroize();
     result
@@ -1798,6 +1909,38 @@ mod tests {
         let fresh = login_config(None, "https://new.example".into(), None);
         assert_eq!(fresh.theme, None);
         assert_eq!(fresh.web_url, None);
+    }
+
+    #[test]
+    fn copy_flags_parse_for_get_and_share() {
+        let cli = Cli::try_parse_from(["sotto", "get", "KEY", "-c"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Get {
+                copy: true,
+                reveal: false,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--copy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Share {
+                copy: true,
+                no_copy: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--no-copy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Share {
+                copy: false,
+                no_copy: true,
+                ..
+            }
+        ));
     }
 
     #[test]

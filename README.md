@@ -104,7 +104,8 @@ sotto import .env            # optional: pull in an existing file, still encrypt
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
-sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
+sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
+sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
 ```
 
 Use `--env` to select an environment for one command without changing the project's default:
@@ -117,6 +118,9 @@ sotto ls --env staging
 `--env` lasts for that command only; `sotto env use` changes the default.
 
 Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
+Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
+Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
+clipboard managers, suspension, or a terminated helper may retain a history copy.
 
 `sotto login` uses the hosted instance at [getsotto.co.uk](https://getsotto.co.uk) unless you point
 it elsewhere with `--server <url>` (see [Deploying](deploy/README.md) to run your own). Either way
