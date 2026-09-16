@@ -860,5 +860,7 @@ async fn server_assurance_executes_against_the_required_database() {
     .await
     .expect("server assurance scenario suite timed out");
 
-    println!("SERVER_ASSURANCE_DONE 4");
+    // Leading newline: the harness prints `test ... ... ` without one, so without this
+    // the marker shares that line and the CI completion grep cannot match it.
+    println!("\nSERVER_ASSURANCE_DONE 4");
 }
