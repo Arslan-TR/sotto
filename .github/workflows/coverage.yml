@@ -57,7 +57,10 @@ jobs:
       - name: Native workspace coverage with Postgres
         run: scripts/check-rust-coverage
       - name: Server authorisation and transaction assurance
-        run: cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture
+        run: |
+          set -euo pipefail
+          cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
+          grep -Eq '^SERVER_ASSURANCE_DONE [1-9][0-9]*$' server-assurance.log
       - name: Publish coverage summary
         run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Retain reports and run status
