@@ -586,17 +586,20 @@ async fn case_removal_and_atomic_batch(pool: &PgPool) {
         .0,
         StatusCode::OK
     );
-    let (_, token_body_json) = post(
+    let (token_status, token_body_json) = post(
         pool,
         &admin,
         &format!("/environments/{env}/tokens"),
         token_body(),
     )
     .await;
-    let token_id = serde_json::from_str::<Value>(&token_body_json).expect("token json")["token_id"]
+    assert_eq!(token_status, StatusCode::CREATED);
+    let token_json = serde_json::from_str::<Value>(&token_body_json).expect("token json");
+    let token_id = token_json["token_id"]
         .as_str()
         .expect("token id")
         .to_owned();
+    let raw_token = token_json["token"].as_str().expect("raw token").to_owned();
     assert_eq!(
         delete(
             pool,
@@ -623,6 +626,27 @@ async fn case_removal_and_atomic_batch(pool: &PgPool) {
             .expect("read revoked token");
     assert_eq!(grant_count, 0);
     assert!(revoked.is_some());
+    assert_eq!(
+        get(pool, &raw_token, "/machine/grant").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            &format!("/orgs/{org}/members"),
+            member_body("assure-removal-admin", "member")
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        get(pool, &admin, &format!("/environments/{env}/grant"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
 
     let owner = fresh_session(pool, "assure-atomic-owner").await;
     assert_eq!(
@@ -732,6 +756,97 @@ async fn case_sequential_rechecks(pool: &PgPool) {
     );
 }
 
+async fn case_lifecycle_and_revision_conflicts(pool: &PgPool) {
+    let (owner, _member, org, _project, _admin, env) =
+        seed_org_env(pool, "lifecycle-sequential", false).await;
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
+        .bind(&org)
+        .execute(pool)
+        .await
+        .expect("mark organisation deleting");
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            &format!("/environments/{env}/secrets"),
+            set_body(1, "assure-lifecycle-write")
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), enc_name = NULL, created_by = NULL, tier = 'free', trial_ends_at = NULL WHERE id = $1",
+    )
+    .bind(&org)
+    .execute(pool)
+    .await
+    .expect("mark organisation deleted");
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            &format!("/environments/{env}/secrets"),
+            set_body(1, "assure-deleted-write")
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+
+    let owner = fresh_session(pool, "assure-revision-owner").await;
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            "/projects",
+            project_body("assure-revision-project")
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            "/projects/assure-revision-project/environments",
+            env_body("assure-revision-env")
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            "/environments/assure-revision-env/secrets",
+            set_body(0, "assure-revision-first")
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(
+            pool,
+            &owner,
+            "/environments/assure-revision-env/secrets",
+            set_body(0, "assure-revision-stale")
+        )
+        .await
+        .0,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1")
+        .bind("assure-revision-env")
+        .fetch_one(pool)
+        .await
+        .expect("read revision");
+    assert_eq!(revision, 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_assurance_executes_against_the_required_database() {
     let Some(pool) = pool_or_skip().await else {
@@ -742,9 +857,10 @@ async fn server_assurance_executes_against_the_required_database() {
         case_access_matrix(&pool).await;
         case_sequential_rechecks(&pool).await;
         case_removal_and_atomic_batch(&pool).await;
+        case_lifecycle_and_revision_conflicts(&pool).await;
     })
     .await
     .expect("server assurance scenario suite timed out");
 
-    println!("SERVER_ASSURANCE_DONE 3");
+    println!("SERVER_ASSURANCE_DONE 4");
 }
