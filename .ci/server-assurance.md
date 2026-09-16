@@ -14,9 +14,9 @@ reachable, and point at a loopback database. Migrations are applied before the t
 the opt-in, a local run prints an explicit skip so an ordinary workspace test cannot write to a
 database accidentally. Use a fresh disposable database for each run.
 
-The binary currently records three completed scenarios before printing
+The binary currently records four completed scenarios before printing
 `SERVER_ASSURANCE_DONE N`: the access matrix, sequential authorisation rechecks after membership
-changes, and atomic removal or malformed batch behaviour. Assertions use the real router and also
+changes, lifecycle and revision conflicts, and atomic removal or malformed batch behaviour. Assertions use the real router and also
 inspect persisted membership, grant, token, revision, and secret state. A missing completion line,
 zero scenarios, a failed assertion, or a database error fails the job.
 
