@@ -446,13 +446,13 @@ async fn case_stale_authorisation(pool: &PgPool) {
     let _ = owner;
 }
 
-#[allow(dead_code)]
 async fn case_lifecycle_recheck(pool: &PgPool) {
-    let (owner, _member, org, _project, _admin, env) = seed_org_env(pool, "lifecycle", false).await;
     for (state, expected) in [
         ("deleting", StatusCode::CONFLICT),
         ("deleted", StatusCode::NOT_FOUND),
     ] {
+        let (owner, _member, org, _project, _admin, env) =
+            seed_org_env(pool, &format!("lifecycle-{state}"), false).await;
         let mut blocker = pool.begin().await.expect("begin lifecycle blocker");
         sqlx::query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
             .bind(&org)
@@ -492,7 +492,6 @@ async fn case_lifecycle_recheck(pool: &PgPool) {
     }
 }
 
-#[allow(dead_code)]
 async fn case_concurrent_batches(pool: &PgPool) {
     let owner = fresh_session(pool, "assure-race-owner").await;
     assert_eq!(
@@ -555,7 +554,6 @@ async fn case_concurrent_batches(pool: &PgPool) {
         "competing batches must produce one success and one precondition failure: {first} {second}"
     );
     let revision: i64 = sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1")
-        .bind("assure-race-env")
         .fetch_one(pool)
         .await
         .expect("read winning revision");
@@ -852,6 +850,8 @@ async fn server_assurance_executes_against_the_required_database() {
     tokio::time::timeout(Duration::from_secs(30), async {
         case_access_matrix(&pool).await;
         case_stale_authorisation(&pool).await;
+        case_lifecycle_recheck(&pool).await;
+        case_concurrent_batches(&pool).await;
         case_sequential_rechecks(&pool).await;
         case_removal_and_atomic_batch(&pool).await;
         case_lifecycle_and_revision_conflicts(&pool).await;
@@ -861,5 +861,5 @@ async fn server_assurance_executes_against_the_required_database() {
 
     // Leading newline: the harness prints `test ... ... ` without one, so without this
     // the marker shares that line and the CI completion grep cannot match it.
-    println!("\nSERVER_ASSURANCE_DONE 5");
+    println!("\nSERVER_ASSURANCE_DONE 7");
 }
