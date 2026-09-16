@@ -263,24 +263,23 @@ async fn seed_org_env(
     (owner, member, org, project, admin, env)
 }
 
-#[allow(dead_code)]
-async fn wait_for_waiter(pool: &PgPool, query_fragment: &str, minimum: i64) {
+async fn wait_for_blocked(pool: &PgPool, label: &str, minimum: i64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
-             WHERE wait_event_type = 'Lock' AND query LIKE $1",
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+               AND cardinality(pg_blocking_pids(pid)) > 0",
         )
-        .bind(format!("%{query_fragment}%"))
         .fetch_one(pool)
         .await
-        .expect("inspect blocked server assurance query");
+        .expect("inspect blocked server assurance sessions");
         if count >= minimum {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {minimum} query(s) blocked on {query_fragment}; observed {count}"
+            "timed out waiting for {minimum} blocked session(s) at {label}; observed {count}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -370,7 +369,6 @@ async fn case_access_matrix(pool: &PgPool) {
     );
 }
 
-#[allow(dead_code)]
 async fn case_stale_authorisation(pool: &PgPool) {
     let (_owner, member, org, _project, _admin, env) =
         seed_org_env(pool, "stale-remove", false).await;
@@ -397,7 +395,7 @@ async fn case_stale_authorisation(pool: &PgPool) {
         !waiting.is_finished(),
         "stale removal request completed before the lock checkpoint"
     );
-    wait_for_waiter(pool, "organizations", 1).await;
+    wait_for_blocked(pool, "stale member removal", 1).await;
     sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1 AND user_id = $2")
         .bind(&org)
         .bind("assure-stale-remove-member")
@@ -431,7 +429,7 @@ async fn case_stale_authorisation(pool: &PgPool) {
         )
         .await
     });
-    wait_for_waiter(pool, "organizations", 1).await;
+    wait_for_blocked(pool, "stale admin demotion", 1).await;
     sqlx::query(
         "UPDATE organization_memberships SET role = 'member' WHERE org_id = $1 AND user_id = $2",
     )
@@ -473,7 +471,7 @@ async fn case_lifecycle_recheck(pool: &PgPool) {
             )
             .await
         });
-        wait_for_waiter(pool, "organizations", 1).await;
+        wait_for_blocked(pool, &format!("lifecycle {state}"), 1).await;
         if state == "deleted" {
             sqlx::query(
                 "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), enc_name = NULL, created_by = NULL, tier = 'free', trial_ends_at = NULL WHERE id = $1",
@@ -547,7 +545,7 @@ async fn case_concurrent_batches(pool: &PgPool) {
         )
         .await
     });
-    wait_for_waiter(pool, "SELECT revision FROM environments", 2).await;
+    wait_for_blocked(pool, "competing batch revisions", 2).await;
     blocker.commit().await.expect("release revision blocker");
     let first = first.await.expect("join first batch").0;
     let second = second.await.expect("join second batch").0;
@@ -853,6 +851,7 @@ async fn server_assurance_executes_against_the_required_database() {
 
     tokio::time::timeout(Duration::from_secs(30), async {
         case_access_matrix(&pool).await;
+        case_stale_authorisation(&pool).await;
         case_sequential_rechecks(&pool).await;
         case_removal_and_atomic_batch(&pool).await;
         case_lifecycle_and_revision_conflicts(&pool).await;
@@ -862,5 +861,5 @@ async fn server_assurance_executes_against_the_required_database() {
 
     // Leading newline: the harness prints `test ... ... ` without one, so without this
     // the marker shares that line and the CI completion grep cannot match it.
-    println!("\nSERVER_ASSURANCE_DONE 4");
+    println!("\nSERVER_ASSURANCE_DONE 5");
 }
