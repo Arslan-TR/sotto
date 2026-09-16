@@ -554,6 +554,7 @@ async fn case_concurrent_batches(pool: &PgPool) {
         "competing batches must produce one success and one precondition failure: {first} {second}"
     );
     let revision: i64 = sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1")
+        .bind("assure-race-env")
         .fetch_one(pool)
         .await
         .expect("read winning revision");
