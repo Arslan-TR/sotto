@@ -56,6 +56,8 @@ jobs:
         run: python3 -B -m unittest discover -s scripts/tests -p test_rust_coverage.py -v
       - name: Native workspace coverage with Postgres
         run: scripts/check-rust-coverage
+      - name: Server authorisation and transaction assurance
+        run: cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture
       - name: Publish coverage summary
         run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Retain reports and run status
