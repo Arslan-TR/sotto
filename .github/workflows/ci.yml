@@ -332,7 +332,14 @@ jobs:
       - name: Reject skipped funnel tests
         working-directory: web
         run: |
-          node -e 'const report = require("./test-results/playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`funnel suite skipped ${skipped} test(s)`); process.exit(1); }'
+          node <<'NODE'
+          const report = require("./test-results/playwright.json");
+          const skipped = report.stats?.skipped ?? 0;
+          if (skipped !== 0) {
+            console.error(`funnel suite skipped ${skipped} test(s)`);
+            process.exit(1);
+          }
+          NODE
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
