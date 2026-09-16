@@ -16,9 +16,10 @@ database accidentally. Use a fresh disposable database for each run.
 
 The binary currently records four completed scenarios before printing
 `SERVER_ASSURANCE_DONE N`: the access matrix, sequential authorisation rechecks after membership
-changes, lifecycle and revision conflicts, and atomic removal or malformed batch behaviour. Assertions use the real router and also
-inspect persisted membership, grant, token, revision, and secret state. A missing completion line,
-zero scenarios, a failed assertion, or a database error fails the job.
+changes, lifecycle and revision conflicts, and atomic removal or malformed batch behaviour.
+Assertions use the real router and also inspect persisted membership, grant, token, revision, and
+secret state. A missing completion line, zero scenarios, a failed assertion, or a database error
+fails the job.
 
 The required CI and coverage jobs invoke this test target explicitly. This suite does not claim
 cryptographic correctness, client or WebAssembly behaviour, hostile-workflow isolation, release
