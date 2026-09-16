@@ -199,7 +199,9 @@ pub(crate) async fn access_for_update(
     // `SELECT ... FOR UPDATE OF o` can take its membership snapshot before waiting for this row;
     // after the wait it may therefore return a membership that was removed by the transaction
     // that released the lock.  The second statement gets a fresh Read Committed snapshot while
-    // the organisation lock is held, so every writer observes the same current authority.
+    // the organisation lock is held, so every writer observes the same current authority.  The
+    // share lock also prevents a membership row from changing between this validation and the
+    // mutation for any writer that does not take the organisation lock first.
     let lifecycle: Option<String> =
         sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
             .bind(org_id)
@@ -209,7 +211,8 @@ pub(crate) async fn access_for_update(
         return Err(Error::NotFound("organisation not found".into()));
     };
     let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
+        "SELECT role FROM organization_memberships \
+         WHERE org_id = $1 AND user_id = $2 FOR SHARE",
     )
     .bind(org_id)
     .bind(user_id)
