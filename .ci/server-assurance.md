@@ -22,6 +22,11 @@ Assertions use the real router and also inspect persisted membership, grant, tok
 secret state. A missing completion line, zero scenarios, a failed assertion, or a database error
 fails the job.
 
+These seven scenarios are the current executable slice, rather than the complete S1-S10 programme.
+Paired grant or rotation races, personal and rotation revision contenders, owner-to-owner races,
+late audit-failure rollback injection, token and rotation ordering, and both machine read endpoints
+remain outstanding and must not be inferred from the cases above.
+
 The required CI and coverage jobs invoke this test target explicitly. This suite does not claim
-cryptographic correctness, client or WebAssembly behaviour, hostile-workflow isolation, release
-gating, or hostile-workflow isolation.
+cryptographic correctness, client or WebAssembly behaviour, hostile-workflow isolation, or release
+gating.
