@@ -24,13 +24,13 @@ use sotto_server::state::AppState;
 
 async fn pool_or_skip() -> Option<PgPool> {
     let required = std::env::var("SOTTO_RUN_DB_TESTS").as_deref() == Ok("1");
+    if !required {
+        eprintln!("skipping server assurance: set SOTTO_RUN_DB_TESTS=1 and DATABASE_URL");
+        return None;
+    }
     let url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
-        Err(error) if required => panic!("DATABASE_URL is required for server assurance: {error}"),
-        Err(_) => {
-            eprintln!("skipping server assurance: set SOTTO_RUN_DB_TESTS=1 and DATABASE_URL");
-            return None;
-        }
+        Err(error) => panic!("DATABASE_URL is required for server assurance: {error}"),
     };
 
     let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
