@@ -13,7 +13,7 @@ use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::Value;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -39,9 +39,7 @@ async fn pool_or_skip() -> Option<PgPool> {
         "server assurance only accepts a dedicated loopback database, got {}",
         options.get_host()
     );
-    let pool = PgPoolOptions::new()
-        .max_connections(32)
-        .connect(&url)
+    let pool = db::connect(&url)
         .await
         .expect("connect to the server assurance database");
     db::migrate(&pool)
