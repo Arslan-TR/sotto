@@ -109,7 +109,8 @@ pub fn run_helper() -> Result<()> {
 }
 
 /// Clear only when the clipboard still contains the text written by this helper. Read failures
-/// and replacement content are preserved.
+/// and replacement content are preserved. The immediate second read narrows the race between
+/// observing our text and asking the backend to clear it.
 pub fn clear_if_unchanged_with<G>(
     expected: &str,
     read: std::result::Result<String, ()>,
@@ -148,6 +149,14 @@ where
     B: ClipboardOps,
 {
     wait();
+    let Ok(mut observed) = backend.read_text() else {
+        return;
+    };
+    let still_expected = observed == expected;
+    observed.zeroize();
+    if !still_expected {
+        return;
+    }
     let current = backend.read_text();
     clear_if_unchanged_with(expected, current, || backend.clear_text());
 }
@@ -184,19 +193,33 @@ mod tests {
     fn expiry_waits_before_attempting_conditional_clear() {
         assert_eq!(CLEAR_AFTER.as_secs(), 45);
         let mut waited = false;
-        let mut backend = FakeClipboard { cleared: false };
+        let mut backend = FakeClipboard {
+            cleared: false,
+            reads: vec![Ok("secret".into()), Ok("secret".into())],
+        };
         clear_after("secret", || waited = true, &mut backend);
         assert!(waited);
         assert!(backend.cleared);
     }
 
+    #[test]
+    fn preserves_replacement_seen_during_recheck() {
+        let mut backend = FakeClipboard {
+            cleared: false,
+            reads: vec![Ok("new text".into()), Ok("secret".into())],
+        };
+        clear_after("secret", || {}, &mut backend);
+        assert!(!backend.cleared);
+    }
+
     struct FakeClipboard {
         cleared: bool,
+        reads: Vec<std::result::Result<String, ()>>,
     }
 
     impl super::ClipboardOps for FakeClipboard {
         fn read_text(&mut self) -> std::result::Result<String, ()> {
-            Ok("secret".into())
+            self.reads.pop().unwrap_or_else(|| Ok("secret".into()))
         }
 
         fn clear_text(&mut self) -> std::result::Result<(), ()> {
