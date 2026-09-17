@@ -1138,7 +1138,7 @@ fn share(
         && !command.copy
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
-        && std::env::var_os("CI").is_none();
+        && !sotto_cli::theme::ci_enabled(std::env::var("CI").ok().as_deref());
     let copy_result = if command.copy || automatic_copy {
         match clipboard::copy(&link) {
             Ok(()) => {
