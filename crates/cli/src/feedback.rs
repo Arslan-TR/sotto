@@ -67,7 +67,7 @@ pub fn enabled() -> bool {
     allowed(
         std::env::args().any(|arg| arg == "--plain"),
         std::env::var("NO_COLOR").is_ok_and(|value| !value.is_empty()),
-        std::env::var_os("CI").is_some(),
+        crate::theme::ci_enabled(std::env::var("CI").ok().as_deref()),
         std::env::var("TERM").is_ok_and(|term| term == "dumb"),
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
