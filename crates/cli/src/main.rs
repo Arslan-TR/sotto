@@ -258,7 +258,11 @@ enum ThemeCommand {
 #[derive(Subcommand)]
 enum EnvCommand {
     /// List the project's environments (the active one is marked).
-    Ls,
+    Ls {
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Set the active environment for this project.
     Use { name: String },
     /// Compare two environments key by key (presence + "differs" markers).
@@ -602,15 +606,20 @@ fn run() -> Result<()> {
             import_dotenv(&app, &config, &file)
         }
         Command::Env { command } => match command {
-            EnvCommand::Ls => {
+            EnvCommand::Ls { json } => {
                 let config = effective_config(&cwd, cli.env.as_deref())?;
-                for env in app.env_list(&config)? {
-                    let marker = if env == config.environment {
-                        theme.marker()
-                    } else {
-                        " ".to_string()
-                    };
-                    println!("{marker} {env}");
+                let environments = app.env_list(&config)?;
+                if json {
+                    println!("{}", env_list_json(&environments, &config.environment)?);
+                } else {
+                    for env in environments {
+                        let marker = if env == config.environment {
+                            theme.marker()
+                        } else {
+                            " ".to_string()
+                        };
+                        println!("{marker} {env}");
+                    }
                 }
                 Ok(())
             }
@@ -1438,6 +1447,19 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| Error::Io(e.to_string()))
 }
 
+/// Stable machine-readable shape for `sotto env ls --json`.
+///
+/// Returns a JSON array of `{"name": <str>, "active": <bool>}` objects — one per environment,
+/// in the order returned by the store. Stdout contains JSON only; diagnostics stay on stderr.
+/// An empty project yields `[]`.
+fn env_list_json(environments: &[String], active: &str) -> Result<String> {
+    let value: Vec<_> = environments
+        .iter()
+        .map(|name| serde_json::json!({ "name": name, "active": name == active }))
+        .collect();
+    to_json(&value)
+}
+
 fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
     if session::current_master_key(keychain)?.is_some() {
         return Ok(());
@@ -1706,8 +1728,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        display_secret, history_line, import_dotenv, login_config, set_confirmation, Cli, Command,
-        ThemeCommand,
+        display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
+        Cli, Command, EnvCommand, ThemeCommand,
     };
 
     #[test]
@@ -2012,5 +2034,41 @@ mod tests {
         let b = display_secret(&[0xfe, 0x00]);
         assert!(a.starts_with("base64:"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn env_ls_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "env", "ls", "--json"])
+            .expect("sotto env ls --json should parse");
+        let Command::Env {
+            command: EnvCommand::Ls { json },
+        } = cli.command
+        else {
+            panic!("expected EnvCommand::Ls");
+        };
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["sotto", "env", "ls"]).expect("sotto env ls should parse");
+        let Command::Env {
+            command: EnvCommand::Ls { json },
+        } = cli.command
+        else {
+            panic!("expected EnvCommand::Ls");
+        };
+        assert!(!json);
+    }
+
+    #[test]
+    fn env_ls_json_renders_empty_project() {
+        assert_eq!(env_list_json(&[], "dev").unwrap(), "[]");
+    }
+
+    #[test]
+    fn env_ls_json_marks_active_environment() {
+        let environments = vec!["dev".to_string(), "prod".to_string(), "staging".to_string()];
+        assert_eq!(
+            env_list_json(&environments, "staging").unwrap(),
+            r#"[{"active":false,"name":"dev"},{"active":false,"name":"prod"},{"active":true,"name":"staging"}]"#
+        );
     }
 }
