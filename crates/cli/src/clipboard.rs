@@ -84,10 +84,11 @@ pub fn run_helper() -> Result<()> {
     io::stdin()
         .read_to_end(&mut bytes)
         .map_err(|e| Error::Io(e.to_string()))?;
-    let mut text = zeroize::Zeroizing::new(
-        String::from_utf8(bytes.to_vec())
-            .map_err(|_| Error::Input("clipboard requires valid UTF-8 text".into()))?,
-    );
+    let mut text = zeroize::Zeroizing::new(String::from_utf8(bytes.to_vec()).map_err(|error| {
+        let mut invalid = error.into_bytes();
+        invalid.zeroize();
+        Error::Input("clipboard requires valid UTF-8 text".into())
+    })?);
     if text.as_bytes().contains(&0) {
         return Err(Error::Input(
             "cannot copy text containing a NUL byte".into(),
@@ -116,7 +117,12 @@ pub fn clear_if_unchanged_with<G>(
 ) where
     G: FnMut() -> std::result::Result<(), ()>,
 {
-    if read.ok().as_deref() == Some(expected) {
+    let Ok(mut current) = read else {
+        return;
+    };
+    let unchanged = current == expected;
+    current.zeroize();
+    if unchanged {
         let _ = clear();
     }
 }
