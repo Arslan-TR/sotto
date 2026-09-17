@@ -1105,7 +1105,7 @@ fn share(
     name: &str,
     command: ShareCommandOptions,
 ) -> Result<()> {
-    let mut value = app.get(config, name)?;
+    let mut value = Zeroizing::new(app.get(config, name)?);
     let client = sync_client(keychain)?;
     let web_base = remote::config::web_base(&sotto_cli::paths::config_path()?)?;
 
