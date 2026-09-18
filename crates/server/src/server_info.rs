@@ -7,9 +7,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
+use crate::entitlements::ENTITLEMENT_MODEL;
 use crate::state::AppState;
-
-const ENTITLEMENT_MODEL: &str = "organisation_tiers_v1";
 
 #[derive(Debug, Serialize)]
 struct ServerInfo {

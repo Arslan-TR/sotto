@@ -12,6 +12,17 @@ pub enum DeploymentMode {
 impl DeploymentMode {
     pub const ENV: &'static str = "SOTTO_DEPLOYMENT_MODE";
 
+    fn from_env_result(value: std::result::Result<String, std::env::VarError>) -> Result<Self> {
+        match value {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(Error::Config(format!(
+                "{} must be valid UTF-8 and either self_hosted or cloud",
+                Self::ENV
+            ))),
+        }
+    }
+
     fn parse(value: Option<&str>) -> Result<Self> {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
             None | Some("self_hosted") => Ok(Self::SelfHosted),
@@ -144,8 +155,7 @@ impl Config {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| Error::Config("DATABASE_URL is not set".into()))?;
         let bind_addr = std::env::var("SOTTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-        let deployment_mode =
-            DeploymentMode::parse(std::env::var(DeploymentMode::ENV).ok().as_deref())?;
+        let deployment_mode = DeploymentMode::from_env_result(std::env::var(DeploymentMode::ENV))?;
         let public_base_url =
             env_nonempty("SOTTO_PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
         let web_origin = env_nonempty("SOTTO_WEB_ORIGIN");
@@ -316,6 +326,19 @@ mod tests {
         );
         assert!(DeploymentMode::parse(Some("hosted")).is_err());
         assert!(DeploymentMode::parse(Some("SELF_HOSTED")).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            assert!(
+                DeploymentMode::from_env_result(Err(std::env::VarError::NotUnicode(
+                    OsString::from_vec(vec![0xff])
+                )))
+                .is_err()
+            );
+        }
     }
 
     #[test]
