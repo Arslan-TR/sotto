@@ -350,6 +350,7 @@ const api = {
 };
 
 const apiProxy = {
+  "/server/info": api,
   "/auth/github": api,
   "/auth/me": api,
   "/auth/logout": api,
