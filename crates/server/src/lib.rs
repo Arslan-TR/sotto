@@ -22,6 +22,7 @@ pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod cloud_coverage;
+pub mod cloud_coverage_store;
 pub mod community;
 pub mod config;
 pub mod db;
