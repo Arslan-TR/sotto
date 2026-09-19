@@ -105,6 +105,14 @@ struct Episode {
     ends_at: Timestamp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenewalIdentity {
+    coverage_id: String,
+    source_id: String,
+    starts_at: Timestamp,
+    paid_until: Timestamp,
+}
+
 /// Evaluate one person's coverage at `now`.
 pub fn evaluate(
     coverage: &PersonCoverage,
@@ -180,7 +188,7 @@ fn eligible_intervals(coverage: &PersonCoverage) -> Result<Vec<EligibleInterval>
     }
 
     let mut unique = HashMap::<String, ConfirmedPaidInterval>::new();
-    let mut renewal_end = HashMap::<String, Timestamp>::new();
+    let mut renewal_identity = HashMap::<String, RenewalIdentity>::new();
     for interval in &coverage.paid_intervals {
         if interval.coverage_id.trim().is_empty() {
             return Err(InvalidCoverage::EmptyCoverageId);
@@ -195,13 +203,18 @@ fn eligible_intervals(coverage: &PersonCoverage) -> Result<Vec<EligibleInterval>
             if renewal_id.trim().is_empty() {
                 return Err(InvalidCoverage::EmptyRenewalId);
             }
-            if let Some(previous_end) =
-                renewal_end.insert(renewal_id.to_owned(), interval.paid_until)
-            {
-                if previous_end != interval.paid_until {
+            let identity = RenewalIdentity {
+                coverage_id: interval.coverage_id.clone(),
+                source_id: interval.source_id.clone(),
+                starts_at: interval.starts_at,
+                paid_until: interval.paid_until,
+            };
+            if let Some(previous) = renewal_identity.get(renewal_id) {
+                if previous != &identity {
                     return Err(InvalidCoverage::ConflictingRenewal);
                 }
             }
+            renewal_identity.insert(renewal_id.to_owned(), identity);
             interval
                 .paid_until
                 .checked_add(RENEWAL_RECOVERY_SECONDS)

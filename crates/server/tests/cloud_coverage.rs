@@ -166,6 +166,17 @@ fn malformed_input_fails_closed() {
         .unwrap_err(),
         InvalidCoverage::ExportDeadlineOverflow
     );
+    assert_eq!(
+        evaluate(
+            &coverage(vec![
+                recovery("first", "source", 0, 10, "renewal"),
+                recovery("second", "source", 1, 10, "renewal"),
+            ]),
+            1
+        )
+        .unwrap_err(),
+        InvalidCoverage::ConflictingRenewal
+    );
 }
 
 #[test]
