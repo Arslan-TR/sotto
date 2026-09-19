@@ -56,6 +56,9 @@ fn paid_boundaries_and_cancellation_are_half_open() {
         evaluate(&input, 30 * DAY).unwrap().state,
         CoverageState::ExportOnly
     );
+    let at_export_deadline = evaluate(&input, 60 * DAY).unwrap();
+    assert_eq!(at_export_deadline.state, CoverageState::Expired);
+    assert_eq!(at_export_deadline.export_until, Some(60 * DAY));
 }
 
 #[test]
@@ -80,6 +83,15 @@ fn failed_renewal_has_one_recovery_window_and_export_deadline() {
 }
 
 #[test]
+fn retried_failure_does_not_restart_recovery() {
+    let fact = recovery("paid", "personal", 0, 30 * DAY, "renewal-1");
+    let input = coverage(vec![fact.clone(), fact]);
+    let at_recovery_end = evaluate(&input, 44 * DAY).unwrap();
+    assert_eq!(at_recovery_end.state, CoverageState::ExportOnly);
+    assert_eq!(at_recovery_end.export_until, Some(74 * DAY));
+}
+
+#[test]
 fn paid_takes_precedence_and_sources_extend_one_episode() {
     let input = coverage(vec![
         recovery("personal", "personal", 0, 30 * DAY, "renewal-1"),
@@ -96,6 +108,18 @@ fn paid_takes_precedence_and_sources_extend_one_episode() {
 }
 
 #[test]
+fn future_paid_segment_excludes_recovery_from_current_decision() {
+    let input = coverage(vec![
+        recovery("renewal", "personal", 0, 30 * DAY, "renewal-1"),
+        paid("next", "personal", 35 * DAY, 65 * DAY),
+    ]);
+    let decision = evaluate(&input, 36 * DAY).unwrap();
+    assert_eq!(decision.state, CoverageState::Paid);
+    assert_eq!(decision.active_until, Some(65 * DAY));
+    assert_eq!(decision.recovery_until, None);
+}
+
+#[test]
 fn touching_periods_are_continuous_but_future_periods_do_not_extend_old_expiry() {
     let touching = coverage(vec![
         paid("one", "personal", 0, 30 * DAY),
@@ -104,6 +128,10 @@ fn touching_periods_are_continuous_but_future_periods_do_not_extend_old_expiry()
     assert_eq!(
         evaluate(&touching, 30 * DAY).unwrap().active_until,
         Some(60 * DAY)
+    );
+    assert_eq!(
+        evaluate(&touching, 30 * DAY).unwrap().state,
+        CoverageState::Paid
     );
 
     let gap = coverage(vec![
@@ -116,6 +144,10 @@ fn touching_periods_are_continuous_but_future_periods_do_not_extend_old_expiry()
     assert_eq!(
         evaluate(&gap, 130 * DAY).unwrap().state,
         CoverageState::ExportOnly
+    );
+    assert_eq!(
+        evaluate(&gap, 130 * DAY).unwrap().export_until,
+        Some(160 * DAY)
     );
 }
 
@@ -131,6 +163,22 @@ fn malformed_input_fails_closed() {
         )
         .unwrap_err(),
         InvalidCoverage::EmptyBeneficiary
+    );
+    assert_eq!(
+        evaluate(&coverage(vec![paid("", "source", 0, 10)]), 1).unwrap_err(),
+        InvalidCoverage::EmptyCoverageId
+    );
+    assert_eq!(
+        evaluate(&coverage(vec![paid("coverage", "", 0, 10)]), 1).unwrap_err(),
+        InvalidCoverage::EmptySourceId
+    );
+    assert_eq!(
+        evaluate(
+            &coverage(vec![recovery("coverage", "source", 0, 10, "")]),
+            1
+        )
+        .unwrap_err(),
+        InvalidCoverage::EmptyRenewalId
     );
     assert_eq!(
         evaluate(
