@@ -354,10 +354,6 @@ pub async fn begin_collection(
     .fetch_optional(&mut **tx)
     .await?
     {
-        let existing_beneficiary: String = existing.try_get("beneficiary_id")?;
-        if existing_beneficiary != beneficiary_id {
-            return Err(ReconciliationError::CollectionConflict);
-        }
         return collection_ticket_from_row(&existing);
     }
 
