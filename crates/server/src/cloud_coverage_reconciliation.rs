@@ -538,7 +538,7 @@ fn canonical_collection(
             } => (source_id, evidence_reference),
         };
         if evidence_reference.trim().is_empty()
-            || expected.get(source_id.as_str()).is_none()
+            || !expected.contains_key(source_id.as_str())
             || seen.insert(source_id.clone(), ()).is_some()
         {
             return Err(ReconciliationError::SourceBatchMismatch);
