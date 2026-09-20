@@ -158,10 +158,8 @@ async fn seed_legacy_database(pool: &PgPool) -> (String, String, SourceBinding, 
         .execute(pool)
         .await
         .expect("insert legacy coverage head");
-        sqlx::query("INSERT INTO cloud_coverage_coordinators (beneficiary_id, source_set_generation, collection_epoch, current_attempt_id) VALUES ($1, 1, $2, $3)")
+        sqlx::query("INSERT INTO cloud_coverage_coordinators (beneficiary_id, source_set_generation, collection_epoch) VALUES ($1, 1, 1)")
             .bind(beneficiary)
-            .bind(1_i64)
-            .bind(if beneficiary == first { "legacy-pending-a" } else { "legacy-completed-b" })
             .execute(pool)
             .await
             .expect("insert legacy coordinator");
@@ -195,6 +193,22 @@ async fn seed_legacy_database(pool: &PgPool) -> (String, String, SourceBinding, 
         .execute(pool)
         .await
         .expect("insert legacy completed attempts");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = $2 WHERE beneficiary_id = $1",
+    )
+    .bind(first)
+    .bind("legacy-pending-a")
+    .execute(pool)
+    .await
+    .expect("link first legacy current attempt");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = $2 WHERE beneficiary_id = $1",
+    )
+    .bind(second)
+    .bind("legacy-completed-b")
+    .execute(pool)
+    .await
+    .expect("link second legacy current attempt");
     (first.into(), second.into(), first_binding, second_binding)
 }
 
