@@ -11,6 +11,7 @@ use sotto_server::cloud_coverage_store::{
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 struct Fixture {
@@ -45,6 +46,22 @@ impl Fixture {
             pool,
             beneficiary_id,
         })
+    }
+
+    async fn add_beneficiary(&self) -> Self {
+        let beneficiary_id = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'reconciliation-test', $2)",
+        )
+        .bind(&beneficiary_id)
+        .bind(&beneficiary_id)
+        .execute(&self.pool)
+        .await
+        .expect("insert second reconciliation test user");
+        Self {
+            pool: self.pool.clone(),
+            beneficiary_id,
+        }
     }
 }
 
@@ -105,6 +122,67 @@ fn binding(fixture: &Fixture, source_id: &str, external: &str) -> SourceBinding 
 
 fn attempt_id(fixture: &Fixture, suffix: &str) -> String {
     format!("{}:{suffix}", fixture.beneficiary_id)
+}
+
+async fn register(fixture: &Fixture, source: &SourceBinding, operation_id: &str) {
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source registration");
+    register_source(&mut tx, operation_id, source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit source registration");
+}
+
+async fn begin(
+    fixture: &Fixture,
+    attempt_id: &str,
+) -> sotto_server::cloud_coverage_reconciliation::CollectionTicket {
+    let mut tx = fixture.pool.begin().await.expect("begin collection");
+    let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, attempt_id)
+        .await
+        .expect("begin collection");
+    tx.commit().await.expect("commit collection");
+    ticket
+}
+
+#[tokio::test]
+async fn beneficiaries_can_independently_use_the_same_attempt_id() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let first_source = binding(&first, "source", "allocation");
+    let second_source = binding(&second, "source", "allocation");
+    register(&first, &first_source, "registration").await;
+    register(&second, &second_source, "registration").await;
+
+    let first_ticket = begin(&first, "attempt").await;
+    let second_ticket = begin(&second, "attempt").await;
+    assert_eq!(first_ticket.attempt_id, second_ticket.attempt_id);
+    assert_ne!(first_ticket.beneficiary_id, second_ticket.beneficiary_id);
+
+    for (fixture, ticket, source) in [
+        (&first, first_ticket, first_source),
+        (&second, second_ticket, second_source),
+    ] {
+        let observation = SourceObservation::Complete {
+            source_id: source.source_id,
+            evidence_reference: "source-evidence".into(),
+            paid_intervals: vec![],
+        };
+        let mut tx = fixture.pool.begin().await.expect("begin collection finish");
+        finish_collection(&mut tx, &ticket, "collection-evidence", &[observation])
+            .await
+            .expect("finish collection");
+        tx.commit().await.expect("commit collection finish");
+        assert!(load(&fixture.pool, &fixture.beneficiary_id).await.is_ok());
+    }
+
+    cleanup(&second).await;
+    cleanup(&first).await;
 }
 
 #[tokio::test]
@@ -258,6 +336,44 @@ async fn registration_rejects_reusing_operation_for_changed_binding() {
 }
 
 #[tokio::test]
+async fn a_source_cannot_bind_to_two_beneficiaries() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let source = binding(&first, "source", "allocation");
+    register(&first, &source, "registration").await;
+
+    let rebound = SourceBinding {
+        beneficiary_id: second.beneficiary_id.clone(),
+        source_id: source.source_id.clone(),
+        provider_namespace: source.provider_namespace.clone(),
+        external_allocation_reference: source.external_allocation_reference.clone(),
+        ownership_evidence_reference: source.ownership_evidence_reference.clone(),
+    };
+    let mut tx = second
+        .pool
+        .begin()
+        .await
+        .expect("begin conflicting registration");
+    let result = register_source(&mut tx, "registration", &rebound).await;
+    tx.rollback()
+        .await
+        .expect("rollback conflicting registration");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::SourceBindingConflict)
+    ));
+    assert!(matches!(
+        load(&second.pool, &second.beneficiary_id).await,
+        Err(StoreError::ProjectionMissing)
+    ));
+
+    cleanup(&second).await;
+    cleanup(&first).await;
+}
+
+#[tokio::test]
 async fn registration_rejects_adopting_an_unmanaged_projection() {
     let Some(fixture) = Fixture::create().await else {
         return;
@@ -368,6 +484,35 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
     );
     assert_eq!(replay.revision, receipt.revision);
 
+    let mut tx = fixture.pool.begin().await.expect("begin later publication");
+    publish(
+        &mut tx,
+        &fixture.beneficiary_id,
+        Some(receipt.revision),
+        "later-publication",
+        "later-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish later projection");
+    tx.commit().await.expect("commit later publication");
+
+    let mut tx = fixture.pool.begin().await.expect("begin stale replay");
+    let stale_replay = finish_collection(&mut tx, &ticket, "collection-evidence-1", &observations)
+        .await
+        .expect("replay original collection after a later revision");
+    tx.commit().await.expect("commit stale replay");
+    assert_eq!(stale_replay.revision, receipt.revision);
+    assert_eq!(
+        load(&fixture.pool, &fixture.beneficiary_id)
+            .await
+            .expect("load later projection")
+            .revision,
+        receipt.revision + 1
+    );
+
     let mut tx = fixture
         .pool
         .begin()
@@ -379,7 +524,7 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
         .expect("rollback malformed collection replay");
     assert!(matches!(
         changed,
-        Err(ReconciliationError::CollectionConflict)
+        Err(ReconciliationError::OperationConflict)
     ));
     cleanup(&fixture).await;
 }
@@ -438,6 +583,112 @@ async fn a_new_collection_supersedes_an_older_pending_attempt() {
         result,
         Err(ReconciliationError::AttemptSuperseded)
     ));
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&first.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read superseded attempt status");
+    assert_eq!(status, "superseded");
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn a_new_source_supersedes_a_pending_collection() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let first_source = binding(&fixture, "first", "allocation-first");
+    let second_source = binding(&fixture, "second", "allocation-second");
+    register(&fixture, &first_source, "registration-first").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "pending")).await;
+
+    register(&fixture, &second_source, "registration-second").await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read source invalidated attempt");
+    assert_eq!(status, "superseded");
+
+    let observation = SourceObservation::Unavailable {
+        source_id: first_source.source_id,
+        evidence_reference: "source-evidence".into(),
+        reason: UnavailableReason::NeedsReconciliation,
+    };
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin stale source finish");
+    let result = finish_collection(&mut tx, &ticket, "aggregate-evidence", &[observation]).await;
+    tx.rollback().await.expect("rollback stale source finish");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn identical_concurrent_completions_apply_once_and_replay_once() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "concurrent")).await;
+    let observations = vec![SourceObservation::Complete {
+        source_id: source.source_id,
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![],
+    }];
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let pool = fixture.pool.clone();
+        let ticket = ticket.clone();
+        let observations = observations.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut tx = pool.begin().await.expect("begin concurrent finish");
+            let result = finish_collection(&mut tx, &ticket, "aggregate-evidence", &observations)
+                .await
+                .expect("finish concurrent collection");
+            tx.commit().await.expect("commit concurrent finish");
+            result
+        }));
+    }
+    let first = tasks.remove(0).await.expect("join first completion");
+    let second = tasks.remove(0).await.expect("join second completion");
+    assert_eq!(first.revision, second.revision);
+    assert!(matches!(
+        (first.outcome, second.outcome),
+        (
+            sotto_server::cloud_coverage_store::PublicationOutcome::Applied,
+            sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied
+        ) | (
+            sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied,
+            sotto_server::cloud_coverage_store::PublicationOutcome::Applied
+        )
+    ));
+    let completed_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND status = 'completed'",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count completed attempts");
+    assert_eq!(completed_count, 1);
     cleanup(&fixture).await;
 }
 
@@ -719,6 +970,57 @@ async fn incomplete_collection_does_not_publish_and_conflicting_evidence_wins() 
             UnavailableReason::ConflictingEvidence
         ))
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn mixed_source_results_publish_no_known_subset_and_prefer_conflicting_evidence() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let complete_source = binding(&fixture, "complete", "allocation-complete");
+    let unavailable_source = binding(&fixture, "unavailable", "allocation-unavailable");
+    register(&fixture, &complete_source, "registration-complete").await;
+    register(&fixture, &unavailable_source, "registration-unavailable").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "mixed")).await;
+    let observations = [
+        SourceObservation::Complete {
+            source_id: complete_source.source_id.clone(),
+            evidence_reference: "complete-evidence".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "known".into(),
+                source_id: complete_source.source_id.clone(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        },
+        SourceObservation::Unavailable {
+            source_id: unavailable_source.source_id,
+            evidence_reference: "unavailable-evidence".into(),
+            reason: UnavailableReason::ConflictingEvidence,
+        },
+    ];
+    let mut tx = fixture.pool.begin().await.expect("begin mixed finish");
+    finish_collection(&mut tx, &ticket, "aggregate-evidence", &observations)
+        .await
+        .expect("finish mixed collection");
+    tx.commit().await.expect("commit mixed finish");
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::ConflictingEvidence
+        ))
+    ));
+    let fact_count: i64 = sqlx::query_scalar(
+        "SELECT fact_count FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 ORDER BY revision DESC LIMIT 1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read unavailable fact count");
+    assert_eq!(fact_count, 0);
     cleanup(&fixture).await;
 }
 
