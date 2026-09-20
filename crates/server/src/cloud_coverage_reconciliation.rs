@@ -119,6 +119,8 @@ pub enum ReconciliationError {
     AttemptSuperseded,
     #[error("collection attempt conflicts with current source or projection state")]
     CollectionConflict,
+    #[error("collection operation conflicts with a completed replay")]
+    OperationConflict,
     #[error("collection source batch does not match the registered source set")]
     SourceBatchMismatch,
     #[error("source observations conflict: {0}")]
@@ -315,8 +317,9 @@ pub async fn register_source(
 
 /// Begin a collection against the current complete source set.
 ///
-/// The returned ticket is durable only after the caller commits. A new attempt supersedes any
-/// pending attempt for the same beneficiary. No provider call belongs inside this transaction.
+/// The returned ticket is durable only after the caller commits. The caller must roll back on
+/// error. A new attempt supersedes any pending attempt for the same beneficiary. No provider call
+/// belongs inside this transaction.
 pub async fn begin_collection(
     tx: &mut Transaction<'_, Postgres>,
     beneficiary_id: &str,
@@ -483,7 +486,7 @@ pub async fn finish_collection(
             aggregate_evidence_reference,
         )
         .map(|(canonical_result, _)| canonical_result)
-        .map_err(|_| ReconciliationError::CollectionConflict)?;
+        .map_err(|_| ReconciliationError::OperationConflict)?;
         let stored_evidence: String = attempt.try_get("aggregate_evidence_reference")?;
         let stored_result: String = attempt.try_get("canonical_result")?;
         let completed_revision: i64 = attempt.try_get("projection_revision")?;
@@ -496,7 +499,7 @@ pub async fn finish_collection(
                 outcome: PublicationOutcome::AlreadyApplied,
             });
         }
-        return Err(ReconciliationError::CollectionConflict);
+        return Err(ReconciliationError::OperationConflict);
     }
     if status == CollectionStatus::Superseded {
         return Err(ReconciliationError::AttemptSuperseded);

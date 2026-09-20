@@ -456,7 +456,7 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
         .expect("rollback malformed collection replay");
     assert!(matches!(
         changed,
-        Err(ReconciliationError::CollectionConflict)
+        Err(ReconciliationError::OperationConflict)
     ));
     cleanup(&fixture).await;
 }
