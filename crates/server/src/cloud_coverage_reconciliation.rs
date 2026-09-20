@@ -537,8 +537,8 @@ pub async fn finish_collection(
     let canonical_result_json = serde_json::to_string(&canonical_result)?;
     let updated = sqlx::query(
         "UPDATE cloud_coverage_collection_attempts SET status = 'completed', \
-         aggregate_evidence_reference = $2, canonical_result = $3::jsonb, \
-         projection_revision = $4, completed_at = now() \
+         aggregate_evidence_reference = $3, canonical_result = $4::jsonb, \
+         projection_revision = $5, completed_at = now() \
          WHERE beneficiary_id = $1 AND attempt_id = $2 AND status = 'pending'",
     )
     .bind(&ticket.beneficiary_id)
