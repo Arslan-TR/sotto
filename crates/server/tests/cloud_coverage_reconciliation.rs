@@ -335,6 +335,44 @@ async fn registration_rejects_reusing_operation_for_changed_binding() {
 }
 
 #[tokio::test]
+async fn a_source_cannot_bind_to_two_beneficiaries() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let source = binding(&first, "source", "allocation");
+    register(&first, &source, "registration").await;
+
+    let rebound = SourceBinding {
+        beneficiary_id: second.beneficiary_id.clone(),
+        source_id: source.source_id.clone(),
+        provider_namespace: source.provider_namespace.clone(),
+        external_allocation_reference: source.external_allocation_reference.clone(),
+        ownership_evidence_reference: source.ownership_evidence_reference.clone(),
+    };
+    let mut tx = second
+        .pool
+        .begin()
+        .await
+        .expect("begin conflicting registration");
+    let result = register_source(&mut tx, "registration", &rebound).await;
+    tx.rollback()
+        .await
+        .expect("rollback conflicting registration");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::SourceBindingConflict)
+    ));
+    assert!(matches!(
+        load(&second.pool, &second.beneficiary_id).await,
+        Err(StoreError::ProjectionMissing)
+    ));
+
+    cleanup(&second).await;
+    cleanup(&first).await;
+}
+
+#[tokio::test]
 async fn registration_rejects_adopting_an_unmanaged_projection() {
     let Some(fixture) = Fixture::create().await else {
         return;
@@ -515,6 +553,16 @@ async fn a_new_collection_supersedes_an_older_pending_attempt() {
         result,
         Err(ReconciliationError::AttemptSuperseded)
     ));
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&first.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read superseded attempt status");
+    assert_eq!(status, "superseded");
     cleanup(&fixture).await;
 }
 
@@ -796,6 +844,57 @@ async fn incomplete_collection_does_not_publish_and_conflicting_evidence_wins() 
             UnavailableReason::ConflictingEvidence
         ))
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn mixed_source_results_publish_no_known_subset_and_prefer_conflicting_evidence() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let complete_source = binding(&fixture, "complete", "allocation-complete");
+    let unavailable_source = binding(&fixture, "unavailable", "allocation-unavailable");
+    register(&fixture, &complete_source, "registration-complete").await;
+    register(&fixture, &unavailable_source, "registration-unavailable").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "mixed")).await;
+    let observations = [
+        SourceObservation::Complete {
+            source_id: complete_source.source_id.clone(),
+            evidence_reference: "complete-evidence".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "known".into(),
+                source_id: complete_source.source_id.clone(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        },
+        SourceObservation::Unavailable {
+            source_id: unavailable_source.source_id,
+            evidence_reference: "unavailable-evidence".into(),
+            reason: UnavailableReason::ConflictingEvidence,
+        },
+    ];
+    let mut tx = fixture.pool.begin().await.expect("begin mixed finish");
+    finish_collection(&mut tx, &ticket, "aggregate-evidence", &observations)
+        .await
+        .expect("finish mixed collection");
+    tx.commit().await.expect("commit mixed finish");
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::ConflictingEvidence
+        ))
+    ));
+    let fact_count: i64 = sqlx::query_scalar(
+        "SELECT fact_count FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 ORDER BY revision DESC LIMIT 1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read unavailable fact count");
+    assert_eq!(fact_count, 0);
     cleanup(&fixture).await;
 }
 
