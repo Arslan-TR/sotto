@@ -33,6 +33,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum callback request-line bytes. The callback is a short GET; anything larger is junk.
 const MAX_REQUEST_LINE: usize = 8192;
 
+/// Deadlines for the loopback accept loop. Named fields so the two `Duration`s cannot be
+/// passed in the wrong order: a swap would compile and no test would catch it.
+#[derive(Debug, Clone, Copy)]
+struct Deadlines {
+    overall: Duration,
+    per_read: Duration,
+}
+
 pub fn store_session(keychain: &dyn Keychain, token: &str) -> Result<()> {
     keychain.set(KC_SERVER_SESSION, token.as_bytes())
 }
@@ -162,15 +170,26 @@ pub fn authorize(server: &str) -> Result<String> {
 /// requests get a 400 and do NOT consume the flow: the listener keeps waiting until a valid
 /// callback arrives or the overall deadline elapses.
 fn accept_callback(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    accept_with_deadlines(listener, expected_state, CALLBACK_TIMEOUT, READ_TIMEOUT)
+    accept_with_deadlines(
+        listener,
+        expected_state,
+        Deadlines {
+            overall: CALLBACK_TIMEOUT,
+            per_read: READ_TIMEOUT,
+        },
+    )
 }
 
 fn accept_with_deadlines(
     listener: &TcpListener,
     expected_state: &str,
-    overall: Duration,
-    per_read: Duration,
+    deadlines: Deadlines,
 ) -> Result<String> {
+    let Deadlines { overall, per_read } = deadlines;
+    debug_assert!(
+        overall > per_read,
+        "overall deadline must exceed the per-connection read deadline"
+    );
     listener
         .set_nonblocking(true)
         .map_err(|e| Error::Io(e.to_string()))?;
@@ -379,7 +398,10 @@ mod tests {
         // The CLI asked for a code, so a session value is one it did not request. The
         // accept loop matches on the variant to fail fast, so pin it, not just the text.
         let err = parse_callback("/?session=st_xyz&state=abc", "abc").unwrap_err();
-        assert!(matches!(err, Error::LegacyServer), "unexpected error: {err}");
+        assert!(
+            matches!(err, Error::LegacyServer),
+            "unexpected error: {err}"
+        );
         assert!(
             err.to_string().contains("instead of a login code"),
             "unexpected error: {err}"
@@ -418,20 +440,14 @@ mod tests {
     /// receiver for its verdict.
     fn serve_callback(
         expected_state: &'static str,
-        overall: Duration,
-        per_read: Duration,
+        deadlines: Deadlines,
     ) -> (u16, std::sync::mpsc::Receiver<Result<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            tx.send(accept_with_deadlines(
-                &listener,
-                expected_state,
-                overall,
-                per_read,
-            ))
-            .expect("send verdict");
+            tx.send(accept_with_deadlines(&listener, expected_state, deadlines))
+                .expect("send verdict");
         });
         (port, rx)
     }
@@ -451,7 +467,13 @@ mod tests {
 
     #[test]
     fn accept_loop_ignores_junk_until_a_valid_callback() {
-        let (port, rx) = serve_callback("abc", Duration::from_secs(10), Duration::from_secs(2));
+        let (port, rx) = serve_callback(
+            "abc",
+            Deadlines {
+                overall: Duration::from_secs(10),
+                per_read: Duration::from_secs(2),
+            },
+        );
         let malformed = get(port, "GARBAGE\r\n");
         assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
         let wrong_state = get(port, "GET /?code=sc_evil&state=evil HTTP/1.1\r\n\r\n");
@@ -470,7 +492,13 @@ mod tests {
 
     #[test]
     fn accept_loop_rejects_an_oversized_request() {
-        let (port, rx) = serve_callback("abc", Duration::from_secs(10), Duration::from_secs(2));
+        let (port, rx) = serve_callback(
+            "abc",
+            Deadlines {
+                overall: Duration::from_secs(10),
+                per_read: Duration::from_secs(2),
+            },
+        );
         let big = get(
             port,
             &format!("GET /?{} HTTP/1.1\r\n\r\n", "a".repeat(9000)),
@@ -488,7 +516,13 @@ mod tests {
 
     #[test]
     fn accept_loop_drops_a_peer_that_never_finishes_its_request() {
-        let (port, rx) = serve_callback("abc", Duration::from_secs(10), Duration::from_millis(200));
+        let (port, rx) = serve_callback(
+            "abc",
+            Deadlines {
+                overall: Duration::from_secs(10),
+                per_read: Duration::from_millis(200),
+            },
+        );
         // A peer that connects and never finishes its request line is dropped with a 400 once
         // the per-connection read deadline expires (no newline, no hang).
         let mut idle = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -512,7 +546,13 @@ mod tests {
 
     #[test]
     fn accept_loop_fails_fast_on_a_legacy_session() {
-        let (port, rx) = serve_callback("abc", Duration::from_secs(30), Duration::from_secs(2));
+        let (port, rx) = serve_callback(
+            "abc",
+            Deadlines {
+                overall: Duration::from_secs(30),
+                per_read: Duration::from_secs(2),
+            },
+        );
         let start = Instant::now();
         let legacy = get(port, "GET /?session=st_old&state=abc HTTP/1.1\r\n\r\n");
         assert!(legacy.starts_with("HTTP/1.1 400"), "{legacy}");
@@ -535,8 +575,15 @@ mod tests {
     fn accept_loop_times_out_instead_of_hanging() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let start = Instant::now();
-        let err = accept_with_deadlines(&listener, "abc", Duration::from_millis(100), READ_TIMEOUT)
-            .unwrap_err();
+        let err = accept_with_deadlines(
+            &listener,
+            "abc",
+            Deadlines {
+                overall: Duration::from_millis(100),
+                per_read: Duration::from_millis(50),
+            },
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
