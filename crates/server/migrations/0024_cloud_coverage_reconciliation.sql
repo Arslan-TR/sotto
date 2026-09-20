@@ -29,6 +29,12 @@ CREATE TABLE cloud_coverage_sources (
         UNIQUE (beneficiary_id, registration_operation_id)
 );
 
+ALTER TABLE cloud_coverage_sources
+    ADD CONSTRAINT cloud_coverage_sources_registration_revision_fk
+    FOREIGN KEY (beneficiary_id, registration_projection_revision)
+    REFERENCES cloud_coverage_revisions (beneficiary_id, revision)
+    DEFERRABLE INITIALLY DEFERRED;
+
 CREATE TABLE cloud_coverage_collection_attempts (
     attempt_id                    TEXT PRIMARY KEY CHECK (btrim(attempt_id) <> ''),
     beneficiary_id                TEXT NOT NULL
@@ -64,10 +70,26 @@ CREATE TABLE cloud_coverage_collection_attempts (
     UNIQUE (beneficiary_id, collection_epoch)
 );
 
+ALTER TABLE cloud_coverage_collection_attempts
+    ADD CONSTRAINT cloud_coverage_attempts_beneficiary_key
+    UNIQUE (beneficiary_id, attempt_id);
+
+ALTER TABLE cloud_coverage_collection_attempts
+    ADD CONSTRAINT cloud_coverage_attempts_expected_revision_fk
+    FOREIGN KEY (beneficiary_id, expected_projection_revision)
+    REFERENCES cloud_coverage_revisions (beneficiary_id, revision)
+    DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE cloud_coverage_collection_attempts
+    ADD CONSTRAINT cloud_coverage_attempts_completed_revision_fk
+    FOREIGN KEY (beneficiary_id, projection_revision)
+    REFERENCES cloud_coverage_revisions (beneficiary_id, revision)
+    DEFERRABLE INITIALLY DEFERRED;
+
 ALTER TABLE cloud_coverage_coordinators
     ADD CONSTRAINT cloud_coverage_coordinators_attempt_fk
-    FOREIGN KEY (current_attempt_id)
-    REFERENCES cloud_coverage_collection_attempts (attempt_id)
+    FOREIGN KEY (beneficiary_id, current_attempt_id)
+    REFERENCES cloud_coverage_collection_attempts (beneficiary_id, attempt_id)
     DEFERRABLE INITIALLY DEFERRED;
 
 CREATE INDEX cloud_coverage_sources_beneficiary_idx

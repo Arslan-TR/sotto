@@ -97,7 +97,7 @@ fn binding(fixture: &Fixture, source_id: &str, external: &str) -> SourceBinding 
     SourceBinding {
         beneficiary_id: fixture.beneficiary_id.clone(),
         source_id: source_id.into(),
-        provider_namespace: "stripe:test".into(),
+        provider_namespace: format!("stripe:test:{}", fixture.beneficiary_id),
         external_allocation_reference: external.into(),
         ownership_evidence_reference: format!("evidence:{external}"),
     }

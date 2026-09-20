@@ -431,7 +431,6 @@ pub async fn finish_collection(
 ) -> Result<ReconciliationReceipt, ReconciliationError> {
     validate_identifier(&ticket.beneficiary_id, "beneficiary_id")?;
     validate_attempt_id(&ticket.attempt_id)?;
-    validate_identifier(aggregate_evidence_reference, "aggregate_evidence_reference")?;
 
     let coordinator = sqlx::query(
         "SELECT source_set_generation, collection_epoch, current_attempt_id \
@@ -466,14 +465,16 @@ pub async fn finish_collection(
         return Err(ReconciliationError::CollectionConflict);
     }
 
-    let (canonical_result, projection) = canonical_collection(
-        &ticket.beneficiary_id,
-        &ticket.source_bindings,
-        observations,
-        aggregate_evidence_reference,
-    )?;
     let status = stored_ticket.status;
     if status == CollectionStatus::Completed {
+        let canonical_result = canonical_collection(
+            &ticket.beneficiary_id,
+            &ticket.source_bindings,
+            observations,
+            aggregate_evidence_reference,
+        )
+        .map(|(canonical_result, _)| canonical_result)
+        .map_err(|_| ReconciliationError::CollectionConflict)?;
         let stored_evidence: String = attempt.try_get("aggregate_evidence_reference")?;
         let stored_result: String = attempt.try_get("canonical_result")?;
         let completed_revision: i64 = attempt.try_get("projection_revision")?;
@@ -491,6 +492,13 @@ pub async fn finish_collection(
     if status == CollectionStatus::Superseded {
         return Err(ReconciliationError::AttemptSuperseded);
     }
+    validate_identifier(aggregate_evidence_reference, "aggregate_evidence_reference")?;
+    let (canonical_result, projection) = canonical_collection(
+        &ticket.beneficiary_id,
+        &ticket.source_bindings,
+        observations,
+        aggregate_evidence_reference,
+    )?;
     if current_attempt.as_deref() != Some(ticket.attempt_id.as_str())
         || current_generation != ticket.source_set_generation
         || current_epoch != ticket.collection_epoch
