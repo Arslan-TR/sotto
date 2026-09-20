@@ -455,6 +455,77 @@ async fn simultaneous_first_publications_have_one_winner() {
 }
 
 #[tokio::test]
+async fn simultaneous_first_conflicts_retry_after_empty_head_cleanup() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let first_pool = fixture.pool.clone();
+    let second_pool = fixture.pool.clone();
+    let first_beneficiary = fixture.beneficiary_id.clone();
+    let second_beneficiary = fixture.beneficiary_id.clone();
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier;
+    let publish_one = async move {
+        let mut tx = first_pool.begin().await.expect("begin first conflict race");
+        first_barrier.wait().await;
+        let result = publish(
+            &mut tx,
+            &first_beneficiary,
+            Some(1),
+            "first-conflict-one",
+            "first-conflict-evidence-one",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await;
+        tx.commit().await.expect("commit first conflict cleanup");
+        result
+    };
+    let publish_two = async move {
+        let mut tx = second_pool
+            .begin()
+            .await
+            .expect("begin second conflict race");
+        second_barrier.wait().await;
+        let result = publish(
+            &mut tx,
+            &second_beneficiary,
+            Some(1),
+            "first-conflict-two",
+            "first-conflict-evidence-two",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await;
+        tx.commit().await.expect("commit second conflict cleanup");
+        result
+    };
+    let (first, second) = tokio::join!(publish_one, publish_two);
+    assert!(matches!(
+        first,
+        Err(StoreError::RevisionConflict {
+            expected: Some(1),
+            actual: None,
+        })
+    ));
+    assert!(matches!(
+        second,
+        Err(StoreError::RevisionConflict {
+            expected: Some(1),
+            actual: None,
+        })
+    ));
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionMissing)
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
 async fn simultaneous_replays_of_one_operation_have_one_application() {
     let Some(fixture) = Fixture::create().await else {
         return;
@@ -633,6 +704,29 @@ async fn renewal_correction_replaces_recovery_without_rewriting_old_revision() {
             paid("renewed", "personal", 30 * DAY, 60 * DAY),
         ],
     };
+    let mut rolled_back = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin rolled-back correction");
+    publish(
+        &mut rolled_back,
+        &fixture.beneficiary_id,
+        Some(1),
+        "rolled-back-correction",
+        "evidence-rolled-back-correction",
+        &renewed,
+    )
+    .await
+    .expect("publish rolled-back correction");
+    rolled_back.rollback().await.expect("rollback correction");
+    assert_eq!(
+        load(&fixture.pool, &fixture.beneficiary_id)
+            .await
+            .expect("read revision after rollback")
+            .revision,
+        1
+    );
     let mut pending = fixture.pool.begin().await.expect("begin confirmed renewal");
     publish(
         &mut pending,
