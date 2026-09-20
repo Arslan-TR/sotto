@@ -119,6 +119,8 @@ pub enum ReconciliationError {
     AttemptSuperseded,
     #[error("collection attempt conflicts with current source or projection state")]
     CollectionConflict,
+    #[error("collection operation conflicts with a completed replay")]
+    OperationConflict,
     #[error("collection source batch does not match the registered source set")]
     SourceBatchMismatch,
     #[error("source observations conflict: {0}")]
@@ -315,8 +317,9 @@ pub async fn register_source(
 
 /// Begin a collection against the current complete source set.
 ///
-/// The returned ticket is durable only after the caller commits. A new attempt supersedes any
-/// pending attempt for the same beneficiary. No provider call belongs inside this transaction.
+/// The returned ticket is durable only after the caller commits. The caller must roll back on
+/// error. A new attempt supersedes any pending attempt for the same beneficiary. No provider call
+/// belongs inside this transaction.
 pub async fn begin_collection(
     tx: &mut Transaction<'_, Postgres>,
     beneficiary_id: &str,
@@ -343,16 +346,14 @@ pub async fn begin_collection(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
                 expected_projection_revision, source_bindings::text AS source_bindings, status, \
                 projection_revision \
-         FROM cloud_coverage_collection_attempts WHERE attempt_id = $1",
+         FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
     )
+    .bind(beneficiary_id)
     .bind(attempt_id)
     .fetch_optional(&mut **tx)
     .await?
     {
-        let existing_beneficiary: String = existing.try_get("beneficiary_id")?;
-        if existing_beneficiary != beneficiary_id {
-            return Err(ReconciliationError::CollectionConflict);
-        }
         return collection_ticket_from_row(&existing);
     }
 
@@ -380,8 +381,9 @@ pub async fn begin_collection(
     if let Some(previous_attempt_id) = current_attempt_id {
         sqlx::query(
             "UPDATE cloud_coverage_collection_attempts SET status = 'superseded' \
-             WHERE attempt_id = $1 AND status = 'pending'",
+             WHERE beneficiary_id = $1 AND attempt_id = $2 AND status = 'pending'",
         )
+        .bind(beneficiary_id)
         .bind(previous_attempt_id)
         .execute(&mut **tx)
         .await?;
@@ -453,8 +455,10 @@ pub async fn finish_collection(
                 expected_projection_revision, source_bindings::text AS source_bindings, status, \
                 aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
-         FROM cloud_coverage_collection_attempts WHERE attempt_id = $1",
+         FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
     )
+    .bind(&ticket.beneficiary_id)
     .bind(&ticket.attempt_id)
     .fetch_optional(&mut **tx)
     .await?
@@ -478,7 +482,7 @@ pub async fn finish_collection(
             aggregate_evidence_reference,
         )
         .map(|(canonical_result, _)| canonical_result)
-        .map_err(|_| ReconciliationError::CollectionConflict)?;
+        .map_err(|_| ReconciliationError::OperationConflict)?;
         let stored_evidence: String = attempt.try_get("aggregate_evidence_reference")?;
         let stored_result: String = attempt.try_get("canonical_result")?;
         let completed_revision: i64 = attempt.try_get("projection_revision")?;
@@ -491,7 +495,7 @@ pub async fn finish_collection(
                 outcome: PublicationOutcome::AlreadyApplied,
             });
         }
-        return Err(ReconciliationError::CollectionConflict);
+        return Err(ReconciliationError::OperationConflict);
     }
     if status == CollectionStatus::Superseded {
         return Err(ReconciliationError::AttemptSuperseded);
@@ -529,10 +533,11 @@ pub async fn finish_collection(
     let canonical_result_json = serde_json::to_string(&canonical_result)?;
     let updated = sqlx::query(
         "UPDATE cloud_coverage_collection_attempts SET status = 'completed', \
-         aggregate_evidence_reference = $2, canonical_result = $3::jsonb, \
-         projection_revision = $4, completed_at = now() \
-         WHERE attempt_id = $1 AND status = 'pending'",
+         aggregate_evidence_reference = $3, canonical_result = $4::jsonb, \
+         projection_revision = $5, completed_at = now() \
+         WHERE beneficiary_id = $1 AND attempt_id = $2 AND status = 'pending'",
     )
+    .bind(&ticket.beneficiary_id)
     .bind(&ticket.attempt_id)
     .bind(aggregate_evidence_reference)
     .bind(canonical_result_json)
