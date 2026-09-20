@@ -289,7 +289,7 @@ pub async fn register_source(
     )
     .await?;
 
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE cloud_coverage_sources SET registration_projection_revision = $2 \
          WHERE source_id = $1",
     )
@@ -297,6 +297,9 @@ pub async fn register_source(
     .bind(publication.revision)
     .execute(&mut **tx)
     .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ReconciliationError::CorruptRegistration);
+    }
 
     Ok(RegistrationReceipt {
         source_id: binding.source_id.clone(),
@@ -512,7 +515,7 @@ pub async fn finish_collection(
     )
     .await?;
     let canonical_result_json = serde_json::to_string(&canonical_result)?;
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE cloud_coverage_collection_attempts SET status = 'completed', \
          aggregate_evidence_reference = $2, canonical_result = $3::jsonb, \
          projection_revision = $4, completed_at = now() \
@@ -524,6 +527,9 @@ pub async fn finish_collection(
     .bind(publication.revision)
     .execute(&mut **tx)
     .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ReconciliationError::CollectionConflict);
+    }
     sqlx::query(
         "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL \
          WHERE beneficiary_id = $1 AND current_attempt_id = $2",
