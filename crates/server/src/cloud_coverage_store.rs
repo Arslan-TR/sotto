@@ -150,14 +150,31 @@ pub async fn publish(
     .bind(beneficiary_id)
     .execute(&mut **tx)
     .await?;
-    let head_inserted = head_insert.rows_affected() == 1;
+    let mut head_inserted = head_insert.rows_affected() == 1;
 
-    sqlx::query_scalar::<_, String>(
-        "SELECT beneficiary_id FROM cloud_coverage_heads WHERE beneficiary_id = $1 FOR UPDATE",
-    )
-    .bind(beneficiary_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    loop {
+        let head = sqlx::query_scalar::<_, String>(
+            "SELECT beneficiary_id FROM cloud_coverage_heads WHERE beneficiary_id = $1 FOR UPDATE",
+        )
+        .bind(beneficiary_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if head.is_some() {
+            break;
+        }
+
+        // A concurrent first publisher can delete its empty head after returning a
+        // revision conflict. Recreate it if this transaction's earlier insert saw
+        // that uncommitted row and therefore did not insert a replacement.
+        let retry_insert = sqlx::query(
+            "INSERT INTO cloud_coverage_heads (beneficiary_id, current_revision) VALUES ($1, NULL) \
+             ON CONFLICT (beneficiary_id) DO NOTHING",
+        )
+        .bind(beneficiary_id)
+        .execute(&mut **tx)
+        .await?;
+        head_inserted |= retry_insert.rows_affected() == 1;
+    }
 
     let existing = sqlx::query(
         "SELECT revision, expected_revision, evidence_reference, status, unavailable_reason, fact_count \
