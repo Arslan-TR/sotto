@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Timestamp precision used by the coverage domain: Unix seconds in UTC.
@@ -26,7 +27,7 @@ pub struct PersonCoverage {
 }
 
 /// A paid interval that has already been verified by the billing projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfirmedPaidInterval {
     /// Stable identity for this coverage fact. Retries must reuse this identity.
     pub coverage_id: String,
