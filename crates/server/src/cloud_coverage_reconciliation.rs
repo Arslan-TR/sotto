@@ -393,7 +393,7 @@ pub async fn begin_collection(
 
     let source_rows = sqlx::query(
         "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
-                ownership_evidence_reference, registration_source_set_generation \
+                ownership_evidence_reference \
          FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id COLLATE \"C\"",
     )
     .bind(beneficiary_id)
