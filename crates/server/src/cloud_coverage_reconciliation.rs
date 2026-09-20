@@ -97,6 +97,8 @@ pub enum ReconciliationError {
     Store(#[from] StoreError),
     #[error("invalid source binding: {0}")]
     InvalidSource(String),
+    #[error("invalid identifier: {0}")]
+    InvalidIdentifier(String),
     #[error("registration operation_id must not be empty")]
     EmptyOperationId,
     #[error("source registration conflicts with an existing binding")]
@@ -693,7 +695,7 @@ fn validate_attempt_id(attempt_id: &str) -> Result<(), ReconciliationError> {
 
 fn validate_identifier(value: &str, name: &str) -> Result<(), ReconciliationError> {
     if value.trim().is_empty() {
-        Err(ReconciliationError::InvalidSource(format!(
+        Err(ReconciliationError::InvalidIdentifier(format!(
             "{name} must not be empty"
         )))
     } else {
