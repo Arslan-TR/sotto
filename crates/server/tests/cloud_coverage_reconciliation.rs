@@ -713,6 +713,29 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
         receipt.revision + 1
     );
 
+    let later_source = binding(&fixture, "source-2", "allocation-2");
+    register(&fixture, &later_source, "registration-2").await;
+    let source_generation: i64 = sqlx::query_scalar(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read later source generation");
+    assert_eq!(source_generation, 2);
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin historical source replay");
+    let historical_replay =
+        finish_collection(&mut tx, &ticket, "collection-evidence-1", &observations)
+            .await
+            .expect("replay collection after source registration");
+    tx.commit().await.expect("commit historical source replay");
+    assert_eq!(historical_replay.revision, receipt.revision);
+    assert_eq!(head_revision(&fixture).await, receipt.revision + 2);
+
     let mut tx = fixture
         .pool
         .begin()
