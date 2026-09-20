@@ -11,6 +11,7 @@ use sotto_server::cloud_coverage_store::{
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 struct Fixture {
@@ -633,6 +634,61 @@ async fn a_new_source_supersedes_a_pending_collection() {
         result,
         Err(ReconciliationError::AttemptSuperseded)
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn identical_concurrent_completions_apply_once_and_replay_once() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "concurrent")).await;
+    let observations = vec![SourceObservation::Complete {
+        source_id: source.source_id,
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![],
+    }];
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let pool = fixture.pool.clone();
+        let ticket = ticket.clone();
+        let observations = observations.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut tx = pool.begin().await.expect("begin concurrent finish");
+            let result = finish_collection(&mut tx, &ticket, "aggregate-evidence", &observations)
+                .await
+                .expect("finish concurrent collection");
+            tx.commit().await.expect("commit concurrent finish");
+            result
+        }));
+    }
+    let first = tasks.remove(0).await.expect("join first completion");
+    let second = tasks.remove(0).await.expect("join second completion");
+    assert_eq!(first.revision, second.revision);
+    assert!(matches!(
+        (first.outcome, second.outcome),
+        (
+            sotto_server::cloud_coverage_store::PublicationOutcome::Applied,
+            sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied
+        ) | (
+            sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied,
+            sotto_server::cloud_coverage_store::PublicationOutcome::Applied
+        )
+    ));
+    let completed_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND status = 'completed'",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count completed attempts");
+    assert_eq!(completed_count, 1);
     cleanup(&fixture).await;
 }
 
