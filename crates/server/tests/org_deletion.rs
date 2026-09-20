@@ -19,6 +19,10 @@ use sotto_server::billing::{
     ProviderError, ProviderErrorKind, ProviderResult, SubscriptionObservation,
     SubscriptionProvider, SubscriptionSnapshot, SubscriptionStatus,
 };
+use sotto_server::cloud_coverage::ConfirmedPaidInterval;
+use sotto_server::cloud_coverage_reconciliation::{
+    begin_collection, finish_collection, register_source, SourceBinding, SourceObservation,
+};
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -378,6 +382,7 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .execute(pool)
         .await
         .expect("delete operation history");
+    cleanup_coverage(pool, user_id).await;
     sqlx::query("DELETE FROM organizations WHERE id = $1")
         .bind(org_id)
         .execute(pool)
@@ -388,6 +393,63 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .execute(pool)
         .await
         .expect("delete owner fixture");
+}
+
+async fn coverage_snapshot(pool: &PgPool, beneficiary_id: &str) -> Vec<Vec<serde_json::Value>> {
+    let queries = [
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_coordinators WHERE beneficiary_id = $1) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY attempt_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 ORDER BY revision, coverage_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_heads WHERE beneficiary_id = $1) t",
+    ];
+    let mut snapshots = Vec::with_capacity(queries.len());
+    for query in queries {
+        snapshots.push(
+            sqlx::query(query)
+                .bind(beneficiary_id)
+                .fetch_all(pool)
+                .await
+                .expect("read coverage snapshot")
+                .into_iter()
+                .map(|row| sqlx::Row::try_get(&row, "value").expect("decode coverage snapshot"))
+                .collect(),
+        );
+    }
+    snapshots
+}
+
+async fn cleanup_coverage(pool: &PgPool, beneficiary_id: &str) {
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage head");
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage facts");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("clear coverage current attempt");
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_revisions",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(beneficiary_id)
+            .execute(pool)
+            .await
+            .expect("delete coverage fixture");
+    }
 }
 
 fn metric_value(
@@ -997,6 +1059,87 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
         metric_value(&before, org_deletion_metrics::PURGE_ATTEMPTS, "completed") + 1
     );
     assert_eq!(after.purge_duration.count, before.purge_duration.count + 1);
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let source = SourceBinding {
+        beneficiary_id: owner_id.clone(),
+        source_id: format!("{owner_id}:source"),
+        provider_namespace: "deletion-test".into(),
+        external_allocation_reference: format!("allocation-{owner_id}"),
+        ownership_evidence_reference: format!("ownership-{owner_id}"),
+    };
+    let mut tx = pool.begin().await.expect("begin coverage registration");
+    register_source(&mut tx, "deletion-coverage-registration", &source)
+        .await
+        .expect("register deletion coverage source");
+    tx.commit().await.expect("commit coverage registration");
+
+    let mut tx = pool.begin().await.expect("begin coverage collection");
+    let ticket = begin_collection(&mut tx, &owner_id, "deletion-coverage-complete")
+        .await
+        .expect("begin deletion coverage collection");
+    tx.commit().await.expect("commit coverage collection");
+    let observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "deletion-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 10,
+            paid_until: 20,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut tx = pool.begin().await.expect("begin coverage finish");
+    finish_collection(
+        &mut tx,
+        &ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("finish deletion coverage collection");
+    tx.commit().await.expect("commit coverage finish");
+    let before = coverage_snapshot(&pool, &owner_id).await;
+
+    let operation_id = enter_retention(&pool, &org_id, &owner_id, "coverage-deletion-worker").await;
+    age_deletion_for_purge(&pool, &operation_id).await;
+    let retention_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim retention work")
+        .expect("retention work is due");
+    advance(&pool, &retention_lease, None)
+        .await
+        .expect("enter coverage purge")
+        .expect("purge transition");
+    let purge_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim purge work")
+        .expect("purge work is due");
+    advance(&pool, &purge_lease, None)
+        .await
+        .expect("purge organisation with coverage")
+        .expect("completed purge transition");
+
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+        .bind(&owner_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read preserved coverage owner");
+    assert!(
+        user_exists,
+        "organisation purge must not remove the beneficiary"
+    );
 
     cleanup(&pool, &org_id, &owner_id).await;
 }
