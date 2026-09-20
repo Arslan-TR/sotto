@@ -94,12 +94,10 @@ pub fn parse_callback(target: &str, expected_state: &str) -> Result<String> {
     if let Some(code) = code {
         return Ok(code);
     }
+    // Reachable only with valid state (mismatches returned above), which is what lets the
+    // accept loop fail fast on this: a correct-state legacy session means an outdated server.
     if session {
-        return Err(Error::Server(
-            "server returned a session token instead of a login code - \
-             upgrade the server to one that speaks login codes"
-                .into(),
-        ));
+        return Err(Error::LegacyServer);
     }
     Err(Error::Server("callback missing code".into()))
 }
@@ -206,7 +204,16 @@ fn accept_with_deadlines(
                 reply(&mut stream, true);
                 return Ok(code);
             }
-            // Wrong state, legacy session, malformed or oversized: 400, keep waiting.
+            // A correct-state legacy session means an outdated server, not a probe: fail
+            // fast with the actionable error instead of hanging until the deadline. This hands
+            // a state-knowing local attacker a login-cancel primitive, but that is nuisance
+            // only (retrying mints fresh state), and dribbling junk already delays the loop
+            // without knowing anything.
+            Err(Error::LegacyServer) => {
+                reply(&mut stream, false);
+                return Err(Error::LegacyServer);
+            }
+            // Wrong state, malformed or oversized: 400, keep waiting.
             Err(_) => reply(&mut stream, false),
         }
     }
@@ -369,8 +376,10 @@ mod tests {
 
     #[test]
     fn parse_callback_rejects_a_legacy_session() {
-        // The CLI asked for a code, so a session value is one it did not request.
+        // The CLI asked for a code, so a session value is one it did not request. The
+        // accept loop matches on the variant to fail fast, so pin it, not just the text.
         let err = parse_callback("/?session=st_xyz&state=abc", "abc").unwrap_err();
+        assert!(matches!(err, Error::LegacyServer), "unexpected error: {err}");
         assert!(
             err.to_string().contains("instead of a login code"),
             "unexpected error: {err}"
@@ -447,9 +456,8 @@ mod tests {
         assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
         let wrong_state = get(port, "GET /?code=sc_evil&state=evil HTTP/1.1\r\n\r\n");
         assert!(wrong_state.starts_with("HTTP/1.1 400"), "{wrong_state}");
-        let legacy = get(port, "GET /?session=st_old&state=abc HTTP/1.1\r\n\r\n");
-        assert!(legacy.starts_with("HTTP/1.1 400"), "{legacy}");
         // None of the above consumed the flow: the real callback still lands.
+        // (A correct-state legacy session is not junk: it fails the flow fast, covered below.)
         let valid = get(port, "GET /?code=sc_ok&state=abc HTTP/1.1\r\n\r\n");
         assert!(valid.starts_with("HTTP/1.1 200 OK"), "{valid}");
         assert_eq!(
@@ -499,6 +507,27 @@ mod tests {
                 .expect("verdict")
                 .unwrap(),
             "sc_ok"
+        );
+    }
+
+    #[test]
+    fn accept_loop_fails_fast_on_a_legacy_session() {
+        let (port, rx) = serve_callback("abc", Duration::from_secs(30), Duration::from_secs(2));
+        let start = Instant::now();
+        let legacy = get(port, "GET /?session=st_old&state=abc HTTP/1.1\r\n\r\n");
+        assert!(legacy.starts_with("HTTP/1.1 400"), "{legacy}");
+        let err = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("verdict")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("instead of a login code"),
+            "unexpected error: {err}"
+        );
+        // Fail fast, not at the 30s overall deadline.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "waited for the deadline"
         );
     }
 
