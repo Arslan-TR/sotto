@@ -842,7 +842,7 @@ async fn validate_stored_bindings(
 ) -> Result<(), ReconciliationError> {
     let rows = sqlx::query(
         "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
-                ownership_evidence_reference \
+                ownership_evidence_reference, registration_source_set_generation \
          FROM cloud_coverage_sources \
          WHERE beneficiary_id = $1 AND registration_source_set_generation <= $2 \
          ORDER BY source_id COLLATE \"C\"",
