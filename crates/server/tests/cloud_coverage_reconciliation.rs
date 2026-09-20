@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
-    RegistrationOutcome, SourceBinding, SourceObservation,
+    begin_collection, finish_collection, register_source, CollectionStatus, CorruptAttemptReason,
+    ReconciliationError, RegistrationOutcome, SourceBinding, SourceObservation,
 };
 use sotto_server::cloud_coverage_store::{
     load, publish, CoverageProjection, StoreError, UnavailableReason,
@@ -24,7 +24,8 @@ impl Fixture {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
             return None;
         }
-        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
         let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
         assert!(
             matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
@@ -146,6 +147,258 @@ async fn begin(
         .expect("begin collection");
     tx.commit().await.expect("commit collection");
     ticket
+}
+
+async fn corrupt_bindings(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    bindings: serde_json::Value,
+) {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET source_bindings = $3::jsonb \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(bindings.to_string())
+    .execute(&fixture.pool)
+    .await
+    .expect("corrupt stored source bindings");
+}
+
+async fn corrupt_result(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    result: serde_json::Value,
+) {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET canonical_result = $3::jsonb \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(result.to_string())
+    .execute(&fixture.pool)
+    .await
+    .expect("corrupt stored collection result");
+}
+
+async fn corrupt_generation(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    generation: i64,
+) {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET source_set_generation = $3 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(generation)
+    .execute(&fixture.pool)
+    .await
+    .expect("corrupt stored source generation");
+}
+
+async fn head_revision(fixture: &Fixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read coverage head revision")
+}
+
+#[tokio::test]
+async fn malformed_stored_bindings_fail_closed_without_writes() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "corrupt-bindings")).await;
+    let original_head = head_revision(&fixture).await;
+    corrupt_bindings(&fixture, &ticket, serde_json::json!([])).await;
+
+    let mut begin_tx = fixture.pool.begin().await.expect("begin corrupt replay");
+    let replay = begin_collection(&mut begin_tx, &fixture.beneficiary_id, &ticket.attempt_id).await;
+    begin_tx.commit().await.expect("commit corrupt replay");
+    assert!(matches!(
+        replay,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::BindingShape
+        ))
+    ));
+
+    let observation = SourceObservation::Complete {
+        source_id: source.source_id,
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let mut finish_tx = fixture.pool.begin().await.expect("begin corrupt finish");
+    let finish = finish_collection(
+        &mut finish_tx,
+        &ticket,
+        "aggregate-evidence",
+        &[observation],
+    )
+    .await;
+    finish_tx.commit().await.expect("commit corrupt finish");
+    assert!(matches!(
+        finish,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::BindingShape
+        ))
+    ));
+    assert_eq!(head_revision(&fixture).await, original_head);
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read corrupt attempt status");
+    assert_eq!(status, "pending");
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn changed_stored_binding_fails_without_disclosing_as_a_ticket_conflict() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "changed-binding")).await;
+    let mut changed = source.clone();
+    changed.ownership_evidence_reference = "different-evidence".into();
+    corrupt_bindings(&fixture, &ticket, serde_json::json!([changed])).await;
+
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin changed binding replay");
+    let replay = begin_collection(&mut tx, &fixture.beneficiary_id, &ticket.attempt_id).await;
+    tx.commit().await.expect("commit changed binding replay");
+    assert!(matches!(
+        replay,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::BindingSourceSet
+        ))
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn stored_attempt_requires_an_exact_source_generation_snapshot() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "missing-generation")).await;
+    corrupt_generation(&fixture, &ticket, ticket.source_set_generation + 1).await;
+
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin corrupt generation replay");
+    let replay = begin_collection(&mut tx, &fixture.beneficiary_id, &ticket.attempt_id).await;
+    tx.commit().await.expect("commit corrupt generation replay");
+    assert!(matches!(
+        replay,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::BindingSourceSet
+        ))
+    ));
+    let coordinator_generation: i64 = sqlx::query_scalar(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read source generation after corrupt replay");
+    assert_eq!(coordinator_generation, ticket.source_set_generation);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn corrupt_completed_result_fails_before_classifying_a_changed_replay() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "corrupt-result")).await;
+    let observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let mut complete_tx = fixture.pool.begin().await.expect("begin completion");
+    finish_collection(
+        &mut complete_tx,
+        &ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("complete collection");
+    complete_tx.commit().await.expect("commit completion");
+    let original_head = head_revision(&fixture).await;
+    corrupt_result(
+        &fixture,
+        &ticket,
+        serde_json::json!({
+            "aggregate_evidence_reference": "aggregate-evidence",
+            "sources": []
+        }),
+    )
+    .await;
+
+    let mut finish_tx = fixture.pool.begin().await.expect("begin corrupt replay");
+    let changed = finish_collection(
+        &mut finish_tx,
+        &ticket,
+        "different-evidence",
+        &[SourceObservation::Unavailable {
+            source_id: source.source_id,
+            evidence_reference: "different-source-evidence".into(),
+            reason: UnavailableReason::ConflictingEvidence,
+        }],
+    )
+    .await;
+    finish_tx.commit().await.expect("commit corrupt replay");
+    assert!(matches!(
+        changed,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::ResultCanonical
+        ))
+    ));
+
+    let mut begin_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin corrupt ticket replay");
+    let replay = begin_collection(&mut begin_tx, &fixture.beneficiary_id, &ticket.attempt_id).await;
+    begin_tx
+        .commit()
+        .await
+        .expect("commit corrupt ticket replay");
+    assert!(matches!(
+        replay,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::ResultCanonical
+        ))
+    ));
+    assert_eq!(head_revision(&fixture).await, original_head);
+    cleanup(&fixture).await;
 }
 
 #[tokio::test]
@@ -512,6 +765,29 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
             .revision,
         receipt.revision + 1
     );
+
+    let later_source = binding(&fixture, "source-2", "allocation-2");
+    register(&fixture, &later_source, "registration-2").await;
+    let source_generation: i64 = sqlx::query_scalar(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read later source generation");
+    assert_eq!(source_generation, 2);
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin historical source replay");
+    let historical_replay =
+        finish_collection(&mut tx, &ticket, "collection-evidence-1", &observations)
+            .await
+            .expect("replay collection after source registration");
+    tx.commit().await.expect("commit historical source replay");
+    assert_eq!(historical_replay.revision, receipt.revision);
+    assert_eq!(head_revision(&fixture).await, receipt.revision + 2);
 
     let mut tx = fixture
         .pool

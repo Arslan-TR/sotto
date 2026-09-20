@@ -121,6 +121,8 @@ pub enum ReconciliationError {
     CollectionConflict,
     #[error("collection operation conflicts with a completed replay")]
     OperationConflict,
+    #[error("stored collection attempt is corrupt: {0}")]
+    CorruptAttempt(CorruptAttemptReason),
     #[error("collection source batch does not match the registered source set")]
     SourceBatchMismatch,
     #[error("source observations conflict: {0}")]
@@ -133,6 +135,35 @@ pub enum ReconciliationError {
     GenerationOverflow,
     #[error("serialised reconciliation value is invalid: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+/// The durable collection field that failed validation.
+///
+/// These categories deliberately do not include stored values. They are safe to surface to an
+/// operator without exposing provider identifiers or evidence references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptAttemptReason {
+    BindingShape,
+    BindingOwnership,
+    BindingSourceSet,
+    CompletionReceipt,
+    ResultShape,
+    ResultEvidence,
+    ResultCanonical,
+}
+
+impl fmt::Display for CorruptAttemptReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BindingShape => "source bindings",
+            Self::BindingOwnership => "source binding ownership",
+            Self::BindingSourceSet => "registered source snapshot",
+            Self::CompletionReceipt => "completion receipt",
+            Self::ResultShape => "collection result shape",
+            Self::ResultEvidence => "collection result evidence",
+            Self::ResultCanonical => "collection result canonical form",
+        })
+    }
 }
 
 impl fmt::Display for RegistrationOutcome {
@@ -345,6 +376,7 @@ pub async fn begin_collection(
     if let Some(existing) = sqlx::query(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
                 expected_projection_revision, source_bindings::text AS source_bindings, status, \
+                aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
          FROM cloud_coverage_collection_attempts \
          WHERE beneficiary_id = $1 AND attempt_id = $2",
@@ -354,7 +386,9 @@ pub async fn begin_collection(
     .fetch_optional(&mut **tx)
     .await?
     {
-        return collection_ticket_from_row(&existing);
+        let ticket = collection_ticket_from_row(&existing)?;
+        validate_stored_attempt(tx, &ticket, &existing).await?;
+        return Ok(ticket);
     }
 
     let source_rows = sqlx::query(
@@ -464,6 +498,7 @@ pub async fn finish_collection(
     .await?
     .ok_or(ReconciliationError::AttemptMissing)?;
     let stored_ticket = collection_ticket_from_row(&attempt)?;
+    let stored_completion = validate_stored_attempt(tx, &stored_ticket, &attempt).await?;
     if stored_ticket.beneficiary_id != ticket.beneficiary_id
         || stored_ticket.collection_epoch != ticket.collection_epoch
         || stored_ticket.source_set_generation != ticket.source_set_generation
@@ -483,15 +518,15 @@ pub async fn finish_collection(
         )
         .map(|(canonical_result, _)| canonical_result)
         .map_err(|_| ReconciliationError::OperationConflict)?;
-        let stored_evidence: String = attempt.try_get("aggregate_evidence_reference")?;
-        let stored_result: String = attempt.try_get("canonical_result")?;
-        let completed_revision: i64 = attempt.try_get("projection_revision")?;
-        if stored_evidence == aggregate_evidence_reference
-            && serde_json::from_str::<serde_json::Value>(&stored_result)? == canonical_result
+        let Some(stored_completion) = stored_completion else {
+            return Err(corrupt(CorruptAttemptReason::CompletionReceipt));
+        };
+        if stored_completion.evidence == aggregate_evidence_reference
+            && stored_completion.canonical_result == canonical_result
         {
             return Ok(ReconciliationReceipt {
                 attempt_id: ticket.attempt_id.clone(),
-                revision: completed_revision,
+                revision: stored_completion.revision,
                 outcome: PublicationOutcome::AlreadyApplied,
             });
         }
@@ -720,11 +755,12 @@ fn collection_ticket_from_row(
             return Err(ReconciliationError::CollectionConflict);
         }
     };
+    let beneficiary_id: String = row.try_get("beneficiary_id")?;
     let source_bindings_json: String = row.try_get("source_bindings")?;
-    let source_bindings: Vec<SourceBinding> = serde_json::from_str(&source_bindings_json)?;
+    let source_bindings = parse_stored_bindings(&source_bindings_json, &beneficiary_id)?;
     let projection_revision: Option<i64> = row.try_get("projection_revision")?;
     Ok(CollectionTicket {
-        beneficiary_id: row.try_get("beneficiary_id")?,
+        beneficiary_id,
         attempt_id: row.try_get("attempt_id")?,
         collection_epoch: row.try_get("collection_epoch")?,
         source_set_generation: row.try_get("source_set_generation")?,
@@ -733,6 +769,312 @@ fn collection_ticket_from_row(
         status,
         completed_revision: projection_revision,
     })
+}
+
+fn parse_stored_bindings(
+    source_bindings_json: &str,
+    beneficiary_id: &str,
+) -> Result<Vec<SourceBinding>, ReconciliationError> {
+    let value: serde_json::Value = serde_json::from_str(source_bindings_json)
+        .map_err(|_| corrupt(CorruptAttemptReason::BindingShape))?;
+    let bindings = value
+        .as_array()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::BindingShape))?;
+    if bindings.is_empty() {
+        return Err(corrupt(CorruptAttemptReason::BindingShape));
+    }
+    let mut parsed = Vec::with_capacity(bindings.len());
+    for value in bindings {
+        let object = value
+            .as_object()
+            .ok_or_else(|| corrupt(CorruptAttemptReason::BindingShape))?;
+        if object.len() != 5
+            || ![
+                "beneficiary_id",
+                "source_id",
+                "provider_namespace",
+                "external_allocation_reference",
+                "ownership_evidence_reference",
+            ]
+            .iter()
+            .all(|field| object.contains_key(*field))
+        {
+            return Err(corrupt(CorruptAttemptReason::BindingShape));
+        }
+        let binding = SourceBinding {
+            beneficiary_id: stored_string(
+                object,
+                "beneficiary_id",
+                CorruptAttemptReason::BindingShape,
+            )?,
+            source_id: stored_string(object, "source_id", CorruptAttemptReason::BindingShape)?,
+            provider_namespace: stored_string(
+                object,
+                "provider_namespace",
+                CorruptAttemptReason::BindingShape,
+            )?,
+            external_allocation_reference: stored_string(
+                object,
+                "external_allocation_reference",
+                CorruptAttemptReason::BindingShape,
+            )?,
+            ownership_evidence_reference: stored_string(
+                object,
+                "ownership_evidence_reference",
+                CorruptAttemptReason::BindingShape,
+            )?,
+        };
+        if binding.beneficiary_id != beneficiary_id {
+            return Err(corrupt(CorruptAttemptReason::BindingOwnership));
+        }
+        validate_binding(&binding).map_err(|_| corrupt(CorruptAttemptReason::BindingShape))?;
+        parsed.push(binding);
+    }
+    if parsed
+        .windows(2)
+        .any(|pair| pair[0].source_id >= pair[1].source_id)
+    {
+        return Err(corrupt(CorruptAttemptReason::BindingShape));
+    }
+    Ok(parsed)
+}
+
+async fn validate_stored_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &CollectionTicket,
+) -> Result<(), ReconciliationError> {
+    let rows = sqlx::query(
+        "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference, registration_source_set_generation \
+         FROM cloud_coverage_sources \
+         WHERE beneficiary_id = $1 AND registration_source_set_generation <= $2 \
+         ORDER BY source_id COLLATE \"C\"",
+    )
+    .bind(&ticket.beneficiary_id)
+    .bind(ticket.source_set_generation)
+    .fetch_all(&mut **tx)
+    .await?;
+    let authoritative = rows
+        .iter()
+        .map(source_binding_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let latest_generation = rows
+        .iter()
+        .map(|row| row.try_get("registration_source_set_generation"))
+        .collect::<Result<Vec<i64>, sqlx::Error>>()?
+        .into_iter()
+        .max();
+    if latest_generation != Some(ticket.source_set_generation)
+        || authoritative.is_empty()
+        || authoritative != ticket.source_bindings
+    {
+        return Err(corrupt(CorruptAttemptReason::BindingSourceSet));
+    }
+    Ok(())
+}
+
+async fn validate_stored_attempt(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &CollectionTicket,
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<StoredCompletionReceipt>, ReconciliationError> {
+    validate_stored_bindings(tx, ticket).await?;
+    let receipt = stored_completion_receipt(
+        ticket.status,
+        row.try_get("aggregate_evidence_reference")?,
+        row.try_get("canonical_result")?,
+        row.try_get("projection_revision")?,
+    )?;
+    receipt
+        .map(|(evidence, result, revision)| {
+            let canonical_result = validate_stored_result(ticket, &evidence, &result)?;
+            Ok(StoredCompletionReceipt {
+                evidence,
+                canonical_result,
+                revision,
+            })
+        })
+        .transpose()
+}
+
+struct StoredCompletionReceipt {
+    evidence: String,
+    canonical_result: serde_json::Value,
+    revision: i64,
+}
+
+fn stored_completion_receipt(
+    status: CollectionStatus,
+    evidence: Option<String>,
+    result: Option<String>,
+    revision: Option<i64>,
+) -> Result<Option<(String, String, i64)>, ReconciliationError> {
+    match (status, evidence, result, revision) {
+        (CollectionStatus::Completed, Some(evidence), Some(result), Some(revision)) => {
+            Ok(Some((evidence, result, revision)))
+        }
+        (CollectionStatus::Pending | CollectionStatus::Superseded, None, None, None) => Ok(None),
+        _ => Err(corrupt(CorruptAttemptReason::CompletionReceipt)),
+    }
+}
+
+fn validate_stored_result(
+    ticket: &CollectionTicket,
+    evidence: &str,
+    stored_result: &str,
+) -> Result<serde_json::Value, ReconciliationError> {
+    if evidence.trim().is_empty() {
+        return Err(corrupt(CorruptAttemptReason::ResultEvidence));
+    }
+    let value: serde_json::Value = serde_json::from_str(stored_result)
+        .map_err(|_| corrupt(CorruptAttemptReason::ResultShape))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    if object.len() != 2
+        || !object.contains_key("aggregate_evidence_reference")
+        || !object.contains_key("sources")
+    {
+        return Err(corrupt(CorruptAttemptReason::ResultShape));
+    }
+    let stored_evidence = stored_string(
+        object,
+        "aggregate_evidence_reference",
+        CorruptAttemptReason::ResultShape,
+    )?;
+    if stored_evidence != evidence || stored_evidence.trim().is_empty() {
+        return Err(corrupt(CorruptAttemptReason::ResultEvidence));
+    }
+    let sources = object
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    let observations = sources
+        .iter()
+        .map(parse_stored_observation)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (canonical, _) = canonical_collection(
+        &ticket.beneficiary_id,
+        &ticket.source_bindings,
+        &observations,
+        evidence,
+    )
+    .map_err(|_| corrupt(CorruptAttemptReason::ResultCanonical))?;
+    if value != canonical {
+        return Err(corrupt(CorruptAttemptReason::ResultCanonical));
+    }
+    Ok(canonical)
+}
+
+fn parse_stored_observation(
+    value: &serde_json::Value,
+) -> Result<SourceObservation, ReconciliationError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    let status = stored_string(object, "status", CorruptAttemptReason::ResultShape)?;
+    let source_id = stored_string(object, "source_id", CorruptAttemptReason::ResultShape)?;
+    let evidence_reference = stored_string(
+        object,
+        "evidence_reference",
+        CorruptAttemptReason::ResultShape,
+    )?;
+    match status.as_str() {
+        "complete" => {
+            if object.len() != 4 || !object.contains_key("paid_intervals") {
+                return Err(corrupt(CorruptAttemptReason::ResultShape));
+            }
+            let intervals = object
+                .get("paid_intervals")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?
+                .iter()
+                .map(parse_stored_interval)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(SourceObservation::Complete {
+                source_id,
+                evidence_reference,
+                paid_intervals: intervals,
+            })
+        }
+        "unavailable" => {
+            if object.len() != 4 || !object.contains_key("reason") {
+                return Err(corrupt(CorruptAttemptReason::ResultShape));
+            }
+            let reason = match stored_string(object, "reason", CorruptAttemptReason::ResultShape)?
+                .as_str()
+            {
+                "needs_reconciliation" => UnavailableReason::NeedsReconciliation,
+                "conflicting_evidence" => UnavailableReason::ConflictingEvidence,
+                _ => return Err(corrupt(CorruptAttemptReason::ResultShape)),
+            };
+            Ok(SourceObservation::Unavailable {
+                source_id,
+                evidence_reference,
+                reason,
+            })
+        }
+        _ => Err(corrupt(CorruptAttemptReason::ResultShape)),
+    }
+}
+
+fn parse_stored_interval(
+    value: &serde_json::Value,
+) -> Result<ConfirmedPaidInterval, ReconciliationError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    if object.len() != 5
+        || ![
+            "coverage_id",
+            "source_id",
+            "starts_at",
+            "paid_until",
+            "failed_renewal_id",
+        ]
+        .iter()
+        .all(|field| object.contains_key(*field))
+    {
+        return Err(corrupt(CorruptAttemptReason::ResultShape));
+    }
+    let failed_renewal_id = match object.get("failed_renewal_id") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => return Err(corrupt(CorruptAttemptReason::ResultShape)),
+    };
+    Ok(ConfirmedPaidInterval {
+        coverage_id: stored_string(object, "coverage_id", CorruptAttemptReason::ResultShape)?,
+        source_id: stored_string(object, "source_id", CorruptAttemptReason::ResultShape)?,
+        starts_at: stored_i64(object, "starts_at")?,
+        paid_until: stored_i64(object, "paid_until")?,
+        failed_renewal_id,
+    })
+}
+
+fn stored_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    reason: CorruptAttemptReason,
+) -> Result<String, ReconciliationError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| corrupt(reason))
+}
+
+fn stored_i64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<i64, ReconciliationError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))
+}
+
+fn corrupt(reason: CorruptAttemptReason) -> ReconciliationError {
+    ReconciliationError::CorruptAttempt(reason)
 }
 
 fn validate_binding(binding: &SourceBinding) -> Result<(), ReconciliationError> {
@@ -801,5 +1143,58 @@ fn projection_outcome(outcome: PublicationOutcome) -> RegistrationOutcome {
 fn unavailable_projection() -> CoverageProjection {
     CoverageProjection::Unavailable {
         reason: UnavailableReason::NeedsReconciliation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_receipts_require_all_fields_for_completed_attempts() {
+        let valid = stored_completion_receipt(
+            CollectionStatus::Completed,
+            Some("aggregate-evidence".into()),
+            Some("{}".into()),
+            Some(1),
+        )
+        .expect("accept complete receipt")
+        .expect("return complete receipt");
+        assert_eq!(valid, ("aggregate-evidence".into(), "{}".into(), 1));
+
+        for (evidence, result, revision) in [
+            (None, Some("{}".into()), Some(1)),
+            (Some("aggregate-evidence".into()), None, Some(1)),
+            (Some("aggregate-evidence".into()), Some("{}".into()), None),
+        ] {
+            assert!(matches!(
+                stored_completion_receipt(CollectionStatus::Completed, evidence, result, revision),
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::CompletionReceipt
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_and_superseded_attempts_reject_completion_receipts() {
+        for status in [CollectionStatus::Pending, CollectionStatus::Superseded] {
+            assert_eq!(
+                stored_completion_receipt(status, None, None, None)
+                    .expect("accept empty incomplete receipt"),
+                None
+            );
+            assert!(matches!(
+                stored_completion_receipt(
+                    status,
+                    Some("aggregate-evidence".into()),
+                    Some("{}".into()),
+                    Some(1),
+                ),
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::CompletionReceipt
+                ))
+            ));
+        }
     }
 }
