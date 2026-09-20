@@ -5,7 +5,9 @@ use sotto_server::cloud_coverage_reconciliation::{
     begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
     RegistrationOutcome, SourceBinding, SourceObservation,
 };
-use sotto_server::cloud_coverage_store::{load, StoreError, UnavailableReason};
+use sotto_server::cloud_coverage_store::{
+    load, publish, CoverageProjection, StoreError, UnavailableReason,
+};
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
@@ -344,6 +346,139 @@ async fn a_new_collection_supersedes_an_older_pending_attempt() {
     assert!(matches!(
         result,
         Err(ReconciliationError::AttemptSuperseded)
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn collection_combines_all_sources_in_canonical_order() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let first_source = binding(&fixture, "source-B", "allocation-B");
+    let second_source = binding(&fixture, "source-a", "allocation-a");
+    for (operation, source) in [
+        ("registration-B", first_source.clone()),
+        ("registration-a", second_source.clone()),
+    ] {
+        let mut tx = fixture
+            .pool
+            .begin()
+            .await
+            .expect("begin source registration");
+        register_source(&mut tx, operation, &source)
+            .await
+            .expect("register source");
+        tx.commit().await.expect("commit source registration");
+    }
+    let ticket = {
+        let mut tx = fixture.pool.begin().await.expect("begin collection");
+        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-all")
+            .await
+            .expect("begin collection");
+        tx.commit().await.expect("commit collection begin");
+        ticket
+    };
+    let observations = vec![
+        SourceObservation::Complete {
+            source_id: second_source.source_id.clone(),
+            evidence_reference: "evidence-a".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "a".into(),
+                source_id: "payer-a".into(),
+                starts_at: 30,
+                paid_until: 60,
+                failed_renewal_id: None,
+            }],
+        },
+        SourceObservation::Complete {
+            source_id: first_source.source_id.clone(),
+            evidence_reference: "evidence-B".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "B".into(),
+                source_id: "payer-B".into(),
+                starts_at: 0,
+                paid_until: 30,
+                failed_renewal_id: None,
+            }],
+        },
+    ];
+    let mut tx = fixture.pool.begin().await.expect("begin collection finish");
+    finish_collection(&mut tx, &ticket, "evidence-all", &observations)
+        .await
+        .expect("finish collection");
+    tx.commit().await.expect("commit collection finish");
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load combined collection");
+    assert_eq!(
+        loaded
+            .coverage
+            .paid_intervals
+            .iter()
+            .map(|interval| interval.coverage_id.as_str())
+            .collect::<Vec<_>>(),
+        ["B", "a"]
+    );
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn direct_projection_change_rejects_a_stale_collection() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source-1", "allocation-1");
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source registration");
+    register_source(&mut tx, "registration-1", &source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit source registration");
+    let ticket = {
+        let mut tx = fixture.pool.begin().await.expect("begin collection");
+        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-stale")
+            .await
+            .expect("begin collection");
+        tx.commit().await.expect("commit collection begin");
+        ticket
+    };
+
+    let mut direct = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin direct publication");
+    publish(
+        &mut direct,
+        &fixture.beneficiary_id,
+        ticket.expected_projection_revision,
+        "direct-publication",
+        "direct-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish direct correction");
+    direct.commit().await.expect("commit direct publication");
+
+    let observation = SourceObservation::Unavailable {
+        source_id: source.source_id,
+        evidence_reference: "source-evidence".into(),
+        reason: UnavailableReason::NeedsReconciliation,
+    };
+    let mut tx = fixture.pool.begin().await.expect("begin stale finish");
+    let result = finish_collection(&mut tx, &ticket, "collection-evidence", &[observation]).await;
+    tx.rollback().await.expect("rollback stale finish");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::Store(
+            StoreError::RevisionConflict { .. }
+        ))
     ));
     cleanup(&fixture).await;
 }
