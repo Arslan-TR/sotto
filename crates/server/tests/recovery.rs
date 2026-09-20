@@ -352,6 +352,59 @@ async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
     let token = fresh_session(&pool, &user_id, &format!("{user_id}-subject")).await;
     let (status, body) = send(&pool, "PUT", "/account", &token, Some(bundle_body("old"))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    let org_id = format!("rec-coverage-org-{suffix}");
+    let project_id = format!("rec-coverage-project-{suffix}");
+    let environment_id = format!("rec-coverage-environment-{suffix}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        "/orgs",
+        &token,
+        Some(format!(
+            r#"{{"id":"{org_id}","enc_name":"{}","enc_org_key":"{}"}}"#,
+            b64(b"coverage-org"),
+            b64(b"coverage-org-key")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        "/projects",
+        &token,
+        Some(format!(
+            r#"{{"id":"{project_id}","enc_name":"{}","org_id":"{org_id}"}}"#,
+            b64(b"coverage-project")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        &format!("/projects/{project_id}/environments"),
+        &token,
+        Some(format!(
+            r#"{{"id":"{environment_id}","enc_name":"{}","enc_vault_key":"{}"}}"#,
+            b64(b"coverage-environment"),
+            b64(b"coverage-vault-key")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        &format!("/environments/{environment_id}/grants"),
+        &token,
+        Some(format!(
+            r#"{{"user_id":"{user_id}","enc_vault_key":"{}"}}"#,
+            b64(b"coverage-grant")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     let source = SourceBinding {
         beneficiary_id: user_id.clone(),
@@ -410,6 +463,26 @@ async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(coverage_snapshot(&pool, &user_id).await, before_reset);
+    let (status, body) = send(&pool, "GET", "/account", &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&b64(b"new-priv")),
+        "reset must replace key material"
+    );
+    assert!(!body.contains(&b64(b"old-priv")));
+    assert_eq!(
+        send(
+            &pool,
+            "GET",
+            &format!("/environments/{environment_id}/grant"),
+            &token,
+            None,
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "reset must remove the grant before coverage replay"
+    );
 
     let mut tx = pool
         .begin()
@@ -426,6 +499,19 @@ async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
     tx.commit()
         .await
         .expect("commit completed replay after reset");
+    assert_eq!(
+        send(
+            &pool,
+            "GET",
+            &format!("/environments/{environment_id}/grant"),
+            &token,
+            None,
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "coverage replay must not restore a deleted grant"
+    );
 
     let mut tx = pool
         .begin()
@@ -446,8 +532,26 @@ async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
     tx.commit()
         .await
         .expect("commit pending finish after reset");
+    assert_eq!(
+        send(
+            &pool,
+            "GET",
+            &format!("/environments/{environment_id}/grant"),
+            &token,
+            None,
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "coverage completion must not restore a deleted grant"
+    );
 
     cleanup_coverage(&pool, &user_id).await;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("delete recovery coverage organisation");
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&user_id)
         .execute(&pool)
