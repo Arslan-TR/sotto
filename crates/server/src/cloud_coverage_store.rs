@@ -385,6 +385,30 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
     Ok(LoadedCoverage { revision, coverage })
 }
 
+/// Read the committed projection revision inside a caller-owned transaction.
+///
+/// `None` means that no projection head exists. A head with a null revision is an invalid
+/// committed state and is reported as corruption rather than being treated as empty coverage.
+pub(crate) async fn current_revision(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+) -> Result<Option<i64>, StoreError> {
+    validate_identifier(beneficiary_id, StoreError::EmptyBeneficiary)?;
+    let head: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match head {
+        None => Ok(None),
+        Some(Some(revision)) => Ok(Some(revision)),
+        Some(None) => Err(StoreError::CorruptProjection(
+            "head has no current revision".into(),
+        )),
+    }
+}
+
 fn canonical_projection(
     beneficiary_id: &str,
     projection: &CoverageProjection,
