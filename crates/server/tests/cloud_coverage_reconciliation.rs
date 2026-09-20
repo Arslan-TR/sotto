@@ -103,6 +103,10 @@ fn binding(fixture: &Fixture, source_id: &str, external: &str) -> SourceBinding 
     }
 }
 
+fn attempt_id(fixture: &Fixture, suffix: &str) -> String {
+    format!("{}:{suffix}", fixture.beneficiary_id)
+}
+
 #[tokio::test]
 async fn first_registration_is_unavailable_and_exact_replay_is_idempotent() {
     let Some(fixture) = Fixture::create().await else {
@@ -313,9 +317,13 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
 
     let ticket = {
         let mut tx = fixture.pool.begin().await.expect("begin collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-1")
-            .await
-            .expect("begin collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-1"),
+        )
+        .await
+        .expect("begin collection");
         tx.commit().await.expect("commit collection begin");
         ticket
     };
@@ -394,17 +402,25 @@ async fn a_new_collection_supersedes_an_older_pending_attempt() {
 
     let first = {
         let mut tx = fixture.pool.begin().await.expect("begin first collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-1")
-            .await
-            .expect("begin first collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-1"),
+        )
+        .await
+        .expect("begin first collection");
         tx.commit().await.expect("commit first collection");
         ticket
     };
     let second = {
         let mut tx = fixture.pool.begin().await.expect("begin second collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-2")
-            .await
-            .expect("begin second collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-2"),
+        )
+        .await
+        .expect("begin second collection");
         tx.commit().await.expect("commit second collection");
         ticket
     };
@@ -448,9 +464,13 @@ async fn collection_combines_all_sources_in_canonical_order() {
     }
     let ticket = {
         let mut tx = fixture.pool.begin().await.expect("begin collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-all")
-            .await
-            .expect("begin collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-all"),
+        )
+        .await
+        .expect("begin collection");
         tx.commit().await.expect("commit collection begin");
         ticket
     };
@@ -591,9 +611,13 @@ async fn direct_projection_change_rejects_a_stale_collection() {
     tx.commit().await.expect("commit source registration");
     let ticket = {
         let mut tx = fixture.pool.begin().await.expect("begin collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-stale")
-            .await
-            .expect("begin collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-stale"),
+        )
+        .await
+        .expect("begin collection");
         tx.commit().await.expect("commit collection begin");
         ticket
     };
@@ -651,9 +675,13 @@ async fn incomplete_collection_does_not_publish_and_conflicting_evidence_wins() 
     tx.commit().await.expect("commit source registration");
     let ticket = {
         let mut tx = fixture.pool.begin().await.expect("begin collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-errors")
-            .await
-            .expect("begin collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-errors"),
+        )
+        .await
+        .expect("begin collection");
         tx.commit().await.expect("commit collection begin");
         ticket
     };
@@ -711,9 +739,13 @@ async fn rolling_back_a_finish_keeps_the_ticket_retryable() {
     tx.commit().await.expect("commit source registration");
     let ticket = {
         let mut tx = fixture.pool.begin().await.expect("begin collection");
-        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-rollback")
-            .await
-            .expect("begin collection");
+        let ticket = begin_collection(
+            &mut tx,
+            &fixture.beneficiary_id,
+            &attempt_id(&fixture, "collection-rollback"),
+        )
+        .await
+        .expect("begin collection");
         tx.commit().await.expect("commit collection begin");
         ticket
     };
