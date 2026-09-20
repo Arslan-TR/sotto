@@ -166,6 +166,23 @@ async fn corrupt_bindings(
     .expect("corrupt stored source bindings");
 }
 
+async fn corrupt_result(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    result: serde_json::Value,
+) {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET canonical_result = $3::jsonb \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(result.to_string())
+    .execute(&fixture.pool)
+    .await
+    .expect("corrupt stored collection result");
+}
+
 async fn head_revision(fixture: &Fixture) -> i64 {
     sqlx::query_scalar("SELECT revision FROM cloud_coverage_heads WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
@@ -254,6 +271,80 @@ async fn changed_stored_binding_fails_without_disclosing_as_a_ticket_conflict() 
             CorruptAttemptReason::BindingSourceSet
         ))
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn corrupt_completed_result_fails_before_classifying_a_changed_replay() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "corrupt-result")).await;
+    let observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let mut complete_tx = fixture.pool.begin().await.expect("begin completion");
+    finish_collection(
+        &mut complete_tx,
+        &ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("complete collection");
+    complete_tx.commit().await.expect("commit completion");
+    let original_head = head_revision(&fixture).await;
+    corrupt_result(
+        &fixture,
+        &ticket,
+        serde_json::json!({
+            "aggregate_evidence_reference": "aggregate-evidence",
+            "sources": []
+        }),
+    )
+    .await;
+
+    let mut finish_tx = fixture.pool.begin().await.expect("begin corrupt replay");
+    let changed = finish_collection(
+        &mut finish_tx,
+        &ticket,
+        "different-evidence",
+        &[SourceObservation::Unavailable {
+            source_id: source.source_id,
+            evidence_reference: "different-source-evidence".into(),
+            reason: UnavailableReason::ConflictingEvidence,
+        }],
+    )
+    .await;
+    finish_tx.commit().await.expect("commit corrupt replay");
+    assert!(matches!(
+        changed,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::ResultCanonical
+        ))
+    ));
+
+    let mut begin_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin corrupt ticket replay");
+    let replay = begin_collection(&mut begin_tx, &fixture.beneficiary_id, &ticket.attempt_id).await;
+    begin_tx
+        .commit()
+        .await
+        .expect("commit corrupt ticket replay");
+    assert!(matches!(
+        replay,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::ResultCanonical
+        ))
+    ));
+    assert_eq!(head_revision(&fixture).await, original_head);
     cleanup(&fixture).await;
 }
 

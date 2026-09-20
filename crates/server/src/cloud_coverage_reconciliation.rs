@@ -374,6 +374,7 @@ pub async fn begin_collection(
     if let Some(existing) = sqlx::query(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
                 expected_projection_revision, source_bindings::text AS source_bindings, status, \
+                aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
          FROM cloud_coverage_collection_attempts \
          WHERE beneficiary_id = $1 AND attempt_id = $2",
@@ -384,7 +385,7 @@ pub async fn begin_collection(
     .await?
     {
         let ticket = collection_ticket_from_row(&existing)?;
-        validate_stored_bindings(tx, &ticket).await?;
+        validate_stored_attempt(tx, &ticket, &existing).await?;
         return Ok(ticket);
     }
 
@@ -495,7 +496,7 @@ pub async fn finish_collection(
     .await?
     .ok_or(ReconciliationError::AttemptMissing)?;
     let stored_ticket = collection_ticket_from_row(&attempt)?;
-    validate_stored_bindings(tx, &stored_ticket).await?;
+    let stored_result = validate_stored_attempt(tx, &stored_ticket, &attempt).await?;
     if stored_ticket.beneficiary_id != ticket.beneficiary_id
         || stored_ticket.collection_epoch != ticket.collection_epoch
         || stored_ticket.source_set_generation != ticket.source_set_generation
@@ -516,10 +517,9 @@ pub async fn finish_collection(
         .map(|(canonical_result, _)| canonical_result)
         .map_err(|_| ReconciliationError::OperationConflict)?;
         let stored_evidence: String = attempt.try_get("aggregate_evidence_reference")?;
-        let stored_result: String = attempt.try_get("canonical_result")?;
         let completed_revision: i64 = attempt.try_get("projection_revision")?;
         if stored_evidence == aggregate_evidence_reference
-            && serde_json::from_str::<serde_json::Value>(&stored_result)? == canonical_result
+            && stored_result == Some(canonical_result)
         {
             return Ok(ReconciliationReceipt {
                 attempt_id: ticket.attempt_id.clone(),
@@ -861,6 +861,153 @@ async fn validate_stored_bindings(
     Ok(())
 }
 
+async fn validate_stored_attempt(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &CollectionTicket,
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<serde_json::Value>, ReconciliationError> {
+    validate_stored_bindings(tx, ticket).await?;
+    if ticket.status != CollectionStatus::Completed {
+        return Ok(None);
+    }
+    let evidence: String = row.try_get("aggregate_evidence_reference")?;
+    let result: String = row.try_get("canonical_result")?;
+    Ok(Some(validate_stored_result(ticket, &evidence, &result)?))
+}
+
+fn validate_stored_result(
+    ticket: &CollectionTicket,
+    evidence: &str,
+    stored_result: &str,
+) -> Result<serde_json::Value, ReconciliationError> {
+    if evidence.trim().is_empty() {
+        return Err(corrupt(CorruptAttemptReason::ResultEvidence));
+    }
+    let value: serde_json::Value = serde_json::from_str(stored_result)
+        .map_err(|_| corrupt(CorruptAttemptReason::ResultShape))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    if object.len() != 2
+        || !object.contains_key("aggregate_evidence_reference")
+        || !object.contains_key("sources")
+    {
+        return Err(corrupt(CorruptAttemptReason::ResultShape));
+    }
+    let stored_evidence = stored_string(
+        object,
+        "aggregate_evidence_reference",
+        CorruptAttemptReason::ResultShape,
+    )?;
+    if stored_evidence != evidence || stored_evidence.trim().is_empty() {
+        return Err(corrupt(CorruptAttemptReason::ResultEvidence));
+    }
+    let sources = object
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    let observations = sources
+        .iter()
+        .map(parse_stored_observation)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (canonical, _) = canonical_collection(
+        &ticket.beneficiary_id,
+        &ticket.source_bindings,
+        &observations,
+        evidence,
+    )
+    .map_err(|_| corrupt(CorruptAttemptReason::ResultCanonical))?;
+    if value != canonical {
+        return Err(corrupt(CorruptAttemptReason::ResultCanonical));
+    }
+    Ok(canonical)
+}
+
+fn parse_stored_observation(
+    value: &serde_json::Value,
+) -> Result<SourceObservation, ReconciliationError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    let status = stored_string(object, "status", CorruptAttemptReason::ResultShape)?;
+    let source_id = stored_string(object, "source_id", CorruptAttemptReason::ResultShape)?;
+    let evidence_reference = stored_string(
+        object,
+        "evidence_reference",
+        CorruptAttemptReason::ResultShape,
+    )?;
+    match status.as_str() {
+        "complete" => {
+            if object.len() != 4 || !object.contains_key("paid_intervals") {
+                return Err(corrupt(CorruptAttemptReason::ResultShape));
+            }
+            let intervals = object
+                .get("paid_intervals")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?
+                .iter()
+                .map(parse_stored_interval)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(SourceObservation::Complete {
+                source_id,
+                evidence_reference,
+                paid_intervals: intervals,
+            })
+        }
+        "unavailable" => {
+            if object.len() != 4 || !object.contains_key("reason") {
+                return Err(corrupt(CorruptAttemptReason::ResultShape));
+            }
+            let reason = match stored_string(object, "reason", CorruptAttemptReason::ResultShape)?
+                .as_str()
+            {
+                "needs_reconciliation" => UnavailableReason::NeedsReconciliation,
+                "conflicting_evidence" => UnavailableReason::ConflictingEvidence,
+                _ => return Err(corrupt(CorruptAttemptReason::ResultShape)),
+            };
+            Ok(SourceObservation::Unavailable {
+                source_id,
+                evidence_reference,
+                reason,
+            })
+        }
+        _ => Err(corrupt(CorruptAttemptReason::ResultShape)),
+    }
+}
+
+fn parse_stored_interval(
+    value: &serde_json::Value,
+) -> Result<ConfirmedPaidInterval, ReconciliationError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))?;
+    if object.len() != 5
+        || ![
+            "coverage_id",
+            "source_id",
+            "starts_at",
+            "paid_until",
+            "failed_renewal_id",
+        ]
+        .iter()
+        .all(|field| object.contains_key(*field))
+    {
+        return Err(corrupt(CorruptAttemptReason::ResultShape));
+    }
+    let failed_renewal_id = match object.get("failed_renewal_id") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => return Err(corrupt(CorruptAttemptReason::ResultShape)),
+    };
+    Ok(ConfirmedPaidInterval {
+        coverage_id: stored_string(object, "coverage_id", CorruptAttemptReason::ResultShape)?,
+        source_id: stored_string(object, "source_id", CorruptAttemptReason::ResultShape)?,
+        starts_at: stored_i64(object, "starts_at")?,
+        paid_until: stored_i64(object, "paid_until")?,
+        failed_renewal_id,
+    })
+}
+
 fn stored_string(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
@@ -871,6 +1018,16 @@ fn stored_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| corrupt(reason))
+}
+
+fn stored_i64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<i64, ReconciliationError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| corrupt(CorruptAttemptReason::ResultShape))
 }
 
 fn corrupt(reason: CorruptAttemptReason) -> ReconciliationError {
