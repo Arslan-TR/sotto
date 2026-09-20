@@ -59,11 +59,6 @@ async fn cleanup(fixture: &Fixture) {
         .execute(&fixture.pool)
         .await
         .expect("delete coverage facts");
-    sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
-        .await
-        .expect("delete coverage revisions");
     sqlx::query(
         "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
     )
@@ -81,6 +76,11 @@ async fn cleanup(fixture: &Fixture) {
         .execute(&fixture.pool)
         .await
         .expect("delete coverage sources");
+    sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
+        .bind(&fixture.beneficiary_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("delete coverage revisions");
     sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
@@ -96,7 +96,7 @@ async fn cleanup(fixture: &Fixture) {
 fn binding(fixture: &Fixture, source_id: &str, external: &str) -> SourceBinding {
     SourceBinding {
         beneficiary_id: fixture.beneficiary_id.clone(),
-        source_id: source_id.into(),
+        source_id: format!("{}:{source_id}", fixture.beneficiary_id),
         provider_namespace: format!("stripe:test:{}", fixture.beneficiary_id),
         external_allocation_reference: external.into(),
         ownership_evidence_reference: format!("evidence:{external}"),
