@@ -46,6 +46,22 @@ impl Fixture {
             beneficiary_id,
         })
     }
+
+    async fn add_beneficiary(&self) -> Self {
+        let beneficiary_id = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'reconciliation-test', $2)",
+        )
+        .bind(&beneficiary_id)
+        .bind(&beneficiary_id)
+        .execute(&self.pool)
+        .await
+        .expect("insert second reconciliation test user");
+        Self {
+            pool: self.pool.clone(),
+            beneficiary_id,
+        }
+    }
 }
 
 async fn cleanup(fixture: &Fixture) {
@@ -105,6 +121,67 @@ fn binding(fixture: &Fixture, source_id: &str, external: &str) -> SourceBinding 
 
 fn attempt_id(fixture: &Fixture, suffix: &str) -> String {
     format!("{}:{suffix}", fixture.beneficiary_id)
+}
+
+async fn register(fixture: &Fixture, source: &SourceBinding, operation_id: &str) {
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source registration");
+    register_source(&mut tx, operation_id, source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit source registration");
+}
+
+async fn begin(
+    fixture: &Fixture,
+    attempt_id: &str,
+) -> sotto_server::cloud_coverage_reconciliation::CollectionTicket {
+    let mut tx = fixture.pool.begin().await.expect("begin collection");
+    let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, attempt_id)
+        .await
+        .expect("begin collection");
+    tx.commit().await.expect("commit collection");
+    ticket
+}
+
+#[tokio::test]
+async fn beneficiaries_can_independently_use_the_same_attempt_id() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let first_source = binding(&first, "source", "allocation");
+    let second_source = binding(&second, "source", "allocation");
+    register(&first, &first_source, "registration").await;
+    register(&second, &second_source, "registration").await;
+
+    let first_ticket = begin(&first, "attempt").await;
+    let second_ticket = begin(&second, "attempt").await;
+    assert_eq!(first_ticket.attempt_id, second_ticket.attempt_id);
+    assert_ne!(first_ticket.beneficiary_id, second_ticket.beneficiary_id);
+
+    for (fixture, ticket, source) in [
+        (&first, first_ticket, first_source),
+        (&second, second_ticket, second_source),
+    ] {
+        let observation = SourceObservation::Complete {
+            source_id: source.source_id,
+            evidence_reference: "source-evidence".into(),
+            paid_intervals: vec![],
+        };
+        let mut tx = fixture.pool.begin().await.expect("begin collection finish");
+        finish_collection(&mut tx, &ticket, "collection-evidence", &[observation])
+            .await
+            .expect("finish collection");
+        tx.commit().await.expect("commit collection finish");
+        assert!(load(&fixture.pool, &fixture.beneficiary_id).await.is_ok());
+    }
+
+    cleanup(&second).await;
+    cleanup(&first).await;
 }
 
 #[tokio::test]

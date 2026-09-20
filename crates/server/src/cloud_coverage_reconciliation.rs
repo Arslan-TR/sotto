@@ -343,8 +343,10 @@ pub async fn begin_collection(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
                 expected_projection_revision, source_bindings::text AS source_bindings, status, \
                 projection_revision \
-         FROM cloud_coverage_collection_attempts WHERE attempt_id = $1",
+         FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
     )
+    .bind(beneficiary_id)
     .bind(attempt_id)
     .fetch_optional(&mut **tx)
     .await?
@@ -380,8 +382,9 @@ pub async fn begin_collection(
     if let Some(previous_attempt_id) = current_attempt_id {
         sqlx::query(
             "UPDATE cloud_coverage_collection_attempts SET status = 'superseded' \
-             WHERE attempt_id = $1 AND status = 'pending'",
+             WHERE beneficiary_id = $1 AND attempt_id = $2 AND status = 'pending'",
         )
+        .bind(beneficiary_id)
         .bind(previous_attempt_id)
         .execute(&mut **tx)
         .await?;
@@ -453,8 +456,10 @@ pub async fn finish_collection(
                 expected_projection_revision, source_bindings::text AS source_bindings, status, \
                 aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
-         FROM cloud_coverage_collection_attempts WHERE attempt_id = $1",
+         FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
     )
+    .bind(&ticket.beneficiary_id)
     .bind(&ticket.attempt_id)
     .fetch_optional(&mut **tx)
     .await?
@@ -531,8 +536,9 @@ pub async fn finish_collection(
         "UPDATE cloud_coverage_collection_attempts SET status = 'completed', \
          aggregate_evidence_reference = $2, canonical_result = $3::jsonb, \
          projection_revision = $4, completed_at = now() \
-         WHERE attempt_id = $1 AND status = 'pending'",
+         WHERE beneficiary_id = $1 AND attempt_id = $2 AND status = 'pending'",
     )
+    .bind(&ticket.beneficiary_id)
     .bind(&ticket.attempt_id)
     .bind(aggregate_evidence_reference)
     .bind(canonical_result_json)
