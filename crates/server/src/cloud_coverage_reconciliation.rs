@@ -101,6 +101,10 @@ pub enum ReconciliationError {
     EmptyOperationId,
     #[error("source registration conflicts with an existing binding")]
     RegistrationConflict,
+    #[error("existing coverage is not owned by the reconciliation coordinator")]
+    BootstrapConflict,
+    #[error("stored source registration receipt is incomplete")]
+    CorruptRegistration,
     #[error("source allocation is already bound to another beneficiary")]
     SourceBindingConflict,
     #[error("collection attempt_id must not be empty")]
@@ -149,6 +153,17 @@ pub async fn register_source(
     validate_operation_id(operation_id)?;
     validate_binding(binding)?;
 
+    let coordinator_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_coordinators WHERE beneficiary_id = $1)",
+    )
+    .bind(&binding.beneficiary_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let existing_projection_revision = current_revision(tx, &binding.beneficiary_id).await?;
+    if !coordinator_exists && existing_projection_revision.is_some() {
+        return Err(ReconciliationError::BootstrapConflict);
+    }
+
     sqlx::query(
         "INSERT INTO cloud_coverage_coordinators (beneficiary_id) VALUES ($1) \
          ON CONFLICT (beneficiary_id) DO NOTHING",
@@ -169,10 +184,14 @@ pub async fn register_source(
     let generation: i64 = coordinator
         .try_get("source_set_generation")
         .map_err(ReconciliationError::Database)?;
+    if generation == 0 && existing_projection_revision.is_some() {
+        return Err(ReconciliationError::BootstrapConflict);
+    }
 
     if let Some(row) = sqlx::query(
         "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
-                ownership_evidence_reference \
+                ownership_evidence_reference, registration_source_set_generation, \
+                registration_projection_revision \
          FROM cloud_coverage_sources \
          WHERE beneficiary_id = $1 AND registration_operation_id = $2",
     )
@@ -184,10 +203,15 @@ pub async fn register_source(
     {
         let stored = source_binding_from_row(&row)?;
         if &stored == binding {
+            let projection_revision: Option<i64> =
+                row.try_get("registration_projection_revision")?;
+            let Some(projection_revision) = projection_revision else {
+                return Err(ReconciliationError::CorruptRegistration);
+            };
             return Ok(RegistrationReceipt {
                 source_id: stored.source_id,
-                source_set_generation: generation,
-                projection_revision: current_revision(tx, &binding.beneficiary_id).await?,
+                source_set_generation: row.try_get("registration_source_set_generation")?,
+                projection_revision: Some(projection_revision),
                 outcome: RegistrationOutcome::AlreadyApplied,
             });
         }
@@ -222,8 +246,8 @@ pub async fn register_source(
     sqlx::query(
         "INSERT INTO cloud_coverage_sources \
          (source_id, beneficiary_id, provider_namespace, external_allocation_reference, \
-          ownership_evidence_reference, registration_operation_id) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+          ownership_evidence_reference, registration_operation_id, registration_source_set_generation) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&binding.source_id)
     .bind(&binding.beneficiary_id)
@@ -231,6 +255,7 @@ pub async fn register_source(
     .bind(&binding.external_allocation_reference)
     .bind(&binding.ownership_evidence_reference)
     .bind(operation_id)
+    .bind(next_generation)
     .execute(&mut **tx)
     .await
     .map_err(map_source_insert_error)?;
@@ -262,6 +287,15 @@ pub async fn register_source(
         &binding.ownership_evidence_reference,
         &unavailable_projection(),
     )
+    .await?;
+
+    sqlx::query(
+        "UPDATE cloud_coverage_sources SET registration_projection_revision = $2 \
+         WHERE source_id = $1",
+    )
+    .bind(&binding.source_id)
+    .bind(publication.revision)
+    .execute(&mut **tx)
     .await?;
 
     Ok(RegistrationReceipt {
@@ -522,6 +556,7 @@ fn canonical_collection(
     let mut canonical_observations = Vec::with_capacity(observations.len());
     let mut complete_facts = Vec::new();
     let mut fact_sources = BTreeMap::new();
+    let mut renewal_sources = BTreeMap::new();
     let mut unavailable_reason = None;
 
     for observation in observations {
@@ -550,6 +585,11 @@ fn canonical_collection(
                     paid_intervals: paid_intervals.clone(),
                 })?;
                 for interval in &normalised {
+                    if interval.source_id != *source_id {
+                        return Err(ReconciliationError::SourceObservationConflict(
+                            "coverage fact source_id does not match its registered source".into(),
+                        ));
+                    }
                     if fact_sources
                         .insert(interval.coverage_id.clone(), source_id.clone())
                         .is_some()
@@ -557,6 +597,16 @@ fn canonical_collection(
                         return Err(ReconciliationError::SourceObservationConflict(
                             "coverage_id appears in multiple sources".into(),
                         ));
+                    }
+                    if let Some(renewal_id) = interval.failed_renewal_id.as_deref() {
+                        if renewal_sources
+                            .insert(renewal_id.to_owned(), source_id.clone())
+                            .is_some()
+                        {
+                            return Err(ReconciliationError::SourceObservationConflict(
+                                "failed_renewal_id appears in multiple sources".into(),
+                            ));
+                        }
                     }
                 }
                 complete_facts.extend(normalised.iter().cloned());

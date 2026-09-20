@@ -148,8 +148,8 @@ async fn adding_a_source_invalidates_the_previous_completeness_claim() {
     let first_source = binding(&fixture, "source-1", "allocation-1");
     let second_source = binding(&fixture, "source-2", "allocation-2");
     for (operation, source) in [
-        ("registration-1", first_source),
-        ("registration-2", second_source),
+        ("registration-1", first_source.clone()),
+        ("registration-2", second_source.clone()),
     ] {
         let mut tx = fixture
             .pool
@@ -162,6 +162,18 @@ async fn adding_a_source_invalidates_the_previous_completeness_claim() {
         tx.commit().await.expect("commit source registration");
         assert_eq!(receipt.outcome, RegistrationOutcome::Applied);
     }
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin registration replay");
+    let replay = register_source(&mut tx, "registration-1", &first_source)
+        .await
+        .expect("replay first source registration");
+    tx.commit().await.expect("commit registration replay");
+    assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
+    assert_eq!(replay.source_set_generation, 1);
+    assert_eq!(replay.projection_revision, Some(1));
     let generation: i64 = sqlx::query_scalar(
         "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
     )
@@ -238,6 +250,48 @@ async fn registration_rejects_reusing_operation_for_changed_binding() {
         result,
         Err(ReconciliationError::RegistrationConflict)
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn registration_rejects_adopting_an_unmanaged_projection() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin unmanaged publication");
+    publish(
+        &mut tx,
+        &fixture.beneficiary_id,
+        None,
+        "unmanaged-publication",
+        "unmanaged-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish unmanaged projection");
+    tx.commit().await.expect("commit unmanaged projection");
+
+    let source = binding(&fixture, "source-1", "allocation-1");
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source registration");
+    let result = register_source(&mut tx, "registration-1", &source).await;
+    tx.rollback()
+        .await
+        .expect("rollback unmanaged registration");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::BootstrapConflict)
+    ));
+    assert!(load(&fixture.pool, &fixture.beneficiary_id).await.is_ok());
     cleanup(&fixture).await;
 }
 
@@ -392,7 +446,7 @@ async fn collection_combines_all_sources_in_canonical_order() {
             evidence_reference: "evidence-a".into(),
             paid_intervals: vec![ConfirmedPaidInterval {
                 coverage_id: "a".into(),
-                source_id: "payer-a".into(),
+                source_id: second_source.source_id.clone(),
                 starts_at: 30,
                 paid_until: 60,
                 failed_renewal_id: None,
@@ -403,13 +457,89 @@ async fn collection_combines_all_sources_in_canonical_order() {
             evidence_reference: "evidence-B".into(),
             paid_intervals: vec![ConfirmedPaidInterval {
                 coverage_id: "B".into(),
-                source_id: "payer-B".into(),
+                source_id: first_source.source_id.clone(),
                 starts_at: 0,
                 paid_until: 30,
                 failed_renewal_id: None,
             }],
         },
     ];
+    let wrong_provenance = vec![
+        SourceObservation::Complete {
+            source_id: second_source.source_id.clone(),
+            evidence_reference: "evidence-a".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "a".into(),
+                source_id: "unregistered-source".into(),
+                starts_at: 30,
+                paid_until: 60,
+                failed_renewal_id: None,
+            }],
+        },
+        observations[1].clone(),
+    ];
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin wrong provenance finish");
+    let result = finish_collection(
+        &mut tx,
+        &ticket,
+        "evidence-wrong-provenance",
+        &wrong_provenance,
+    )
+    .await;
+    tx.rollback()
+        .await
+        .expect("rollback wrong provenance finish");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::SourceObservationConflict(_))
+    ));
+    let conflicting_renewal = vec![
+        SourceObservation::Complete {
+            source_id: second_source.source_id.clone(),
+            evidence_reference: "evidence-a-renewal".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "a-renewal".into(),
+                source_id: second_source.source_id.clone(),
+                starts_at: 30,
+                paid_until: 60,
+                failed_renewal_id: Some("renewal-shared".into()),
+            }],
+        },
+        SourceObservation::Complete {
+            source_id: first_source.source_id.clone(),
+            evidence_reference: "evidence-B-renewal".into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "B-renewal".into(),
+                source_id: first_source.source_id.clone(),
+                starts_at: 0,
+                paid_until: 30,
+                failed_renewal_id: Some("renewal-shared".into()),
+            }],
+        },
+    ];
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin conflicting renewal finish");
+    let result = finish_collection(
+        &mut tx,
+        &ticket,
+        "evidence-conflicting-renewal",
+        &conflicting_renewal,
+    )
+    .await;
+    tx.rollback()
+        .await
+        .expect("rollback conflicting renewal finish");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::SourceObservationConflict(_))
+    ));
     let mut tx = fixture.pool.begin().await.expect("begin collection finish");
     finish_collection(&mut tx, &ticket, "evidence-all", &observations)
         .await

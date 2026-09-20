@@ -18,6 +18,10 @@ CREATE TABLE cloud_coverage_sources (
     ownership_evidence_reference    TEXT NOT NULL
         CHECK (btrim(ownership_evidence_reference) <> ''),
     registration_operation_id       TEXT NOT NULL CHECK (btrim(registration_operation_id) <> ''),
+    registration_source_set_generation BIGINT NOT NULL CHECK (registration_source_set_generation > 0),
+    registration_projection_revision  BIGINT CHECK (
+        registration_projection_revision IS NULL OR registration_projection_revision > 0
+    ),
     registered_at                   TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT cloud_coverage_sources_provider_allocation_key
         UNIQUE (provider_namespace, external_allocation_reference),
