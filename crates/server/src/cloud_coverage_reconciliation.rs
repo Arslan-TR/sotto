@@ -184,7 +184,10 @@ pub async fn register_source(
     let generation: i64 = coordinator
         .try_get("source_set_generation")
         .map_err(ReconciliationError::Database)?;
-    if generation == 0 && existing_projection_revision.is_some() {
+    // Re-read after taking the coordinator lock. A direct publisher can commit between the
+    // initial bootstrap check and the insert/lock above; the fresh value must not be adopted.
+    let expected_revision = current_revision(tx, &binding.beneficiary_id).await?;
+    if generation == 0 && expected_revision.is_some() {
         return Err(ReconciliationError::BootstrapConflict);
     }
 
@@ -241,7 +244,6 @@ pub async fn register_source(
     let next_generation = generation
         .checked_add(1)
         .ok_or(ReconciliationError::GenerationOverflow)?;
-    let expected_revision = current_revision(tx, &binding.beneficiary_id).await?;
 
     sqlx::query(
         "INSERT INTO cloud_coverage_sources \
