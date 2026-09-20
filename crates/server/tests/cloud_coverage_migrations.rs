@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, CollectionStatus, ReconciliationError, SourceBinding,
-    SourceObservation,
+    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
+    RegistrationOutcome, SourceBinding, SourceObservation,
 };
+use sotto_server::cloud_coverage_store::PublicationOutcome;
 use sotto_server::db;
 
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
@@ -313,6 +314,20 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
         evidence_reference: "legacy-evidence-a".into(),
         paid_intervals: vec![],
     };
+    let head_before_replay: i64 = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(&first)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read head before completed replay");
+    let revisions_before_replay: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+    )
+    .bind(&first)
+    .fetch_one(&database.pool)
+    .await
+    .expect("count revisions before completed replay");
     let mut tx = database
         .pool
         .begin()
@@ -328,6 +343,27 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     .expect("replay upgraded completed attempt");
     tx.commit().await.expect("commit completed replay");
     assert_eq!(replay.revision, 1);
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+        )
+        .bind(&first)
+        .fetch_one(&database.pool)
+        .await
+        .expect("read head after completed replay"),
+        head_before_replay
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+        )
+        .bind(&first)
+        .fetch_one(&database.pool)
+        .await
+        .expect("count revisions after completed replay"),
+        revisions_before_replay
+    );
 
     let mut tx = database
         .pool
@@ -339,6 +375,80 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
         .expect("load second beneficiary attempt");
     tx.commit().await.expect("commit second completed load");
     assert_eq!(second_completed.status, CollectionStatus::Completed);
+
+    sqlx::query("INSERT INTO cloud_coverage_revisions (beneficiary_id, revision, operation_id, evidence_reference, status, unavailable_reason, fact_count) VALUES ($1, 4, 'second-only-revision', 'second-only-evidence', 'unavailable', 'needs_reconciliation', 0)")
+        .bind(&second)
+        .execute(&database.pool)
+        .await
+        .expect("insert second-only revision for foreign key checks");
+    let first_source_json = serde_json::to_string(&[&first_binding]).expect("encode first source");
+
+    let mut tx = database
+        .pool
+        .begin()
+        .await
+        .expect("begin foreign current attempt");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = $2 WHERE beneficiary_id = $1",
+    )
+    .bind(&first)
+    .bind("legacy-completed-b")
+    .execute(&mut *tx)
+    .await
+    .expect("write foreign current attempt");
+    assert!(
+        tx.commit().await.is_err(),
+        "foreign current attempt committed"
+    );
+
+    let mut tx = database
+        .pool
+        .begin()
+        .await
+        .expect("begin foreign expected revision");
+    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status) VALUES ('foreign-expected-revision', $1, 10, 1, 4, $2::jsonb, 'pending')")
+        .bind(&first)
+        .bind(&first_source_json)
+        .execute(&mut *tx)
+        .await
+        .expect("write foreign expected revision");
+    assert!(
+        tx.commit().await.is_err(),
+        "foreign expected revision committed"
+    );
+
+    let mut tx = database
+        .pool
+        .begin()
+        .await
+        .expect("begin foreign completed revision");
+    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, source_bindings, status, aggregate_evidence_reference, canonical_result, projection_revision, completed_at) VALUES ('foreign-completed-revision', $1, 11, 1, $2::jsonb, 'completed', 'foreign-evidence', $3::jsonb, 4, now())")
+        .bind(&first)
+        .bind(&first_source_json)
+        .bind(canonical_result(
+            &first_binding,
+            "foreign-evidence",
+            "source-evidence",
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("write foreign completed revision");
+    assert!(
+        tx.commit().await.is_err(),
+        "foreign completed revision committed"
+    );
+
+    let mut tx = database.pool.begin().await.expect("begin duplicate epoch");
+    let duplicate_epoch = sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, source_bindings, status) VALUES ('duplicate-epoch', $1, 1, 1, $2::jsonb, 'pending')")
+        .bind(&first)
+        .bind(&first_source_json)
+        .execute(&mut *tx)
+        .await;
+    assert!(
+        duplicate_epoch.is_err(),
+        "duplicate beneficiary epoch committed"
+    );
+    tx.rollback().await.expect("rollback duplicate epoch");
 
     let mut tx = database
         .pool
@@ -356,6 +466,49 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
         .await
         .expect("scoped attempt identities accept same text");
     tx.commit().await.expect("commit scoped identity insert");
+
+    let fresh = DisposableDatabase::create()
+        .await
+        .expect("create fresh migration database");
+    db::migrate(&fresh.pool)
+        .await
+        .expect("migrate fresh database");
+    for beneficiary in ["fresh-beneficiary-a", "fresh-beneficiary-b"] {
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'migration-test', $1)",
+        )
+        .bind(beneficiary)
+        .execute(&fresh.pool)
+        .await
+        .expect("insert fresh beneficiary");
+        let source = binding(beneficiary, &format!("{beneficiary}:source"));
+        let mut tx = fresh.pool.begin().await.expect("begin fresh registration");
+        let receipt = register_source(&mut tx, "fresh-registration", &source)
+            .await
+            .expect("register fresh source");
+        tx.commit().await.expect("commit fresh registration");
+        assert_eq!(receipt.outcome, RegistrationOutcome::Applied);
+        let mut tx = fresh.pool.begin().await.expect("begin fresh collection");
+        let ticket = begin_collection(&mut tx, beneficiary, "same-attempt")
+            .await
+            .expect("begin same attempt on fresh beneficiary");
+        tx.commit().await.expect("commit fresh collection");
+        let mut tx = fresh.pool.begin().await.expect("begin fresh finish");
+        finish_collection(
+            &mut tx,
+            &ticket,
+            "fresh-aggregate",
+            &[SourceObservation::Complete {
+                source_id: source.source_id,
+                evidence_reference: "fresh-source-evidence".into(),
+                paid_intervals: vec![],
+            }],
+        )
+        .await
+        .expect("finish same attempt on fresh beneficiary");
+        tx.commit().await.expect("commit fresh finish");
+    }
+    fresh.cleanup().await;
 
     database.cleanup().await;
 }
