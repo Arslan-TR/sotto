@@ -1109,9 +1109,36 @@ async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
     .await
     .expect("finish deletion coverage collection");
     tx.commit().await.expect("commit coverage finish");
+    let mut tx = pool.begin().await.expect("begin pending deletion coverage");
+    let pending_ticket = begin_collection(&mut tx, &owner_id, "deletion-coverage-pending")
+        .await
+        .expect("begin pending deletion coverage");
+    tx.commit().await.expect("commit pending deletion coverage");
     let before = coverage_snapshot(&pool, &owner_id).await;
 
-    let operation_id = enter_retention(&pool, &org_id, &owner_id, "coverage-deletion-worker").await;
+    let tree = seed_project_tree(&pool, &org_id, &owner_id).await;
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request organisation deletion with coverage");
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let requested_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim requested deletion")
+        .expect("requested deletion is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start deletion billing phase")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim billing deletion")
+        .expect("billing deletion is due");
+    advance(&pool, &billing_lease, None)
+        .await
+        .expect("enter deletion retention")
+        .expect("retention transition");
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let operation_id = requested.id;
     age_deletion_for_purge(&pool, &operation_id).await;
     let retention_lease = claim_due(&pool, "coverage-deletion-worker")
         .await
@@ -1121,6 +1148,7 @@ async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
         .await
         .expect("enter coverage purge")
         .expect("purge transition");
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
     let purge_lease = claim_due(&pool, "coverage-deletion-worker")
         .await
         .expect("claim purge work")
@@ -1131,6 +1159,25 @@ async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
         .expect("completed purge transition");
 
     assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
+            .bind(&tree.project)
+            .fetch_one(&pool)
+            .await
+            .expect("read purged organisation project");
+    assert!(
+        !project_exists,
+        "organisation purge must remove its project tree"
+    );
+    let pending_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&owner_id)
+    .bind(&pending_ticket.attempt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read preserved pending coverage attempt");
+    assert_eq!(pending_status, "pending");
     let user_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
         .bind(&owner_id)
         .fetch_one(&pool)
