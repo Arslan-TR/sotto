@@ -183,6 +183,45 @@ pub fn evaluate(
 }
 
 fn eligible_intervals(coverage: &PersonCoverage) -> Result<Vec<EligibleInterval>, InvalidCoverage> {
+    let unique = normalise_confirmed_intervals(coverage)?;
+
+    let mut eligible = Vec::with_capacity(unique.len() * 2);
+    for interval in unique {
+        eligible.push(EligibleInterval {
+            starts_at: interval.starts_at,
+            ends_at: interval.paid_until,
+            kind: IntervalKind::Paid,
+            coverage_id: interval.coverage_id.clone(),
+        });
+        if interval.failed_renewal_id.is_some() {
+            eligible.push(EligibleInterval {
+                starts_at: interval.paid_until,
+                ends_at: interval
+                    .paid_until
+                    .checked_add(RENEWAL_RECOVERY_SECONDS)
+                    .ok_or(InvalidCoverage::RecoveryDeadlineOverflow)?,
+                kind: IntervalKind::Recovery,
+                coverage_id: interval.coverage_id,
+            });
+        }
+    }
+    eligible.sort_by(|left, right| {
+        left.starts_at
+            .cmp(&right.starts_at)
+            .then(left.ends_at.cmp(&right.ends_at))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.coverage_id.cmp(&right.coverage_id))
+    });
+    Ok(eligible)
+}
+
+/// Validate and deterministically de-duplicate confirmed coverage facts.
+///
+/// The storage projection uses this same function before writing a snapshot, so the pure
+/// evaluator and the durable loader agree on duplicate coverage and renewal identity rules.
+pub(crate) fn normalise_confirmed_intervals(
+    coverage: &PersonCoverage,
+) -> Result<Vec<ConfirmedPaidInterval>, InvalidCoverage> {
     if coverage.beneficiary_id.trim().is_empty() {
         return Err(InvalidCoverage::EmptyBeneficiary);
     }
@@ -230,34 +269,16 @@ fn eligible_intervals(coverage: &PersonCoverage) -> Result<Vec<EligibleInterval>
         }
     }
 
-    let mut eligible = Vec::with_capacity(unique.len() * 2);
-    for interval in unique.into_values() {
-        eligible.push(EligibleInterval {
-            starts_at: interval.starts_at,
-            ends_at: interval.paid_until,
-            kind: IntervalKind::Paid,
-            coverage_id: interval.coverage_id.clone(),
-        });
-        if interval.failed_renewal_id.is_some() {
-            eligible.push(EligibleInterval {
-                starts_at: interval.paid_until,
-                ends_at: interval
-                    .paid_until
-                    .checked_add(RENEWAL_RECOVERY_SECONDS)
-                    .ok_or(InvalidCoverage::RecoveryDeadlineOverflow)?,
-                kind: IntervalKind::Recovery,
-                coverage_id: interval.coverage_id,
-            });
-        }
-    }
-    eligible.sort_by(|left, right| {
-        left.starts_at
-            .cmp(&right.starts_at)
-            .then(left.ends_at.cmp(&right.ends_at))
-            .then(left.kind.cmp(&right.kind))
-            .then(left.coverage_id.cmp(&right.coverage_id))
+    let mut intervals: Vec<_> = unique.into_values().collect();
+    intervals.sort_by(|left, right| {
+        left.coverage_id
+            .cmp(&right.coverage_id)
+            .then(left.source_id.cmp(&right.source_id))
+            .then(left.starts_at.cmp(&right.starts_at))
+            .then(left.paid_until.cmp(&right.paid_until))
+            .then(left.failed_renewal_id.cmp(&right.failed_renewal_id))
     });
-    Ok(eligible)
+    Ok(intervals)
 }
 
 fn episodes(intervals: &[EligibleInterval]) -> Vec<Episode> {
