@@ -855,6 +855,7 @@ mod tests {
             server_url: Some("https://api.sotto.dev".into()),
             web_url: Some("https://app.sotto.dev".into()),
             theme: None,
+            last_user_id: None,
         }
         .save_to(&config_path)
         .unwrap();

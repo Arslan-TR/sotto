@@ -64,6 +64,14 @@ pub enum Error {
     #[error("server error: {0}")]
     Server(String),
 
+    /// The server answered the login callback with a legacy session value instead of a
+    /// single-use login code. Distinct from [`Error::Server`] so the accept loop can fail
+    /// fast with the actionable message rather than waiting out the deadline.
+    #[error(
+        "server error: server returned a session token instead of a login code - upgrade the server to one that speaks login codes"
+    )]
+    LegacyServer,
+
     /// The server authenticated the caller but refused the action (HTTP 403) - e.g. a plain org
     /// member attempting a structural change that needs admin+.
     #[error("forbidden: {0}")]
@@ -81,7 +89,7 @@ impl Error {
             Error::NotFound(_) | Error::NoConfig(_) => 3,
             Error::Locked | Error::Crypto | Error::NoIdentity => 4,
             Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
-            Error::Network(_) | Error::Server(_) | Error::Forbidden(_) => 5,
+            Error::Network(_) | Error::Server(_) | Error::Forbidden(_) | Error::LegacyServer => 5,
             Error::Conflict(_) => 6,
             Error::Config(_) | Error::AlreadyInitialized | Error::Input(_) => 1,
         }
