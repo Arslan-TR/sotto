@@ -326,7 +326,8 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
     let facts = sqlx::query(
         "SELECT coverage_id, source_id, starts_at, paid_until, failed_renewal_id \
          FROM cloud_coverage_revision_facts \
-         WHERE beneficiary_id = $1 AND revision = $2 ORDER BY coverage_id",
+         WHERE beneficiary_id = $1 AND revision = $2 \
+         ORDER BY coverage_id COLLATE \"C\"",
     )
     .bind(beneficiary_id)
     .bind(revision)
@@ -434,7 +435,7 @@ async fn load_operation(
     let facts = sqlx::query(
         "SELECT coverage_id, source_id, starts_at, paid_until, failed_renewal_id \
          FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 AND revision = $2 \
-         ORDER BY coverage_id",
+         ORDER BY coverage_id COLLATE \"C\"",
     )
     .bind(beneficiary_id)
     .bind(revision)
