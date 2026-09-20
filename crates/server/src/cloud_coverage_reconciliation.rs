@@ -391,7 +391,7 @@ pub async fn begin_collection(
 
     let source_rows = sqlx::query(
         "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
-                ownership_evidence_reference \
+                ownership_evidence_reference, registration_source_set_generation \
          FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id COLLATE \"C\"",
     )
     .bind(beneficiary_id)
@@ -855,7 +855,16 @@ async fn validate_stored_bindings(
         .iter()
         .map(source_binding_from_row)
         .collect::<Result<Vec<_>, _>>()?;
-    if authoritative.is_empty() || authoritative != ticket.source_bindings {
+    let latest_generation = rows
+        .iter()
+        .map(|row| row.try_get("registration_source_set_generation"))
+        .collect::<Result<Vec<i64>, sqlx::Error>>()?
+        .into_iter()
+        .max();
+    if latest_generation != Some(ticket.source_set_generation)
+        || authoritative.is_empty()
+        || authoritative != ticket.source_bindings
+    {
         return Err(corrupt(CorruptAttemptReason::BindingSourceSet));
     }
     Ok(())

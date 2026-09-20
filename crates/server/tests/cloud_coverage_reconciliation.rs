@@ -183,6 +183,23 @@ async fn corrupt_result(
     .expect("corrupt stored collection result");
 }
 
+async fn corrupt_generation(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    generation: i64,
+) {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET source_set_generation = $3 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(generation)
+    .execute(&fixture.pool)
+    .await
+    .expect("corrupt stored source generation");
+}
+
 async fn head_revision(fixture: &Fixture) -> i64 {
     sqlx::query_scalar(
         "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
@@ -273,6 +290,40 @@ async fn changed_stored_binding_fails_without_disclosing_as_a_ticket_conflict() 
             CorruptAttemptReason::BindingSourceSet
         ))
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn stored_attempt_requires_an_exact_source_generation_snapshot() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source", "allocation");
+    register(&fixture, &source, "registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "missing-generation")).await;
+    corrupt_generation(&fixture, &ticket, ticket.source_set_generation + 1).await;
+
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin corrupt generation replay");
+    let replay = begin_collection(&mut tx, &fixture.beneficiary_id, &ticket.attempt_id).await;
+    tx.commit().await.expect("commit corrupt generation replay");
+    assert!(matches!(
+        replay,
+        Err(ReconciliationError::CorruptAttempt(
+            CorruptAttemptReason::BindingSourceSet
+        ))
+    ));
+    let coordinator_generation: i64 = sqlx::query_scalar(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read source generation after corrupt replay");
+    assert_eq!(coordinator_generation, ticket.source_set_generation);
     cleanup(&fixture).await;
 }
 
