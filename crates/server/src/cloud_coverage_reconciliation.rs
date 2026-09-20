@@ -705,7 +705,7 @@ fn map_source_insert_error(error: sqlx::Error) -> ReconciliationError {
                 database.constraint(),
                 Some(
                     "cloud_coverage_sources_provider_allocation_key"
-                        | "cloud_coverage_sources_source_id_key"
+                        | "cloud_coverage_sources_pkey"
                 )
             )
     );
