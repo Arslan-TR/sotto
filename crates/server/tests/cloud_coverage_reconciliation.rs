@@ -482,3 +482,121 @@ async fn direct_projection_change_rejects_a_stale_collection() {
     ));
     cleanup(&fixture).await;
 }
+
+#[tokio::test]
+async fn incomplete_collection_does_not_publish_and_conflicting_evidence_wins() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source-1", "allocation-1");
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source registration");
+    register_source(&mut tx, "registration-1", &source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit source registration");
+    let ticket = {
+        let mut tx = fixture.pool.begin().await.expect("begin collection");
+        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-errors")
+            .await
+            .expect("begin collection");
+        tx.commit().await.expect("commit collection begin");
+        ticket
+    };
+    let mut tx = fixture.pool.begin().await.expect("begin incomplete finish");
+    let result = finish_collection(&mut tx, &ticket, "evidence-incomplete", &[]).await;
+    tx.rollback().await.expect("rollback incomplete finish");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::SourceBatchMismatch)
+    ));
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::NeedsReconciliation
+        ))
+    ));
+
+    let observation = SourceObservation::Unavailable {
+        source_id: source.source_id,
+        evidence_reference: "evidence-conflict".into(),
+        reason: UnavailableReason::ConflictingEvidence,
+    };
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin unavailable finish");
+    finish_collection(&mut tx, &ticket, "evidence-conflict", &[observation])
+        .await
+        .expect("finish conflicting collection");
+    tx.commit().await.expect("commit unavailable finish");
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::ConflictingEvidence
+        ))
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn rolling_back_a_finish_keeps_the_ticket_retryable() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "source-1", "allocation-1");
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source registration");
+    register_source(&mut tx, "registration-1", &source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit source registration");
+    let ticket = {
+        let mut tx = fixture.pool.begin().await.expect("begin collection");
+        let ticket = begin_collection(&mut tx, &fixture.beneficiary_id, "collection-rollback")
+            .await
+            .expect("begin collection");
+        tx.commit().await.expect("commit collection begin");
+        ticket
+    };
+    let observation = SourceObservation::Complete {
+        source_id: source.source_id,
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin rolled-back finish");
+    finish_collection(
+        &mut tx,
+        &ticket,
+        "evidence-rollback",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("finish before rollback");
+    tx.rollback().await.expect("rollback finish");
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::NeedsReconciliation
+        ))
+    ));
+
+    let mut tx = fixture.pool.begin().await.expect("begin retried finish");
+    let receipt = finish_collection(&mut tx, &ticket, "evidence-rollback", &[observation])
+        .await
+        .expect("retry finish after rollback");
+    tx.commit().await.expect("commit retried finish");
+    assert_eq!(receipt.revision, 2);
+    cleanup(&fixture).await;
+}
