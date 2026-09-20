@@ -483,6 +483,35 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
     );
     assert_eq!(replay.revision, receipt.revision);
 
+    let mut tx = fixture.pool.begin().await.expect("begin later publication");
+    publish(
+        &mut tx,
+        &fixture.beneficiary_id,
+        Some(receipt.revision),
+        "later-publication",
+        "later-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish later projection");
+    tx.commit().await.expect("commit later publication");
+
+    let mut tx = fixture.pool.begin().await.expect("begin stale replay");
+    let stale_replay = finish_collection(&mut tx, &ticket, "collection-evidence-1", &observations)
+        .await
+        .expect("replay original collection after a later revision");
+    tx.commit().await.expect("commit stale replay");
+    assert_eq!(stale_replay.revision, receipt.revision);
+    assert_eq!(
+        load(&fixture.pool, &fixture.beneficiary_id)
+            .await
+            .expect("load later projection")
+            .revision,
+        receipt.revision + 1
+    );
+
     let mut tx = fixture
         .pool
         .begin()
@@ -563,6 +592,47 @@ async fn a_new_collection_supersedes_an_older_pending_attempt() {
     .await
     .expect("read superseded attempt status");
     assert_eq!(status, "superseded");
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn a_new_source_supersedes_a_pending_collection() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let first_source = binding(&fixture, "first", "allocation-first");
+    let second_source = binding(&fixture, "second", "allocation-second");
+    register(&fixture, &first_source, "registration-first").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "pending")).await;
+
+    register(&fixture, &second_source, "registration-second").await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read source invalidated attempt");
+    assert_eq!(status, "superseded");
+
+    let observation = SourceObservation::Unavailable {
+        source_id: first_source.source_id,
+        evidence_reference: "source-evidence".into(),
+        reason: UnavailableReason::NeedsReconciliation,
+    };
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin stale source finish");
+    let result = finish_collection(&mut tx, &ticket, "aggregate-evidence", &[observation]).await;
+    tx.rollback().await.expect("rollback stale source finish");
+    assert!(matches!(
+        result,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
     cleanup(&fixture).await;
 }
 
