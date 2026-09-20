@@ -153,8 +153,8 @@ async fn complete_facts_round_trip_and_exact_replay_is_idempotent() {
         return;
     };
     let facts = vec![
-        recovery("renewal", "personal", 0, 30 * DAY, "renewal-1"),
-        paid("future", "sponsor", 40 * DAY, 70 * DAY),
+        paid("B", "sponsor", 0, 30 * DAY),
+        paid("a", "sponsor", 40 * DAY, 70 * DAY),
     ];
     let first = committed_publish(
         &fixture,
@@ -191,7 +191,8 @@ async fn complete_facts_round_trip_and_exact_replay_is_idempotent() {
         .expect("load complete projection");
     assert_eq!(loaded.revision, 1);
     assert_eq!(loaded.coverage.paid_intervals.len(), 2);
-    assert_eq!(loaded.coverage.paid_intervals[0].coverage_id, "future");
+    assert_eq!(loaded.coverage.paid_intervals[0].coverage_id, "B");
+    assert_eq!(loaded.coverage.paid_intervals[1].coverage_id, "a");
     cleanup(&fixture).await;
 }
 
@@ -266,6 +267,19 @@ async fn operation_conflict_and_stale_replay_cannot_rewind_head() {
         committed_publish(
             &fixture,
             None,
+            "operation-1",
+            "evidence-1",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![paid("different-facts", "personal", 0, 30 * DAY)],
+            },
+        )
+        .await,
+        Err(StoreError::OperationConflict)
+    ));
+    assert!(matches!(
+        committed_publish(
+            &fixture,
+            None,
             "stale-operation",
             "stale-evidence",
             &first_projection,
@@ -312,7 +326,9 @@ async fn invalid_publication_does_not_create_a_head() {
             sotto_server::cloud_coverage::InvalidCoverage::InvalidInterval
         ))
     ));
-    tx.rollback().await.expect("rollback invalid publication");
+    tx.commit()
+        .await
+        .expect("commit invalid publication transaction");
     assert!(matches!(
         load(&fixture.pool, &fixture.beneficiary_id).await,
         Err(StoreError::ProjectionMissing)
