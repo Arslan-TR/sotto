@@ -184,11 +184,13 @@ async fn corrupt_result(
 }
 
 async fn head_revision(fixture: &Fixture) -> i64 {
-    sqlx::query_scalar("SELECT revision FROM cloud_coverage_heads WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .fetch_one(&fixture.pool)
-        .await
-        .expect("read coverage head revision")
+    sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read coverage head revision")
 }
 
 #[tokio::test]
