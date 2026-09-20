@@ -8,10 +8,15 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use sotto_server::auth::session;
+use sotto_server::cloud_coverage::ConfirmedPaidInterval;
+use sotto_server::cloud_coverage_reconciliation::{
+    begin_collection, finish_collection, register_source, SourceBinding, SourceObservation,
+};
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::state::AppState;
@@ -21,6 +26,63 @@ async fn pool_or_skip() -> Option<PgPool> {
     let pool = db::connect(&url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
     Some(pool)
+}
+
+async fn coverage_snapshot(pool: &PgPool, beneficiary_id: &str) -> Vec<Vec<serde_json::Value>> {
+    let queries = [
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_coordinators WHERE beneficiary_id = $1) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY attempt_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 ORDER BY revision, coverage_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_heads WHERE beneficiary_id = $1) t",
+    ];
+    let mut snapshots = Vec::with_capacity(queries.len());
+    for query in queries {
+        snapshots.push(
+            sqlx::query(query)
+                .bind(beneficiary_id)
+                .fetch_all(pool)
+                .await
+                .expect("read coverage snapshot")
+                .into_iter()
+                .map(|row| row.try_get("value").expect("decode coverage snapshot"))
+                .collect(),
+        );
+    }
+    snapshots
+}
+
+async fn cleanup_coverage(pool: &PgPool, beneficiary_id: &str) {
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage head");
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage facts");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("clear coverage current attempt");
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_revisions",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(beneficiary_id)
+            .execute(pool)
+            .await
+            .expect("delete coverage fixture");
+    }
 }
 
 fn app(pool: PgPool) -> Router {
@@ -277,4 +339,118 @@ async fn reset_requires_an_initialized_account() {
         .0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("rec-coverage-{suffix}");
+    let token = fresh_session(&pool, &user_id, &format!("{user_id}-subject")).await;
+    let (status, body) = send(&pool, "PUT", "/account", &token, Some(bundle_body("old"))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let source = SourceBinding {
+        beneficiary_id: user_id.clone(),
+        source_id: format!("{user_id}:source"),
+        provider_namespace: "recovery-test".into(),
+        external_allocation_reference: format!("allocation-{suffix}"),
+        ownership_evidence_reference: format!("ownership-{suffix}"),
+    };
+    let mut tx = pool.begin().await.expect("begin coverage registration");
+    register_source(&mut tx, "recovery-registration", &source)
+        .await
+        .expect("register coverage source");
+    tx.commit().await.expect("commit coverage registration");
+
+    let mut tx = pool.begin().await.expect("begin completed coverage");
+    let completed_ticket = begin_collection(&mut tx, &user_id, "recovery-completed")
+        .await
+        .expect("begin completed coverage");
+    tx.commit().await.expect("commit completed begin");
+    let completed_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "recovery-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 10,
+            paid_until: 20,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut tx = pool.begin().await.expect("begin completed finish");
+    finish_collection(
+        &mut tx,
+        &completed_ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&completed_observation),
+    )
+    .await
+    .expect("finish completed coverage");
+    tx.commit().await.expect("commit completed coverage");
+
+    let mut tx = pool.begin().await.expect("begin pending coverage");
+    let pending_ticket = begin_collection(&mut tx, &user_id, "recovery-pending")
+        .await
+        .expect("begin pending coverage");
+    tx.commit().await.expect("commit pending begin");
+    let before_reset = coverage_snapshot(&pool, &user_id).await;
+
+    let (status, body) = send(
+        &pool,
+        "POST",
+        "/account/reset",
+        &token,
+        Some(bundle_body("new")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(coverage_snapshot(&pool, &user_id).await, before_reset);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin completed replay after reset");
+    finish_collection(
+        &mut tx,
+        &completed_ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&completed_observation),
+    )
+    .await
+    .expect("replay completed coverage after reset");
+    tx.commit()
+        .await
+        .expect("commit completed replay after reset");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin pending finish after reset");
+    finish_collection(
+        &mut tx,
+        &pending_ticket,
+        "aggregate-evidence-after-reset",
+        &[SourceObservation::Unavailable {
+            source_id: source.source_id.clone(),
+            evidence_reference: "source-evidence-after-reset".into(),
+            reason: sotto_server::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
+        }],
+    )
+    .await
+    .expect("finish pending coverage after reset");
+    tx.commit()
+        .await
+        .expect("commit pending finish after reset");
+
+    cleanup_coverage(&pool, &user_id).await;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("delete recovery coverage user");
 }
