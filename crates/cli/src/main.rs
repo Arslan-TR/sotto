@@ -1077,17 +1077,31 @@ fn login(
 
     // Preserve a previously configured web URL and theme unless this login overrides it.
     let existing = remote::config::GlobalConfig::load_from(&config_path)?;
-    login_config(existing.as_ref(), server.clone(), web_override).save_to(&config_path)?;
+    if let Some(prev) = existing.as_ref().and_then(|c| c.last_user_id.clone()) {
+        // An unexpected account here is the visible signal of a planted login (S-10): warn
+        // loudly, but continue - switching accounts on purpose must keep working.
+        if prev != me.user_id {
+            eprintln!(
+                "WARNING: the previous login here was user {prev}, but this login is user {}. \
+                 If you did not switch accounts, do not push any secrets and investigate before continuing.",
+                me.user_id
+            );
+        }
+    }
+    login_config(existing.as_ref(), server.clone(), web_override, &me.user_id)
+        .save_to(&config_path)?;
     eprintln!("logged in to {server} (user {})", me.user_id);
     Ok(())
 }
 
 /// Build the config `login` persists: the verified server URL, the new `--web` origin or the
-/// kept one, and whatever theme was already saved. Login must never reset the user's theme.
+/// kept one, whatever theme was already saved, and the freshly authenticated user id. Login must
+/// never reset the user's theme.
 fn login_config(
     existing: Option<&remote::config::GlobalConfig>,
     server: String,
     web_override: Option<&str>,
+    user_id: &str,
 ) -> remote::config::GlobalConfig {
     let (existing_web, existing_theme) = existing
         .map(|c| (c.web_url.clone(), c.theme.clone()))
@@ -1098,6 +1112,7 @@ fn login_config(
             .map(|w| w.trim_end_matches('/').to_string())
             .or(existing_web),
         theme: existing_theme,
+        last_user_id: Some(user_id.to_string()),
     }
 }
 
@@ -1916,24 +1931,34 @@ mod tests {
             server_url: Some("https://old.example".into()),
             web_url: Some("https://app.example".into()),
             theme: Some("sordino".into()),
+            last_user_id: Some("user-old".into()),
         };
-        let merged = login_config(Some(&existing), "https://new.example".into(), None);
+        let merged = login_config(
+            Some(&existing),
+            "https://new.example".into(),
+            None,
+            "user-1",
+        );
         assert_eq!(merged.server_url.as_deref(), Some("https://new.example"));
         assert_eq!(merged.web_url.as_deref(), Some("https://app.example"));
         assert_eq!(merged.theme.as_deref(), Some("sordino"));
+        assert_eq!(merged.last_user_id.as_deref(), Some("user-1"));
 
         // A --web override wins and still keeps the theme; a fresh login starts clean.
         let merged = login_config(
             Some(&existing),
             "https://new.example".into(),
             Some("https://w.example/"),
+            "user-1",
         );
         assert_eq!(merged.web_url.as_deref(), Some("https://w.example"));
         assert_eq!(merged.theme.as_deref(), Some("sordino"));
+        assert_eq!(merged.last_user_id.as_deref(), Some("user-1"));
 
-        let fresh = login_config(None, "https://new.example".into(), None);
+        let fresh = login_config(None, "https://new.example".into(), None, "user-1");
         assert_eq!(fresh.theme, None);
         assert_eq!(fresh.web_url, None);
+        assert_eq!(fresh.last_user_id.as_deref(), Some("user-1"));
     }
 
     #[test]

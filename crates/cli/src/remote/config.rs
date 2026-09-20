@@ -28,6 +28,10 @@ pub struct GlobalConfig {
     /// Active CLI theme (e.g. "nord", "sordino", "terminal", "monochrome", "tokyo-night").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// User id from the last successful `login`, so a surprising account change warns loudly
+    /// (S-10). An opaque id, not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_id: Option<String>,
 }
 
 impl GlobalConfig {
@@ -112,6 +116,7 @@ mod tests {
             server_url: Some("https://api.sotto.dev".into()),
             web_url: Some("https://app.sotto.dev".into()),
             theme: None,
+            last_user_id: Some("user-1".into()),
         };
         config.save_to(&path).unwrap();
         assert_eq!(GlobalConfig::load_from(&path).unwrap().unwrap(), config);
@@ -167,6 +172,7 @@ mod tests {
             server_url: Some("https://self.hosted".into()),
             web_url: None,
             theme: None,
+            last_user_id: None,
         }
         .save_to(&path)
         .unwrap();

@@ -2776,6 +2776,7 @@ dependencies = [
  "sotto-core",
  "sotto-server",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",
