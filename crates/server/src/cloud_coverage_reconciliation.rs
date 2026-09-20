@@ -146,6 +146,7 @@ pub enum CorruptAttemptReason {
     BindingShape,
     BindingOwnership,
     BindingSourceSet,
+    CompletionReceipt,
     ResultShape,
     ResultEvidence,
     ResultCanonical,
@@ -157,6 +158,7 @@ impl fmt::Display for CorruptAttemptReason {
             Self::BindingShape => "source bindings",
             Self::BindingOwnership => "source binding ownership",
             Self::BindingSourceSet => "registered source snapshot",
+            Self::CompletionReceipt => "completion receipt",
             Self::ResultShape => "collection result shape",
             Self::ResultEvidence => "collection result evidence",
             Self::ResultCanonical => "collection result canonical form",
@@ -496,7 +498,7 @@ pub async fn finish_collection(
     .await?
     .ok_or(ReconciliationError::AttemptMissing)?;
     let stored_ticket = collection_ticket_from_row(&attempt)?;
-    let stored_result = validate_stored_attempt(tx, &stored_ticket, &attempt).await?;
+    let stored_completion = validate_stored_attempt(tx, &stored_ticket, &attempt).await?;
     if stored_ticket.beneficiary_id != ticket.beneficiary_id
         || stored_ticket.collection_epoch != ticket.collection_epoch
         || stored_ticket.source_set_generation != ticket.source_set_generation
@@ -516,14 +518,15 @@ pub async fn finish_collection(
         )
         .map(|(canonical_result, _)| canonical_result)
         .map_err(|_| ReconciliationError::OperationConflict)?;
-        let stored_evidence: String = attempt.try_get("aggregate_evidence_reference")?;
-        let completed_revision: i64 = attempt.try_get("projection_revision")?;
-        if stored_evidence == aggregate_evidence_reference
-            && stored_result == Some(canonical_result)
+        let Some(stored_completion) = stored_completion else {
+            return Err(corrupt(CorruptAttemptReason::CompletionReceipt));
+        };
+        if stored_completion.evidence == aggregate_evidence_reference
+            && stored_completion.canonical_result == canonical_result
         {
             return Ok(ReconciliationReceipt {
                 attempt_id: ticket.attempt_id.clone(),
-                revision: completed_revision,
+                revision: stored_completion.revision,
                 outcome: PublicationOutcome::AlreadyApplied,
             });
         }
@@ -874,14 +877,45 @@ async fn validate_stored_attempt(
     tx: &mut Transaction<'_, Postgres>,
     ticket: &CollectionTicket,
     row: &sqlx::postgres::PgRow,
-) -> Result<Option<serde_json::Value>, ReconciliationError> {
+) -> Result<Option<StoredCompletionReceipt>, ReconciliationError> {
     validate_stored_bindings(tx, ticket).await?;
-    if ticket.status != CollectionStatus::Completed {
-        return Ok(None);
+    let receipt = stored_completion_receipt(
+        ticket.status,
+        row.try_get("aggregate_evidence_reference")?,
+        row.try_get("canonical_result")?,
+        row.try_get("projection_revision")?,
+    )?;
+    receipt
+        .map(|(evidence, result, revision)| {
+            let canonical_result = validate_stored_result(ticket, &evidence, &result)?;
+            Ok(StoredCompletionReceipt {
+                evidence,
+                canonical_result,
+                revision,
+            })
+        })
+        .transpose()
+}
+
+struct StoredCompletionReceipt {
+    evidence: String,
+    canonical_result: serde_json::Value,
+    revision: i64,
+}
+
+fn stored_completion_receipt(
+    status: CollectionStatus,
+    evidence: Option<String>,
+    result: Option<String>,
+    revision: Option<i64>,
+) -> Result<Option<(String, String, i64)>, ReconciliationError> {
+    match (status, evidence, result, revision) {
+        (CollectionStatus::Completed, Some(evidence), Some(result), Some(revision)) => {
+            Ok(Some((evidence, result, revision)))
+        }
+        (CollectionStatus::Pending | CollectionStatus::Superseded, None, None, None) => Ok(None),
+        _ => Err(corrupt(CorruptAttemptReason::CompletionReceipt)),
     }
-    let evidence: String = row.try_get("aggregate_evidence_reference")?;
-    let result: String = row.try_get("canonical_result")?;
-    Ok(Some(validate_stored_result(ticket, &evidence, &result)?))
 }
 
 fn validate_stored_result(
@@ -1109,5 +1143,58 @@ fn projection_outcome(outcome: PublicationOutcome) -> RegistrationOutcome {
 fn unavailable_projection() -> CoverageProjection {
     CoverageProjection::Unavailable {
         reason: UnavailableReason::NeedsReconciliation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_receipts_require_all_fields_for_completed_attempts() {
+        let valid = stored_completion_receipt(
+            CollectionStatus::Completed,
+            Some("aggregate-evidence".into()),
+            Some("{}".into()),
+            Some(1),
+        )
+        .expect("accept complete receipt")
+        .expect("return complete receipt");
+        assert_eq!(valid, ("aggregate-evidence".into(), "{}".into(), 1));
+
+        for (evidence, result, revision) in [
+            (None, Some("{}".into()), Some(1)),
+            (Some("aggregate-evidence".into()), None, Some(1)),
+            (Some("aggregate-evidence".into()), Some("{}".into()), None),
+        ] {
+            assert!(matches!(
+                stored_completion_receipt(CollectionStatus::Completed, evidence, result, revision),
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::CompletionReceipt
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_and_superseded_attempts_reject_completion_receipts() {
+        for status in [CollectionStatus::Pending, CollectionStatus::Superseded] {
+            assert_eq!(
+                stored_completion_receipt(status, None, None, None)
+                    .expect("accept empty incomplete receipt"),
+                None
+            );
+            assert!(matches!(
+                stored_completion_receipt(
+                    status,
+                    Some("aggregate-evidence".into()),
+                    Some("{}".into()),
+                    Some(1),
+                ),
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::CompletionReceipt
+                ))
+            ));
+        }
     }
 }
