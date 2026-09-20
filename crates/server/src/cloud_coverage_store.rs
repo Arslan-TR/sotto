@@ -126,6 +126,7 @@ struct StoredOperation {
 ///
 /// The returned receipt is not durable until the caller commits `tx`. The beneficiary head and
 /// immutable revision are changed atomically within that transaction.
+/// Callers must roll back `tx` whenever this function returns an error.
 pub async fn publish(
     tx: &mut Transaction<'_, Postgres>,
     beneficiary_id: &str,
