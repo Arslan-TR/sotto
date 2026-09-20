@@ -64,6 +64,13 @@ async fn cleanup(fixture: &Fixture) {
         .execute(&fixture.pool)
         .await
         .expect("delete coverage revisions");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("clear current collection attempt");
     sqlx::query("DELETE FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
