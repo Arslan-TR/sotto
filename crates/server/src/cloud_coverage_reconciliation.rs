@@ -121,6 +121,8 @@ pub enum ReconciliationError {
     CollectionConflict,
     #[error("collection operation conflicts with a completed replay")]
     OperationConflict,
+    #[error("stored collection attempt is corrupt: {0}")]
+    CorruptAttempt(CorruptAttemptReason),
     #[error("collection source batch does not match the registered source set")]
     SourceBatchMismatch,
     #[error("source observations conflict: {0}")]
@@ -133,6 +135,33 @@ pub enum ReconciliationError {
     GenerationOverflow,
     #[error("serialised reconciliation value is invalid: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+/// The durable collection field that failed validation.
+///
+/// These categories deliberately do not include stored values. They are safe to surface to an
+/// operator without exposing provider identifiers or evidence references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptAttemptReason {
+    BindingShape,
+    BindingOwnership,
+    BindingSourceSet,
+    ResultShape,
+    ResultEvidence,
+    ResultCanonical,
+}
+
+impl fmt::Display for CorruptAttemptReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BindingShape => "source bindings",
+            Self::BindingOwnership => "source binding ownership",
+            Self::BindingSourceSet => "registered source snapshot",
+            Self::ResultShape => "collection result shape",
+            Self::ResultEvidence => "collection result evidence",
+            Self::ResultCanonical => "collection result canonical form",
+        })
+    }
 }
 
 impl fmt::Display for RegistrationOutcome {
@@ -354,7 +383,9 @@ pub async fn begin_collection(
     .fetch_optional(&mut **tx)
     .await?
     {
-        return collection_ticket_from_row(&existing);
+        let ticket = collection_ticket_from_row(&existing)?;
+        validate_stored_bindings(tx, &ticket).await?;
+        return Ok(ticket);
     }
 
     let source_rows = sqlx::query(
@@ -464,6 +495,7 @@ pub async fn finish_collection(
     .await?
     .ok_or(ReconciliationError::AttemptMissing)?;
     let stored_ticket = collection_ticket_from_row(&attempt)?;
+    validate_stored_bindings(tx, &stored_ticket).await?;
     if stored_ticket.beneficiary_id != ticket.beneficiary_id
         || stored_ticket.collection_epoch != ticket.collection_epoch
         || stored_ticket.source_set_generation != ticket.source_set_generation
@@ -720,11 +752,12 @@ fn collection_ticket_from_row(
             return Err(ReconciliationError::CollectionConflict);
         }
     };
+    let beneficiary_id: String = row.try_get("beneficiary_id")?;
     let source_bindings_json: String = row.try_get("source_bindings")?;
-    let source_bindings: Vec<SourceBinding> = serde_json::from_str(&source_bindings_json)?;
+    let source_bindings = parse_stored_bindings(&source_bindings_json, &beneficiary_id)?;
     let projection_revision: Option<i64> = row.try_get("projection_revision")?;
     Ok(CollectionTicket {
-        beneficiary_id: row.try_get("beneficiary_id")?,
+        beneficiary_id,
         attempt_id: row.try_get("attempt_id")?,
         collection_epoch: row.try_get("collection_epoch")?,
         source_set_generation: row.try_get("source_set_generation")?,
@@ -733,6 +766,115 @@ fn collection_ticket_from_row(
         status,
         completed_revision: projection_revision,
     })
+}
+
+fn parse_stored_bindings(
+    source_bindings_json: &str,
+    beneficiary_id: &str,
+) -> Result<Vec<SourceBinding>, ReconciliationError> {
+    let value: serde_json::Value = serde_json::from_str(source_bindings_json)
+        .map_err(|_| corrupt(CorruptAttemptReason::BindingShape))?;
+    let bindings = value
+        .as_array()
+        .ok_or_else(|| corrupt(CorruptAttemptReason::BindingShape))?;
+    if bindings.is_empty() {
+        return Err(corrupt(CorruptAttemptReason::BindingShape));
+    }
+    let mut parsed = Vec::with_capacity(bindings.len());
+    for value in bindings {
+        let object = value
+            .as_object()
+            .ok_or_else(|| corrupt(CorruptAttemptReason::BindingShape))?;
+        if object.len() != 5
+            || ![
+                "beneficiary_id",
+                "source_id",
+                "provider_namespace",
+                "external_allocation_reference",
+                "ownership_evidence_reference",
+            ]
+            .iter()
+            .all(|field| object.contains_key(*field))
+        {
+            return Err(corrupt(CorruptAttemptReason::BindingShape));
+        }
+        let binding = SourceBinding {
+            beneficiary_id: stored_string(
+                object,
+                "beneficiary_id",
+                CorruptAttemptReason::BindingShape,
+            )?,
+            source_id: stored_string(object, "source_id", CorruptAttemptReason::BindingShape)?,
+            provider_namespace: stored_string(
+                object,
+                "provider_namespace",
+                CorruptAttemptReason::BindingShape,
+            )?,
+            external_allocation_reference: stored_string(
+                object,
+                "external_allocation_reference",
+                CorruptAttemptReason::BindingShape,
+            )?,
+            ownership_evidence_reference: stored_string(
+                object,
+                "ownership_evidence_reference",
+                CorruptAttemptReason::BindingShape,
+            )?,
+        };
+        if binding.beneficiary_id != beneficiary_id {
+            return Err(corrupt(CorruptAttemptReason::BindingOwnership));
+        }
+        validate_binding(&binding).map_err(|_| corrupt(CorruptAttemptReason::BindingShape))?;
+        parsed.push(binding);
+    }
+    if parsed
+        .windows(2)
+        .any(|pair| pair[0].source_id >= pair[1].source_id)
+    {
+        return Err(corrupt(CorruptAttemptReason::BindingShape));
+    }
+    Ok(parsed)
+}
+
+async fn validate_stored_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &CollectionTicket,
+) -> Result<(), ReconciliationError> {
+    let rows = sqlx::query(
+        "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference \
+         FROM cloud_coverage_sources \
+         WHERE beneficiary_id = $1 AND registration_source_set_generation <= $2 \
+         ORDER BY source_id COLLATE \"C\"",
+    )
+    .bind(&ticket.beneficiary_id)
+    .bind(ticket.source_set_generation)
+    .fetch_all(&mut **tx)
+    .await?;
+    let authoritative = rows
+        .iter()
+        .map(source_binding_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    if authoritative.is_empty() || authoritative != ticket.source_bindings {
+        return Err(corrupt(CorruptAttemptReason::BindingSourceSet));
+    }
+    Ok(())
+}
+
+fn stored_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    reason: CorruptAttemptReason,
+) -> Result<String, ReconciliationError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| corrupt(reason))
+}
+
+fn corrupt(reason: CorruptAttemptReason) -> ReconciliationError {
+    ReconciliationError::CorruptAttempt(reason)
 }
 
 fn validate_binding(binding: &SourceBinding) -> Result<(), ReconciliationError> {
