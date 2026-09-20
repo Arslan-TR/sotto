@@ -195,6 +195,15 @@ pub async fn publish(
     }
 
     if current_revision != expected_revision {
+        if head_inserted {
+            sqlx::query(
+                "DELETE FROM cloud_coverage_heads \
+                 WHERE beneficiary_id = $1 AND current_revision IS NULL",
+            )
+            .bind(beneficiary_id)
+            .execute(&mut **tx)
+            .await?;
+        }
         return Err(StoreError::RevisionConflict {
             expected: expected_revision,
             actual: current_revision,

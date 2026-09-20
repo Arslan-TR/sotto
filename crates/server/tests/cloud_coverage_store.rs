@@ -321,6 +321,43 @@ async fn invalid_publication_does_not_create_a_head() {
 }
 
 #[tokio::test]
+async fn first_revision_conflict_does_not_leave_an_empty_head() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin first revision conflict");
+    assert!(matches!(
+        publish(
+            &mut tx,
+            &fixture.beneficiary_id,
+            Some(1),
+            "wrong-first-revision",
+            "evidence-wrong-first-revision",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await,
+        Err(StoreError::RevisionConflict {
+            expected: Some(1),
+            actual: None,
+        })
+    ));
+    tx.commit()
+        .await
+        .expect("commit unrelated work after conflict");
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionMissing)
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
 async fn simultaneous_first_publications_have_one_winner() {
     let Some(fixture) = Fixture::create().await else {
         return;
