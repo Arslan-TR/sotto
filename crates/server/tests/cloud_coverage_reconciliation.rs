@@ -359,6 +359,20 @@ async fn complete_collection_replaces_unavailable_projection_and_replays() {
         sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied
     );
     assert_eq!(replay.revision, receipt.revision);
+
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin malformed collection replay");
+    let changed = finish_collection(&mut tx, &ticket, "collection-evidence-1", &[]).await;
+    tx.rollback()
+        .await
+        .expect("rollback malformed collection replay");
+    assert!(matches!(
+        changed,
+        Err(ReconciliationError::CollectionConflict)
+    ));
     cleanup(&fixture).await;
 }
 
