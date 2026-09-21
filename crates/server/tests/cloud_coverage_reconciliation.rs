@@ -243,6 +243,30 @@ async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32
     }
 }
 
+async fn held_registration(
+    pool: PgPool,
+    operation_id: String,
+    source: SourceBinding,
+    ready: oneshot::Sender<i32>,
+    release: Arc<Notify>,
+) -> Result<sotto_server::cloud_coverage_reconciliation::RegistrationReceipt, ReconciliationError> {
+    let mut tx = pool.begin().await.expect("begin held registration");
+    let pid = transaction_pid(&mut tx).await;
+    let result = register_source(&mut tx, &operation_id, &source).await;
+    ready.send(pid).expect("signal held registration");
+    release.notified().await;
+    match result {
+        Ok(receipt) => {
+            tx.commit().await.expect("commit held registration");
+            Ok(receipt)
+        }
+        Err(error) => {
+            tx.rollback().await.expect("rollback held registration");
+            Err(error)
+        }
+    }
+}
+
 #[tokio::test]
 async fn malformed_stored_bindings_fail_closed_without_writes() {
     let Some(fixture) = Fixture::create().await else {
@@ -943,6 +967,363 @@ async fn a_new_source_supersedes_a_pending_collection() {
         result,
         Err(ReconciliationError::AttemptSuperseded)
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn competing_source_claims_preserve_provider_allocation_ownership() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let first_source = binding(&first, "owner-a", "shared-allocation");
+    let mut second_source = binding(&second, "owner-b", "shared-allocation");
+    second_source.provider_namespace = first_source.provider_namespace.clone();
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_registration(
+        first.pool.clone(),
+        "owner-a-registration".into(),
+        first_source.clone(),
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = holder_ready_rx
+        .await
+        .expect("receive allocation holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = second.pool.clone();
+    let waiter_source = second_source.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.expect("begin allocation waiter");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready.send(pid).expect("signal allocation waiter");
+        let result = register_source(&mut tx, "owner-b-registration", &waiter_source).await;
+        tx.rollback().await.expect("rollback allocation waiter");
+        result
+    });
+    let waiter_pid = waiter_ready_rx
+        .await
+        .expect("receive allocation waiter pid");
+    wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let first_receipt = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("allocation holder finished")
+        .expect("join allocation holder")
+        .expect("first allocation claim applied");
+    let second_result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("allocation waiter finished")
+        .expect("join allocation waiter");
+    assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
+    assert!(matches!(
+        second_result,
+        Err(ReconciliationError::SourceBindingConflict)
+    ));
+    let second_source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+            .bind(&second.beneficiary_id)
+            .fetch_one(&second.pool)
+            .await
+            .expect("count losing allocation sources");
+    assert_eq!(second_source_count, 0);
+
+    let mut replay_tx = first.pool.begin().await.expect("begin allocation replay");
+    let replay = register_source(&mut replay_tx, "owner-a-registration", &first_source)
+        .await
+        .expect("replay winning allocation claim");
+    replay_tx.commit().await.expect("commit allocation replay");
+    assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
+    assert_eq!(
+        replay.projection_revision,
+        first_receipt.projection_revision
+    );
+    cleanup(&second).await;
+    cleanup(&first).await;
+}
+
+#[tokio::test]
+async fn competing_source_claims_preserve_global_source_identity() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let first_source = binding(&first, "shared-source", "allocation-a");
+    let mut second_source = binding(&second, "different-source", "allocation-b");
+    second_source.source_id = first_source.source_id.clone();
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_registration(
+        first.pool.clone(),
+        "identity-a-registration".into(),
+        first_source.clone(),
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = holder_ready_rx.await.expect("receive identity holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = second.pool.clone();
+    let waiter_source = second_source.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.expect("begin identity waiter");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready.send(pid).expect("signal identity waiter");
+        let result = register_source(&mut tx, "identity-b-registration", &waiter_source).await;
+        tx.rollback().await.expect("rollback identity waiter");
+        result
+    });
+    let waiter_pid = waiter_ready_rx.await.expect("receive identity waiter pid");
+    wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let first_receipt = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("identity holder finished")
+        .expect("join identity holder")
+        .expect("first identity claim applied");
+    let second_result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("identity waiter finished")
+        .expect("join identity waiter");
+    assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
+    assert!(matches!(
+        second_result,
+        Err(ReconciliationError::SourceBindingConflict)
+    ));
+    let second_source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+            .bind(&second.beneficiary_id)
+            .fetch_one(&second.pool)
+            .await
+            .expect("count losing identity sources");
+    assert_eq!(second_source_count, 0);
+    cleanup(&second).await;
+    cleanup(&first).await;
+}
+
+#[tokio::test]
+async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let first_source = binding(
+        &fixture,
+        "registration-race-first",
+        "registration-race-allocation-first",
+    );
+    let second_source = binding(
+        &fixture,
+        "registration-race-second",
+        "registration-race-allocation-second",
+    );
+    register(&fixture, &first_source, "registration-race-first-op").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "registration-race-pending")).await;
+    let observation = SourceObservation::Complete {
+        source_id: first_source.source_id.clone(),
+        evidence_reference: "registration-race-evidence".into(),
+        paid_intervals: vec![],
+    };
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_registration(
+        fixture.pool.clone(),
+        "registration-race-second-op".into(),
+        second_source,
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = holder_ready_rx
+        .await
+        .expect("receive registration holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = ticket.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.expect("begin superseded finish");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready.send(pid).expect("signal superseded finish");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "registration-race-aggregate",
+            &[observation],
+        )
+        .await;
+        tx.rollback().await.expect("rollback superseded finish");
+        result
+    });
+    let waiter_pid = waiter_ready_rx
+        .await
+        .expect("receive superseded finish pid");
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let registration = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("registration holder finished")
+        .expect("join registration holder")
+        .expect("second registration applied");
+    let finish = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("superseded finish finished")
+        .expect("join superseded finish");
+    assert_eq!(registration.source_set_generation, 2);
+    assert!(matches!(
+        finish,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read superseded registration race status");
+    assert_eq!(status, "superseded");
+    assert_eq!(head_revision(&fixture).await, 2);
+    assert!(matches!(
+        load(&fixture.pool, &fixture.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::NeedsReconciliation
+        ))
+    ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn completion_first_allows_registration_and_preserves_historical_replay() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let first_source = binding(
+        &fixture,
+        "completion-race-first",
+        "completion-race-allocation-first",
+    );
+    let second_source = binding(
+        &fixture,
+        "completion-race-second",
+        "completion-race-allocation-second",
+    );
+    register(&fixture, &first_source, "completion-race-first-op").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "completion-race-pending")).await;
+    let observations = vec![SourceObservation::Complete {
+        source_id: first_source.source_id.clone(),
+        evidence_reference: "completion-race-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "completion-race-coverage".into(),
+            source_id: first_source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    }];
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder_pool = fixture.pool.clone();
+    let holder_ticket = ticket.clone();
+    let holder_observations = observations.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool
+            .begin()
+            .await
+            .expect("begin held completion race");
+        let pid = transaction_pid(&mut tx).await;
+        let result = finish_collection(
+            &mut tx,
+            &holder_ticket,
+            "completion-race-aggregate",
+            &holder_observations,
+        )
+        .await;
+        holder_ready.send(pid).expect("signal held completion race");
+        holder_release.notified().await;
+        match result {
+            Ok(receipt) => {
+                tx.commit().await.expect("commit held completion race");
+                Ok(receipt)
+            }
+            Err(error) => {
+                tx.rollback().await.expect("rollback held completion race");
+                Err(error)
+            }
+        }
+    });
+    let holder_pid = holder_ready_rx
+        .await
+        .expect("receive completion holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin blocked registration race");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal blocked registration race");
+        let result = register_source(&mut tx, "completion-race-second-op", &second_source).await;
+        match result {
+            Ok(receipt) => {
+                tx.commit().await.expect("commit blocked registration race");
+                Ok(receipt)
+            }
+            Err(error) => {
+                tx.rollback()
+                    .await
+                    .expect("rollback blocked registration race");
+                Err(error)
+            }
+        }
+    });
+    let waiter_pid = waiter_ready_rx
+        .await
+        .expect("receive registration waiter pid");
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let completion = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("held completion race finished")
+        .expect("join held completion race")
+        .expect("completion race applied");
+    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("registration race finished")
+        .expect("join registration race")
+        .expect("registration race applied");
+    assert_eq!(completion.revision, 2);
+    assert_eq!(completion.outcome, PublicationOutcome::Applied);
+    assert_eq!(registration.source_set_generation, 2);
+    assert_eq!(registration.projection_revision, Some(3));
+    assert_eq!(head_revision(&fixture).await, 3);
+    let mut replay_tx = fixture.pool.begin().await.expect("begin completed replay");
+    let replay = finish_collection(
+        &mut replay_tx,
+        &ticket,
+        "completion-race-aggregate",
+        &observations,
+    )
+    .await
+    .expect("replay completed historical collection");
+    replay_tx.commit().await.expect("commit completed replay");
+    assert_eq!(replay.revision, completion.revision);
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(head_revision(&fixture).await, 3);
     cleanup(&fixture).await;
 }
 
