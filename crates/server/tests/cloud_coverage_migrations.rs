@@ -159,8 +159,9 @@ async fn seed_legacy_database(pool: &PgPool) -> (String, String, SourceBinding, 
         .execute(pool)
         .await
         .expect("insert legacy coverage head");
-        sqlx::query("INSERT INTO cloud_coverage_coordinators (beneficiary_id, source_set_generation, collection_epoch) VALUES ($1, 1, 1)")
+        sqlx::query("INSERT INTO cloud_coverage_coordinators (beneficiary_id, source_set_generation, collection_epoch) VALUES ($1, 1, $2)")
             .bind(beneficiary)
+            .bind(if beneficiary == first { 3 } else { 1 })
             .execute(pool)
             .await
             .expect("insert legacy coordinator");
@@ -450,22 +451,72 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     );
     tx.rollback().await.expect("rollback duplicate epoch");
 
-    let mut tx = database
+    for beneficiary in [&first, &second] {
+        let mut tx = database
+            .pool
+            .begin()
+            .await
+            .expect("begin scoped identity operation");
+        let ticket = begin_collection(&mut tx, beneficiary, "same-textual-id")
+            .await
+            .expect("public collection operation accepts scoped identity");
+        tx.commit().await.expect("commit scoped identity operation");
+        let mut tx = database
+            .pool
+            .begin()
+            .await
+            .expect("begin scoped identity completion");
+        finish_collection(
+            &mut tx,
+            &ticket,
+            "scoped-identity-aggregate",
+            &[SourceObservation::Complete {
+                source_id: if beneficiary == &first {
+                    first_binding.source_id.clone()
+                } else {
+                    second_binding.source_id.clone()
+                },
+                evidence_reference: "scoped-identity-evidence".into(),
+                paid_intervals: vec![],
+            }],
+        )
+        .await
+        .expect("public scoped identity completion");
+        tx.commit()
+            .await
+            .expect("commit scoped identity completion");
+    }
+
+    let legacy_only = DisposableDatabase::create()
+        .await
+        .expect("create pre migration identity database");
+    old.run(&legacy_only.pool)
+        .await
+        .expect("apply legacy migrations for identity check");
+    let (legacy_first, legacy_second, _, _) = seed_legacy_database(&legacy_only.pool).await;
+    let mut tx = legacy_only
         .pool
         .begin()
         .await
-        .expect("begin scoped identity insert");
-    let second_source_json =
-        serde_json::to_string(&[&second_binding]).expect("encode second source");
-    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, source_bindings, status) VALUES ('same-textual-id', $1, 9, 1, $2::jsonb, 'pending'), ('same-textual-id', $3, 9, 1, $4::jsonb, 'pending')")
-        .bind(&first)
-        .bind(serde_json::to_string(&[&first_binding]).expect("encode first source"))
-        .bind(&second)
-        .bind(second_source_json)
-        .execute(&mut *tx)
+        .expect("begin legacy first identity");
+    begin_collection(&mut tx, &legacy_first, "same-textual-id")
         .await
-        .expect("scoped attempt identities accept same text");
-    tx.commit().await.expect("commit scoped identity insert");
+        .expect("legacy first identity operation");
+    tx.commit().await.expect("commit legacy first identity");
+    let mut tx = legacy_only
+        .pool
+        .begin()
+        .await
+        .expect("begin legacy second identity");
+    let duplicate = begin_collection(&mut tx, &legacy_second, "same-textual-id").await;
+    assert!(
+        duplicate.is_err(),
+        "pre migration schema must reject a cross beneficiary textual attempt id"
+    );
+    tx.rollback()
+        .await
+        .expect("rollback legacy duplicate identity");
+    legacy_only.cleanup().await;
 
     let fresh = DisposableDatabase::create()
         .await
