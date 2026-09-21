@@ -2462,10 +2462,8 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
         .expect("commit independent beneficiary");
     release.notify_one();
 
-    let first_result = tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("independent held finish finished")
-        .expect("join independent held finish");
+    let mut holder = Some(holder);
+    let first_result = join_with_timeout(&mut holder, "independent held finish").await;
     assert!(first_result.is_ok());
     assert_eq!(second_receipt.outcome, PublicationOutcome::Applied);
     assert!(matches!(
@@ -2595,10 +2593,9 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
     .expect("read pending visibility attempt");
     assert_eq!(status, "pending");
     release.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let result = join_with_timeout(&mut holder, "visibility holder")
         .await
-        .expect("visibility holder finished")
-        .expect("join visibility holder")
         .expect("visibility finish applied");
     assert_eq!(result.revision, 3);
     let completed: (String, i64) = sqlx::query_as(
@@ -2710,10 +2707,8 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         "rollback-old"
     );
     release.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("rollback holder finished")
-        .expect("join rollback holder");
+    let mut holder = Some(holder);
+    let result = join_with_timeout(&mut holder, "rollback holder").await;
     assert!(result.is_ok());
     assert_eq!(projection_snapshot(&fixture).await, before_rollback);
     let after_rollback = load(&fixture.pool, &fixture.beneficiary_id)
@@ -2842,15 +2837,13 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let applied = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let applied = join_with_timeout(&mut holder, "held completion")
         .await
-        .expect("held completion finished")
-        .expect("join held completion")
         .expect("held completion applied");
-    let replay = tokio::time::timeout(Duration::from_secs(10), waiter)
+    let mut waiter = Some(waiter);
+    let replay = join_with_timeout(&mut waiter, "waiting completion")
         .await
-        .expect("waiting completion finished")
-        .expect("join waiting completion")
         .expect("waiting completion replayed");
     assert_eq!(applied.revision, replay.revision);
     assert_eq!(applied.outcome, PublicationOutcome::Applied);
@@ -3003,15 +2996,12 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let winner = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let winner = join_with_timeout(&mut holder, "winning completion")
         .await
-        .expect("winning completion finished")
-        .expect("join winning completion")
         .expect("winning completion applied");
-    let loser = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("losing completion finished")
-        .expect("join losing completion");
+    let mut waiter = Some(waiter);
+    let loser = join_with_timeout(&mut waiter, "losing completion").await;
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert!(matches!(loser, Err(ReconciliationError::OperationConflict)));
     assert_eq!(head_revision(&fixture).await, winner.revision);
