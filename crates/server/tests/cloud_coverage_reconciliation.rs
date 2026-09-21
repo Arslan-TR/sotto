@@ -314,7 +314,9 @@ async fn held_registration(
     let pid = transaction_pid(&mut tx).await;
     let result = register_source(&mut tx, &operation_id, &source).await;
     ready.send(pid).expect("signal held registration");
-    release.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held registration");
     match result {
         Ok(receipt) => {
             tx.commit().await.expect("commit held registration");
@@ -341,7 +343,9 @@ async fn held_coordinator_insert(
         .expect("insert held coordinator");
     let pid = transaction_pid(&mut tx).await;
     ready.send(pid).expect("signal held coordinator insert");
-    release.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held coordinator insert");
     tx.commit().await.expect("commit held coordinator insert");
 }
 
@@ -366,7 +370,9 @@ async fn held_publication(
     .await;
     let pid = transaction_pid(&mut tx).await;
     ready.send(pid).expect("signal held publication");
-    release.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held publication");
     match receipt {
         Ok(receipt) => {
             tx.commit().await.expect("commit held publication");
@@ -395,7 +401,9 @@ async fn held_begin_collection(
         .expect("begin held replacement collection");
     let pid = transaction_pid(&mut tx).await;
     ready.send(pid).expect("signal held replacement collection");
-    release.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held replacement collection");
     tx.commit()
         .await
         .expect("commit held replacement collection");
@@ -421,7 +429,9 @@ async fn held_finish_collection(
     .await;
     let pid = transaction_pid(&mut tx).await;
     ready.send(pid).expect("signal held replacement finish");
-    release.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held replacement finish");
     match result {
         Ok(receipt) => {
             tx.commit().await.expect("commit held replacement finish");
@@ -1005,6 +1015,15 @@ async fn publication_before_coordinator_lock(
             .await
             .expect("count rejected bootstrap sources");
     assert_eq!(source_count, 0);
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(fixture).await;
+    assert_eq!(snapshot_head, Some(publication.revision));
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(attempts.len(), 0);
+    let expected_fact_count = match &projection {
+        CoverageProjection::Complete { paid_intervals } => paid_intervals.len(),
+        CoverageProjection::Unavailable { .. } => 0,
+    };
+    assert_eq!(facts.len(), expected_fact_count);
     assert_eq!(head_revision(fixture).await, publication.revision);
     let operation: (String, String) = sqlx::query_as(
         "SELECT operation_id, evidence_reference FROM cloud_coverage_revisions \
@@ -1155,6 +1174,15 @@ async fn publication_after_revision_anchor(
     .await
     .expect("count rolled back bootstrap coordinators");
     assert_eq!(coordinator_count, 0);
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(fixture).await;
+    assert_eq!(snapshot_head, Some(publication.revision));
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(attempts.len(), 0);
+    let expected_fact_count = match &projection {
+        CoverageProjection::Complete { paid_intervals } => paid_intervals.len(),
+        CoverageProjection::Unavailable { .. } => 0,
+    };
+    assert_eq!(facts.len(), expected_fact_count);
 
     let mut replay_tx = fixture.pool.begin().await.expect("begin bootstrap replay");
     let replay = publish(
@@ -2001,6 +2029,22 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     .expect("read pending replacement current attempt");
     assert_eq!(current_attempt, Some(second_ticket.attempt_id.clone()));
     assert_eq!(head_revision(&fixture).await, 1);
+    let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read pending replacement coordinator");
+    assert_eq!(coordinator, (1, 2, Some(second_ticket.attempt_id.clone())));
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
+    assert_eq!(snapshot_head, Some(1));
+    assert_eq!(revisions.len(), 1);
+    assert!(facts.is_empty());
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].4, "superseded");
+    assert_eq!(attempts[1].4, "pending");
 
     let second_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
@@ -2050,6 +2094,13 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         .expect("commit pending replacement replay");
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
     assert_eq!(replay.revision, second_receipt.revision);
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
+    assert_eq!(snapshot_head, Some(second_receipt.revision));
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].4, "completed");
+    assert_eq!(attempts[1].7, Some(second_receipt.revision));
 
     let mut stale_tx = fixture
         .pool
@@ -2192,6 +2243,32 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
     .await
     .expect("read completing replacement current attempt");
     assert_eq!(current_attempt, None);
+    let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read completing replacement coordinator");
+    assert_eq!(coordinator, (1, 2, None));
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
+    assert_eq!(snapshot_head, Some(second_result.revision));
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].4, "superseded");
+    assert_eq!(attempts[0].7, None);
+    assert_eq!(attempts[1].4, "completed");
+    assert_eq!(
+        attempts[1].5,
+        Some("superseded-completing-second-aggregate".into())
+    );
+    assert_eq!(attempts[1].7, Some(second_result.revision));
+    assert!(attempts[1]
+        .6
+        .as_deref()
+        .is_some_and(|result| result.contains("superseded-completing-coverage")));
     let loaded = load(&fixture.pool, &fixture.beneficiary_id)
         .await
         .expect("load completing replacement projection");
