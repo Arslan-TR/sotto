@@ -264,6 +264,45 @@ async fn projection_snapshot(
     (head, revisions, facts, attempts)
 }
 
+async fn assert_projection_state(
+    fixture: &Fixture,
+    revision: i64,
+    operation_id: &str,
+    evidence_reference: &str,
+    projection: &CoverageProjection,
+    expected_attempts: usize,
+) {
+    let (head, revisions, facts, attempts) = projection_snapshot(fixture).await;
+    assert_eq!(head, Some(revision));
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(attempts.len(), expected_attempts);
+    assert_eq!(revisions[0].0, revision);
+    assert_eq!(revisions[0].1, operation_id);
+    assert_eq!(revisions[0].2, evidence_reference);
+    match projection {
+        CoverageProjection::Complete { paid_intervals } => {
+            assert_eq!(revisions[0].3, "complete");
+            assert_eq!(revisions[0].4, None);
+            assert_eq!(revisions[0].5, paid_intervals.len() as i64);
+            assert_eq!(facts.len(), paid_intervals.len());
+            for (actual, expected) in facts.iter().zip(paid_intervals) {
+                assert_eq!(actual.0, revision);
+                assert_eq!(actual.1, expected.coverage_id);
+                assert_eq!(actual.2, expected.source_id);
+                assert_eq!(actual.3, expected.starts_at);
+                assert_eq!(actual.4, expected.paid_until);
+                assert_eq!(actual.5, expected.failed_renewal_id);
+            }
+        }
+        CoverageProjection::Unavailable { reason } => {
+            assert_eq!(revisions[0].3, "unavailable");
+            assert_eq!(revisions[0].4.as_deref(), Some(reason.to_string().as_str()));
+            assert_eq!(revisions[0].5, 0);
+            assert!(facts.is_empty());
+        }
+    }
+}
+
 async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut **tx)
@@ -1015,15 +1054,15 @@ async fn publication_before_coordinator_lock(
             .await
             .expect("count rejected bootstrap sources");
     assert_eq!(source_count, 0);
-    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(fixture).await;
-    assert_eq!(snapshot_head, Some(publication.revision));
-    assert_eq!(revisions.len(), 1);
-    assert_eq!(attempts.len(), 0);
-    let expected_fact_count = match &projection {
-        CoverageProjection::Complete { paid_intervals } => paid_intervals.len(),
-        CoverageProjection::Unavailable { .. } => 0,
-    };
-    assert_eq!(facts.len(), expected_fact_count);
+    assert_projection_state(
+        fixture,
+        publication.revision,
+        &format!("bootstrap-before-publication-{suffix}"),
+        &format!("bootstrap-before-evidence-{suffix}"),
+        &projection,
+        0,
+    )
+    .await;
     assert_eq!(head_revision(fixture).await, publication.revision);
     let operation: (String, String) = sqlx::query_as(
         "SELECT operation_id, evidence_reference FROM cloud_coverage_revisions \
@@ -1174,16 +1213,17 @@ async fn publication_after_revision_anchor(
     .await
     .expect("count rolled back bootstrap coordinators");
     assert_eq!(coordinator_count, 0);
-    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(fixture).await;
-    assert_eq!(snapshot_head, Some(publication.revision));
-    assert_eq!(revisions.len(), 1);
-    assert_eq!(attempts.len(), 0);
-    let expected_fact_count = match &projection {
-        CoverageProjection::Complete { paid_intervals } => paid_intervals.len(),
-        CoverageProjection::Unavailable { .. } => 0,
-    };
-    assert_eq!(facts.len(), expected_fact_count);
+    assert_projection_state(
+        fixture,
+        publication.revision,
+        &format!("bootstrap-after-publication-{suffix}"),
+        &format!("bootstrap-after-evidence-{suffix}"),
+        &projection,
+        0,
+    )
+    .await;
 
+    let before_replay = projection_snapshot(fixture).await;
     let mut replay_tx = fixture.pool.begin().await.expect("begin bootstrap replay");
     let replay = publish(
         &mut replay_tx,
@@ -1198,6 +1238,7 @@ async fn publication_after_revision_anchor(
     replay_tx.commit().await.expect("commit bootstrap replay");
     assert_eq!(replay.revision, publication.revision);
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(projection_snapshot(fixture).await, before_replay);
     match projection {
         CoverageProjection::Complete { paid_intervals } => {
             let loaded = load(&fixture.pool, &fixture.beneficiary_id)
@@ -2075,6 +2116,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         .await
         .expect("commit pending replacement finish");
     assert_eq!(second_receipt.revision, 2);
+    let before_replay = projection_snapshot(&fixture).await;
     let mut replay_tx = fixture
         .pool
         .begin()
@@ -2094,6 +2136,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         .expect("commit pending replacement replay");
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
     assert_eq!(replay.revision, second_receipt.revision);
+    assert_eq!(projection_snapshot(&fixture).await, before_replay);
     let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
     assert_eq!(snapshot_head, Some(second_receipt.revision));
     assert_eq!(revisions.len(), 2);
@@ -2291,6 +2334,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         "superseded-completing-coverage"
     );
 
+    let before_replay = projection_snapshot(&fixture).await;
     let mut replay_tx = fixture
         .pool
         .begin()
@@ -2309,6 +2353,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         .await
         .expect("commit completing replacement replay");
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(projection_snapshot(&fixture).await, before_replay);
     let mut stale_tx = fixture
         .pool
         .begin()
