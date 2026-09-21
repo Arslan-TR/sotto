@@ -1907,6 +1907,340 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
 }
 
 #[tokio::test]
+async fn superseded_finish_waits_for_a_pending_replacement() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(
+        &fixture,
+        "superseded-pending-source",
+        "superseded-pending-allocation",
+    );
+    register(&fixture, &source, "superseded-pending-registration").await;
+    let first_ticket = begin(&fixture, &attempt_id(&fixture, "superseded-pending-first")).await;
+    let first_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-pending-first-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let second_attempt_id = attempt_id(&fixture, "superseded-pending-second");
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_begin_collection(
+        fixture.pool.clone(),
+        fixture.beneficiary_id.clone(),
+        second_attempt_id.clone(),
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = receive_pid(holder_ready_rx, "receive pending replacement pid").await;
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = first_ticket.clone();
+    let waiter_observation = first_observation.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin superseded pending finish");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal superseded pending finish");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "superseded-pending-first-aggregate",
+            &[waiter_observation],
+        )
+        .await;
+        tx.rollback()
+            .await
+            .expect("rollback superseded pending finish");
+        result
+    });
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded pending finish pid").await;
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let second_ticket = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("pending replacement finished")
+        .expect("join pending replacement");
+    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("superseded pending finish finished")
+        .expect("join superseded pending finish");
+    assert!(matches!(
+        first_result,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
+    assert_eq!(second_ticket.attempt_id, second_attempt_id);
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT attempt_id, status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read pending replacement statuses");
+    assert_eq!(
+        statuses,
+        vec![
+            (first_ticket.attempt_id.clone(), "superseded".into()),
+            (second_ticket.attempt_id.clone(), "pending".into()),
+        ]
+    );
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read pending replacement current attempt");
+    assert_eq!(current_attempt, Some(second_ticket.attempt_id.clone()));
+    assert_eq!(head_revision(&fixture).await, 1);
+
+    let second_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-pending-second-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-pending-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut finish_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin pending replacement finish");
+    let second_receipt = finish_collection(
+        &mut finish_tx,
+        &second_ticket,
+        "superseded-pending-second-aggregate",
+        std::slice::from_ref(&second_observation),
+    )
+    .await
+    .expect("finish pending replacement");
+    finish_tx
+        .commit()
+        .await
+        .expect("commit pending replacement finish");
+    assert_eq!(second_receipt.revision, 2);
+    let mut replay_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin pending replacement replay");
+    let replay = finish_collection(
+        &mut replay_tx,
+        &second_ticket,
+        "superseded-pending-second-aggregate",
+        std::slice::from_ref(&second_observation),
+    )
+    .await
+    .expect("replay pending replacement finish");
+    replay_tx
+        .commit()
+        .await
+        .expect("commit pending replacement replay");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay.revision, second_receipt.revision);
+
+    let mut stale_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin superseded pending retry");
+    let stale = finish_collection(
+        &mut stale_tx,
+        &first_ticket,
+        "superseded-pending-first-aggregate",
+        std::slice::from_ref(&first_observation),
+    )
+    .await;
+    stale_tx
+        .rollback()
+        .await
+        .expect("rollback superseded pending retry");
+    assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(head_revision(&fixture).await, second_receipt.revision);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn superseded_finish_waits_for_a_completing_replacement() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(
+        &fixture,
+        "superseded-completing-source",
+        "superseded-completing-allocation",
+    );
+    register(&fixture, &source, "superseded-completing-registration").await;
+    let first_ticket = begin(
+        &fixture,
+        &attempt_id(&fixture, "superseded-completing-first"),
+    )
+    .await;
+    let second_ticket = begin(
+        &fixture,
+        &attempt_id(&fixture, "superseded-completing-second"),
+    )
+    .await;
+    let first_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-completing-first-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let second_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-completing-second-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-completing-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    };
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_finish_collection(
+        fixture.pool.clone(),
+        second_ticket.clone(),
+        "superseded-completing-second-aggregate".into(),
+        vec![second_observation.clone()],
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = receive_pid(holder_ready_rx, "receive completing replacement pid").await;
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = first_ticket.clone();
+    let waiter_observation = first_observation.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin superseded completing finish");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal superseded completing finish");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "superseded-completing-first-aggregate",
+            &[waiter_observation],
+        )
+        .await;
+        tx.rollback()
+            .await
+            .expect("rollback superseded completing finish");
+        result
+    });
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded completing finish pid").await;
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let second_result = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("completing replacement finished")
+        .expect("join completing replacement")
+        .expect("completing replacement applied");
+    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("superseded completing finish finished")
+        .expect("join superseded completing finish");
+    assert!(matches!(
+        first_result,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
+    assert_eq!(second_result.revision, 2);
+    assert_eq!(second_result.outcome, PublicationOutcome::Applied);
+    let statuses: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT attempt_id, status, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read completing replacement statuses");
+    assert_eq!(
+        statuses,
+        vec![
+            (first_ticket.attempt_id.clone(), "superseded".into(), None),
+            (
+                second_ticket.attempt_id.clone(),
+                "completed".into(),
+                Some(2)
+            ),
+        ]
+    );
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read completing replacement current attempt");
+    assert_eq!(current_attempt, None);
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load completing replacement projection");
+    assert_eq!(loaded.revision, second_result.revision);
+    assert_eq!(
+        loaded.coverage.paid_intervals[0].coverage_id,
+        "superseded-completing-coverage"
+    );
+
+    let mut replay_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin completing replacement replay");
+    let replay = finish_collection(
+        &mut replay_tx,
+        &second_ticket,
+        "superseded-completing-second-aggregate",
+        std::slice::from_ref(&second_observation),
+    )
+    .await
+    .expect("replay completing replacement");
+    replay_tx
+        .commit()
+        .await
+        .expect("commit completing replacement replay");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    let mut stale_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin superseded completing retry");
+    let stale = finish_collection(
+        &mut stale_tx,
+        &first_ticket,
+        "superseded-completing-first-aggregate",
+        std::slice::from_ref(&first_observation),
+    )
+    .await;
+    stale_tx
+        .rollback()
+        .await
+        .expect("rollback superseded completing retry");
+    assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(head_revision(&fixture).await, second_result.revision);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
 async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
     let Some(first) = Fixture::create().await else {
         return;
