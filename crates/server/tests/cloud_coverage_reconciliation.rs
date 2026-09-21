@@ -10,10 +10,16 @@ use sotto_server::cloud_coverage_store::{
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use tokio::sync::{oneshot, Notify};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::Duration;
 use uuid::Uuid;
+
+mod support;
+
+use support::coverage_concurrency::{
+    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskGuard,
+};
 
 struct Fixture {
     pool: PgPool,
@@ -23,6 +29,7 @@ struct Fixture {
 impl Fixture {
     async fn create() -> Option<Self> {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping cloud coverage reconciliation test: set SOTTO_RUN_DB_TESTS=1");
             return None;
         }
         let database_url = std::env::var("DATABASE_URL")
@@ -301,45 +308,6 @@ async fn assert_projection_state(
             assert!(facts.is_empty());
         }
     }
-}
-
-async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
-    sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut **tx)
-        .await
-        .expect("read transaction backend pid")
-}
-
-async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let blocked: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM pg_stat_activity
-                 WHERE pid = $1 AND $2 = ANY(pg_blocking_pids(pid))
-             )",
-        )
-        .bind(waiter_pid)
-        .bind(holder_pid)
-        .fetch_one(pool)
-        .await
-        .expect("inspect coverage transaction blocking");
-        if blocked {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for backend {waiter_pid} to block on {holder_pid}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) -> i32 {
-    tokio::time::timeout(Duration::from_secs(10), receiver)
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
-        .unwrap_or_else(|_| panic!("{label} task exited before reporting its backend pid"))
 }
 
 async fn held_registration(
@@ -980,6 +948,8 @@ async fn publication_before_coordinator_lock(
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive bootstrap coordinator pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1001,6 +971,7 @@ async fn publication_before_coordinator_lock(
             .expect("rollback bootstrap registration");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive bootstrap registration pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
 
@@ -1025,14 +996,10 @@ async fn publication_before_coordinator_lock(
         .expect("commit bootstrap projection");
     release.notify_one();
 
-    tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("bootstrap coordinator holder finished")
-        .expect("join bootstrap coordinator holder");
-    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("bootstrap registration finished")
-        .expect("join bootstrap registration");
+    let mut holder = Some(holder);
+    join_with_timeout(&mut holder, "bootstrap coordinator holder").await;
+    let mut waiter = Some(waiter);
+    let registration = join_with_timeout(&mut waiter, "bootstrap registration").await;
     assert!(matches!(
         registration,
         Err(ReconciliationError::BootstrapConflict)
@@ -1148,6 +1115,8 @@ async fn publication_after_revision_anchor(
         publisher_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&publisher);
     let publisher_pid = receive_pid(publisher_ready_rx, "receive bootstrap publisher pid").await;
 
     let source = binding(
@@ -1173,6 +1142,7 @@ async fn publication_after_revision_anchor(
             .expect("rollback anchored bootstrap registration");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(
         waiter_ready_rx,
         "receive anchored bootstrap registration pid",
@@ -1181,15 +1151,12 @@ async fn publication_after_revision_anchor(
     wait_for_specific_block(&fixture.pool, waiter_pid, publisher_pid).await;
     release.notify_one();
 
-    let publication = tokio::time::timeout(Duration::from_secs(10), publisher)
+    let mut publisher = Some(publisher);
+    let publication = join_with_timeout(&mut publisher, "bootstrap publisher")
         .await
-        .expect("bootstrap publisher finished")
-        .expect("join bootstrap publisher")
         .expect("bootstrap publication applied");
-    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("anchored bootstrap registration finished")
-        .expect("join anchored bootstrap registration");
+    let mut waiter = Some(waiter);
+    let registration = join_with_timeout(&mut waiter, "anchored bootstrap registration").await;
     assert!(matches!(
         registration,
         Err(ReconciliationError::Store(StoreError::RevisionConflict {
@@ -1554,6 +1521,8 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive allocation holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1567,19 +1536,17 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         tx.rollback().await.expect("rollback allocation waiter");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive allocation waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let first_receipt = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let first_receipt = join_with_timeout(&mut holder, "allocation holder")
         .await
-        .expect("allocation holder finished")
-        .expect("join allocation holder")
         .expect("first allocation claim applied");
-    let second_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("allocation waiter finished")
-        .expect("join allocation waiter");
+    let mut waiter = Some(waiter);
+    let second_result = join_with_timeout(&mut waiter, "allocation waiter").await;
     assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
     assert!(matches!(
         second_result,
@@ -1620,6 +1587,8 @@ async fn competing_source_claims_preserve_global_source_identity() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive identity holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1633,19 +1602,17 @@ async fn competing_source_claims_preserve_global_source_identity() {
         tx.rollback().await.expect("rollback identity waiter");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive identity waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let first_receipt = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let first_receipt = join_with_timeout(&mut holder, "identity holder")
         .await
-        .expect("identity holder finished")
-        .expect("join identity holder")
         .expect("first identity claim applied");
-    let second_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("identity waiter finished")
-        .expect("join identity waiter");
+    let mut waiter = Some(waiter);
+    let second_result = join_with_timeout(&mut waiter, "identity waiter").await;
     assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
     assert!(matches!(
         second_result,
@@ -1699,6 +1666,8 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive registration holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1718,19 +1687,17 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         tx.rollback().await.expect("rollback superseded finish");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let registration = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let registration = join_with_timeout(&mut holder, "registration holder")
         .await
-        .expect("registration holder finished")
-        .expect("join registration holder")
         .expect("second registration applied");
-    let finish = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("superseded finish finished")
-        .expect("join superseded finish");
+    let mut waiter = Some(waiter);
+    let finish = join_with_timeout(&mut waiter, "superseded finish").await;
     assert_eq!(registration.source_set_generation, 2);
     assert!(matches!(
         finish,
@@ -1861,6 +1828,8 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
             }
         }
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive completion holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1888,19 +1857,18 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
             }
         }
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive registration waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let completion = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let completion = join_with_timeout(&mut holder, "held completion race")
         .await
-        .expect("held completion race finished")
-        .expect("join held completion race")
         .expect("completion race applied");
-    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
+    let mut waiter = Some(waiter);
+    let registration = join_with_timeout(&mut waiter, "registration race")
         .await
-        .expect("registration race finished")
-        .expect("join registration race")
         .expect("registration race applied");
     assert_eq!(completion.revision, 2);
     assert_eq!(completion.outcome, PublicationOutcome::Applied);
@@ -1990,7 +1958,13 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     let first_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
         evidence_reference: "superseded-pending-first-evidence".into(),
-        paid_intervals: vec![],
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-pending-first-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 50,
+            failed_renewal_id: None,
+        }],
     };
     let second_attempt_id = attempt_id(&fixture, "superseded-pending-second");
     let release = Arc::new(Notify::new());
@@ -2002,6 +1976,8 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive pending replacement pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2029,18 +2005,15 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
             .expect("rollback superseded pending finish");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded pending finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let second_ticket = tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("pending replacement finished")
-        .expect("join pending replacement");
-    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("superseded pending finish finished")
-        .expect("join superseded pending finish");
+    let mut holder = Some(holder);
+    let second_ticket = join_with_timeout(&mut holder, "pending replacement").await;
+    let mut waiter = Some(waiter);
+    let first_result = join_with_timeout(&mut waiter, "superseded pending finish").await;
     assert!(matches!(
         first_result,
         Err(ReconciliationError::AttemptSuperseded)
@@ -2144,6 +2117,31 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[1].4, "completed");
     assert_eq!(attempts[1].7, Some(second_receipt.revision));
+    let canonical: serde_json::Value = serde_json::from_str(
+        attempts[1]
+            .6
+            .as_deref()
+            .expect("pending replacement canonical result"),
+    )
+    .expect("decode pending replacement canonical result");
+    assert_eq!(
+        canonical,
+        serde_json::json!({
+            "aggregate_evidence_reference": "superseded-pending-second-aggregate",
+            "sources": [{
+                "source_id": source.source_id.clone(),
+                "evidence_reference": "superseded-pending-second-evidence",
+                "status": "complete",
+                "paid_intervals": [{
+                    "coverage_id": "superseded-pending-coverage",
+                    "source_id": source.source_id.clone(),
+                    "starts_at": 0,
+                    "paid_until": 100,
+                    "failed_renewal_id": null
+                }]
+            }]
+        })
+    );
     assert_eq!(
         revisions[1].1,
         format!("collection:{}", second_ticket.attempt_id)
@@ -2158,6 +2156,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         "superseded-pending-coverage"
     );
 
+    let before_stale = projection_snapshot(&fixture).await;
     let mut stale_tx = fixture
         .pool
         .begin()
@@ -2175,6 +2174,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         .await
         .expect("rollback superseded pending retry");
     assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(projection_snapshot(&fixture).await, before_stale);
     assert_eq!(head_revision(&fixture).await, second_receipt.revision);
     cleanup(&fixture).await;
 }
@@ -2203,7 +2203,13 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
     let first_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
         evidence_reference: "superseded-completing-first-evidence".into(),
-        paid_intervals: vec![],
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-completing-first-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 50,
+            failed_renewal_id: None,
+        }],
     };
     let second_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
@@ -2226,6 +2232,8 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive completing replacement pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2253,19 +2261,17 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
             .expect("rollback superseded completing finish");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded completing finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let second_result = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let second_result = join_with_timeout(&mut holder, "completing replacement")
         .await
-        .expect("completing replacement finished")
-        .expect("join completing replacement")
         .expect("completing replacement applied");
-    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("superseded completing finish finished")
-        .expect("join superseded completing finish");
+    let mut waiter = Some(waiter);
+    let first_result = join_with_timeout(&mut waiter, "superseded completing finish").await;
     assert!(matches!(
         first_result,
         Err(ReconciliationError::AttemptSuperseded)
@@ -2321,10 +2327,31 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         Some("superseded-completing-second-aggregate".into())
     );
     assert_eq!(attempts[1].7, Some(second_result.revision));
-    assert!(attempts[1]
-        .6
-        .as_deref()
-        .is_some_and(|result| result.contains("superseded-completing-coverage")));
+    let canonical: serde_json::Value = serde_json::from_str(
+        attempts[1]
+            .6
+            .as_deref()
+            .expect("completing replacement canonical result"),
+    )
+    .expect("decode completing replacement canonical result");
+    assert_eq!(
+        canonical,
+        serde_json::json!({
+            "aggregate_evidence_reference": "superseded-completing-second-aggregate",
+            "sources": [{
+                "source_id": source.source_id.clone(),
+                "evidence_reference": "superseded-completing-second-evidence",
+                "status": "complete",
+                "paid_intervals": [{
+                    "coverage_id": "superseded-completing-coverage",
+                    "source_id": source.source_id.clone(),
+                    "starts_at": 0,
+                    "paid_until": 100,
+                    "failed_renewal_id": null
+                }]
+            }]
+        })
+    );
     let loaded = load(&fixture.pool, &fixture.beneficiary_id)
         .await
         .expect("load completing replacement projection");
@@ -2354,6 +2381,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         .expect("commit completing replacement replay");
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
     assert_eq!(projection_snapshot(&fixture).await, before_replay);
+    let before_stale = projection_snapshot(&fixture).await;
     let mut stale_tx = fixture
         .pool
         .begin()
@@ -2371,6 +2399,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         .await
         .expect("rollback superseded completing retry");
     assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(projection_snapshot(&fixture).await, before_stale);
     assert_eq!(head_revision(&fixture).await, second_result.revision);
     cleanup(&fixture).await;
 }
@@ -2436,6 +2465,8 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
             .expect("rollback independent held finish");
         result
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let _holder_pid = receive_pid(holder_ready_rx, "receive independent holder pid").await;
 
     let mut second_tx = second.pool.begin().await.expect("begin independent finish");
@@ -2457,10 +2488,8 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
         .expect("commit independent beneficiary");
     release.notify_one();
 
-    let first_result = tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("independent held finish finished")
-        .expect("join independent held finish");
+    let mut holder = Some(holder);
+    let first_result = join_with_timeout(&mut holder, "independent held finish").await;
     assert!(first_result.is_ok());
     assert_eq!(second_receipt.outcome, PublicationOutcome::Applied);
     assert!(matches!(
@@ -2569,6 +2598,8 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
         tx.commit().await.expect("commit visibility holder");
         result
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let _holder_pid = receive_pid(ready_rx, "receive visibility holder pid").await;
 
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
@@ -2590,10 +2621,9 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
     .expect("read pending visibility attempt");
     assert_eq!(status, "pending");
     release.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let result = join_with_timeout(&mut holder, "visibility holder")
         .await
-        .expect("visibility holder finished")
-        .expect("join visibility holder")
         .expect("visibility finish applied");
     assert_eq!(result.revision, 3);
     let completed: (String, i64) = sqlx::query_as(
@@ -2695,6 +2725,8 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         tx.rollback().await.expect("rollback visibility holder");
         result
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let _holder_pid = receive_pid(ready_rx, "receive rollback holder pid").await;
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
         .await
@@ -2705,10 +2737,8 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         "rollback-old"
     );
     release.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("rollback holder finished")
-        .expect("join rollback holder");
+    let mut holder = Some(holder);
+    let result = join_with_timeout(&mut holder, "rollback holder").await;
     assert!(result.is_ok());
     assert_eq!(projection_snapshot(&fixture).await, before_rollback);
     let after_rollback = load(&fixture.pool, &fixture.beneficiary_id)
@@ -2805,6 +2835,8 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
             }
         }
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2833,19 +2865,18 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
             }
         }
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let applied = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let applied = join_with_timeout(&mut holder, "held completion")
         .await
-        .expect("held completion finished")
-        .expect("join held completion")
         .expect("held completion applied");
-    let replay = tokio::time::timeout(Duration::from_secs(10), waiter)
+    let mut waiter = Some(waiter);
+    let replay = join_with_timeout(&mut waiter, "waiting completion")
         .await
-        .expect("waiting completion finished")
-        .expect("join waiting completion")
         .expect("waiting completion replayed");
     assert_eq!(applied.revision, replay.revision);
     assert_eq!(applied.outcome, PublicationOutcome::Applied);
@@ -2975,6 +3006,8 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
             }
         }
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive winning holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2994,19 +3027,17 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
         tx.rollback().await.expect("rollback losing completion");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive losing waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let winner = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let winner = join_with_timeout(&mut holder, "winning completion")
         .await
-        .expect("winning completion finished")
-        .expect("join winning completion")
         .expect("winning completion applied");
-    let loser = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("losing completion finished")
-        .expect("join losing completion");
+    let mut waiter = Some(waiter);
+    let loser = join_with_timeout(&mut waiter, "losing completion").await;
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert!(matches!(loser, Err(ReconciliationError::OperationConflict)));
     assert_eq!(head_revision(&fixture).await, winner.revision);

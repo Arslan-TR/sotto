@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Run the bounded cloud coverage race scenarios with real local Postgres."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TIMEOUT = 120
+SCENARIOS = (
+    ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_before_coordinator_lock"),
+    ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_after_revision_anchor"),
+    ("cloud_coverage_reconciliation", "competing_source_claims_preserve_provider_allocation_ownership"),
+    ("cloud_coverage_reconciliation", "completion_first_allows_registration_and_preserves_historical_replay"),
+    ("cloud_coverage_reconciliation", "superseded_finish_waits_for_a_pending_replacement"),
+    ("cloud_coverage_reconciliation", "superseded_finish_waits_for_a_completing_replacement"),
+    ("cloud_coverage_store", "competing_corrections_serialize_on_the_head_and_reject_the_loser"),
+    ("cloud_coverage_store", "simultaneous_first_publications_have_one_winner"),
+)
+
+
+def validate_database(env: dict[str, str]) -> None:
+    if env.get("SOTTO_RUN_DB_TESTS") != "1":
+        raise ValueError("race runner requires SOTTO_RUN_DB_TESTS=1")
+    try:
+        url = urlsplit(env.get("DATABASE_URL", ""))
+        valid = (
+            url.scheme in ("postgres", "postgresql")
+            and url.hostname in ("localhost", "127.0.0.1", "::1")
+            and len(url.path) > 1
+            and not url.query
+            and not url.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(
+            "race runner requires a local disposable PostgreSQL DATABASE_URL without query parameters"
+        )
+
+
+def run(args: list[str], env: dict[str, str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+    print("+", " ".join(args), flush=True)
+
+    def emit(value: str | bytes | None, stream: object) -> None:
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode(errors="replace")
+            print(value, end="", file=stream)
+
+    try:
+        result = subprocess.run(
+            args,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            check=False,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        emit(error.stdout, sys.stdout)
+        emit(error.stderr, sys.stderr)
+        raise RuntimeError(f"timed out after {timeout_seconds}s: {' '.join(args)}") from error
+    if result.returncode:
+        emit(result.stdout, sys.stdout)
+        emit(result.stderr, sys.stderr)
+        raise RuntimeError(f"command exited {result.returncode}: {' '.join(args)}")
+    emit(result.stdout, sys.stdout)
+    emit(result.stderr, sys.stderr)
+    return result
+
+
+def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]:
+    result = run(
+        ["cargo", "test", "-p", "sotto-server", "--test", target, "--", "--list"],
+        env,
+        timeout_seconds,
+    )
+    return {
+        line.split(":", 1)[0]
+        for line in result.stdout.splitlines()
+        if line.endswith(": test")
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parsed = parser.parse_args()
+    if parsed.rounds < 1 or parsed.timeout < 1:
+        parser.error("rounds and timeout must be positive")
+
+    env = os.environ.copy()
+    try:
+        validate_database(env)
+        targets = {target for target, _ in SCENARIOS}
+        discovered = {target: discover(target, env, parsed.timeout) for target in targets}
+        missing = [
+            f"{target}::{name}"
+            for target, name in SCENARIOS
+            if name not in discovered[target]
+        ]
+        if missing:
+            raise RuntimeError("scenario discovery failed: " + ", ".join(missing))
+
+        for target, name in SCENARIOS:
+            run(
+                [
+                    "cargo", "test", "-p", "sotto-server", "--test", target,
+                    name, "--", "--exact", "--nocapture", "--test-threads=4",
+                ],
+                env,
+                parsed.timeout,
+            )
+        for round_number in range(1, parsed.rounds + 1):
+            print(f"race repetition round {round_number}/{parsed.rounds}", flush=True)
+            commands = [
+                [
+                    "cargo", "test", "-p", "sotto-server", "--test", target,
+                    "--", "--test-threads=4",
+                ]
+                for target in sorted(targets)
+            ]
+            with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+                futures = [
+                    executor.submit(run, command, env, parsed.timeout)
+                    for command in commands
+                ]
+                failures = []
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
+                        failures.append(str(error))
+                if failures:
+                    raise RuntimeError(
+                        "parallel target failures:\n" + "\n".join(f"- {failure}" for failure in failures)
+                    )
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"cloud coverage race checks failed: {error}", file=sys.stderr)
+        return 1
+    print(f"cloud coverage race checks passed: {len(SCENARIOS)} scenarios x {parsed.rounds} rounds")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

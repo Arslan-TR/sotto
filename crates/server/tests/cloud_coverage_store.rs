@@ -6,10 +6,16 @@ use sotto_server::cloud_coverage_store::{
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use tokio::sync::{oneshot, Barrier, Notify};
-use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
+
+mod support;
+
+use support::coverage_concurrency::{
+    abort_and_join, join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block,
+    RaceTaskGuard,
+};
 
 const DAY: i64 = 24 * 60 * 60;
 
@@ -21,9 +27,11 @@ struct Fixture {
 impl Fixture {
     async fn create() -> Option<Self> {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping cloud coverage store test: set SOTTO_RUN_DB_TESTS=1");
             return None;
         }
-        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
         let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
         assert!(
             matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
@@ -113,45 +121,6 @@ async fn committed_publish(
     .await?;
     tx.commit().await.expect("commit publication");
     Ok(receipt)
-}
-
-async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
-    sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut **tx)
-        .await
-        .expect("read store transaction backend pid")
-}
-
-async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let blocked: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM pg_stat_activity
-                 WHERE pid = $1 AND $2 = ANY(pg_blocking_pids(pid))
-             )",
-        )
-        .bind(waiter_pid)
-        .bind(holder_pid)
-        .fetch_one(pool)
-        .await
-        .expect("inspect store transaction blocking");
-        if blocked {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for store backend {waiter_pid} to block on {holder_pid}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) -> i32 {
-    tokio::time::timeout(Duration::from_secs(10), receiver)
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
-        .unwrap_or_else(|_| panic!("{label} task exited before reporting its backend pid"))
 }
 
 #[tokio::test]
@@ -379,7 +348,7 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
     let holder_beneficiary = fixture.beneficiary_id.clone();
     let holder_projection = winning_projection.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut holder = Some(tokio::spawn(async move {
         let mut tx = holder_pool.begin().await.expect("begin held correction");
         let pid = transaction_pid(&mut tx).await;
         let result = publish(
@@ -403,13 +372,15 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
                 Err(error)
             }
         }
-    });
+    }));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(holder.as_ref().expect("holder task is registered"));
     let holder_pid = receive_pid(holder_ready_rx, "receive correction holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_beneficiary = fixture.beneficiary_id.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(tokio::spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin waiting correction");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal waiting correction");
@@ -424,20 +395,16 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         .await;
         tx.rollback().await.expect("rollback waiting correction");
         result
-    });
+    }));
+    tasks.watch(waiter.as_ref().expect("waiter task is registered"));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let winner = tokio::time::timeout(Duration::from_secs(10), holder)
+    let winner = join_with_timeout(&mut holder, "held correction")
         .await
-        .expect("held correction finished")
-        .expect("join held correction")
         .expect("winning correction applied");
-    let loser = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("waiting correction finished")
-        .expect("join waiting correction");
+    let loser = join_with_timeout(&mut waiter, "waiting correction").await;
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert_eq!(winner.revision, 2);
     assert!(matches!(
@@ -484,6 +451,83 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
     .expect("count losing correction");
     assert_eq!(loser_count, 0);
     cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let unrelated = Fixture::create()
+        .await
+        .expect("create unrelated cleanup fixture");
+    committed_publish(
+        &unrelated,
+        None,
+        "unrelated-publication",
+        "unrelated-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish unrelated fixture");
+
+    let (ready, ready_rx) = oneshot::channel();
+    let pool = fixture.pool.clone();
+    let beneficiary_id = fixture.beneficiary_id.clone();
+    let mut task = Some(tokio::spawn(async move {
+        let mut tx = pool.begin().await.expect("begin owned publication");
+        publish(
+            &mut tx,
+            &beneficiary_id,
+            None,
+            "aborted-publication",
+            "aborted-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await
+        .expect("publish owned publication");
+        ready.send(()).expect("signal owned publication");
+        std::future::pending::<()>().await;
+    }));
+    tokio::time::timeout(support::coverage_concurrency::RACE_TIMEOUT, ready_rx)
+        .await
+        .expect("owned publication became ready")
+        .expect("owned publication task exited before readiness");
+    abort_and_join(&mut task, "owned publication").await;
+
+    let receipt = tokio::time::timeout(
+        support::coverage_concurrency::RACE_TIMEOUT,
+        committed_publish(
+            &fixture,
+            None,
+            "aborted-publication",
+            "aborted-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        ),
+    )
+    .await
+    .expect("replacement publication was not unblocked by task cleanup")
+    .expect("replacement publication after task cleanup");
+    assert_eq!(receipt.revision, 1);
+    assert_eq!(
+        load(&fixture.pool, &fixture.beneficiary_id)
+            .await
+            .expect("load replacement publication")
+            .revision,
+        receipt.revision
+    );
+    let unrelated_loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
+        .await
+        .expect("load unrelated fixture after cleanup");
+    assert_eq!(unrelated_loaded.revision, 1);
+    cleanup(&fixture).await;
+    cleanup(&unrelated).await;
 }
 
 #[tokio::test]
