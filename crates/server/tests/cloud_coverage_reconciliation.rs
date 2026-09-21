@@ -1328,6 +1328,351 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
 }
 
 #[tokio::test]
+async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
+    let Some(first) = Fixture::create().await else {
+        return;
+    };
+    let second = first.add_beneficiary().await;
+    let first_source = binding(&first, "independent-first", "independent-allocation-first");
+    let second_source = binding(
+        &second,
+        "independent-second",
+        "independent-allocation-second",
+    );
+    register(&first, &first_source, "independent-first-registration").await;
+    register(&second, &second_source, "independent-second-registration").await;
+    let first_ticket = begin(&first, &attempt_id(&first, "independent-first-attempt")).await;
+    let second_ticket = begin(&second, &attempt_id(&second, "independent-second-attempt")).await;
+    let first_observations = vec![SourceObservation::Complete {
+        source_id: first_source.source_id.clone(),
+        evidence_reference: "independent-first-evidence".into(),
+        paid_intervals: vec![],
+    }];
+    let second_observations = vec![SourceObservation::Complete {
+        source_id: second_source.source_id.clone(),
+        evidence_reference: "independent-second-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "independent-second-coverage".into(),
+            source_id: second_source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    }];
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder_pool = first.pool.clone();
+    let holder_ticket = first_ticket.clone();
+    let holder_observations = first_observations.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool
+            .begin()
+            .await
+            .expect("begin independent held finish");
+        let pid = transaction_pid(&mut tx).await;
+        let result = finish_collection(
+            &mut tx,
+            &holder_ticket,
+            "independent-first-aggregate",
+            &holder_observations,
+        )
+        .await;
+        holder_ready
+            .send(pid)
+            .expect("signal independent held finish");
+        holder_release.notified().await;
+        tx.rollback()
+            .await
+            .expect("rollback independent held finish");
+        result
+    });
+    let _holder_pid = holder_ready_rx
+        .await
+        .expect("receive independent holder pid");
+
+    let mut second_tx = second.pool.begin().await.expect("begin independent finish");
+    let second_receipt = finish_collection(
+        &mut second_tx,
+        &second_ticket,
+        "independent-second-aggregate",
+        &second_observations,
+    )
+    .await
+    .expect("finish independent beneficiary");
+    second_tx
+        .commit()
+        .await
+        .expect("commit independent beneficiary");
+    release.notify_one();
+
+    let first_result = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("independent held finish finished")
+        .expect("join independent held finish");
+    assert!(first_result.is_ok());
+    assert_eq!(second_receipt.outcome, PublicationOutcome::Applied);
+    assert!(matches!(
+        load(&first.pool, &first.beneficiary_id).await,
+        Err(StoreError::ProjectionUnavailable(
+            UnavailableReason::NeedsReconciliation
+        ))
+    ));
+    let second_loaded = load(&second.pool, &second.beneficiary_id)
+        .await
+        .expect("load independent committed beneficiary");
+    assert_eq!(second_loaded.revision, 2);
+    assert_eq!(second_loaded.coverage.paid_intervals.len(), 1);
+    let first_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&first.beneficiary_id)
+    .bind(&first_ticket.attempt_id)
+    .fetch_one(&first.pool)
+    .await
+    .expect("read independent rolled back status");
+    assert_eq!(first_status, "pending");
+    cleanup(&second).await;
+    cleanup(&first).await;
+}
+
+#[tokio::test]
+async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "visibility-source", "visibility-allocation");
+    register(&fixture, &source, "visibility-registration").await;
+    let first_ticket = begin(&fixture, &attempt_id(&fixture, "visibility-first")).await;
+    let first_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "visibility-first-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "visibility-old".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut first_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin initial visibility finish");
+    finish_collection(
+        &mut first_tx,
+        &first_ticket,
+        "visibility-first-aggregate",
+        std::slice::from_ref(&first_observation),
+    )
+    .await
+    .expect("finish initial visibility collection");
+    first_tx
+        .commit()
+        .await
+        .expect("commit initial visibility collection");
+
+    let second_ticket = begin(&fixture, &attempt_id(&fixture, "visibility-second")).await;
+    let second_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "visibility-second-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "visibility-new".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 100,
+            paid_until: 200,
+            failed_renewal_id: None,
+        }],
+    };
+    let release = Arc::new(Notify::new());
+    let (ready, ready_rx) = oneshot::channel();
+    let holder_pool = fixture.pool.clone();
+    let holder_ticket = second_ticket.clone();
+    let holder_observation = second_observation.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool.begin().await.expect("begin visibility holder");
+        let pid = transaction_pid(&mut tx).await;
+        let result = finish_collection(
+            &mut tx,
+            &holder_ticket,
+            "visibility-second-aggregate",
+            &[holder_observation],
+        )
+        .await;
+        ready.send(pid).expect("signal visibility holder");
+        holder_release.notified().await;
+        tx.commit().await.expect("commit visibility holder");
+        result
+    });
+    let _holder_pid = ready_rx.await.expect("receive visibility holder pid");
+
+    let visible = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load old committed snapshot");
+    assert_eq!(visible.revision, 2);
+    assert_eq!(
+        visible.coverage.paid_intervals[0].coverage_id,
+        "visibility-old"
+    );
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&second_ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read pending visibility attempt");
+    assert_eq!(status, "pending");
+    release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("visibility holder finished")
+        .expect("join visibility holder")
+        .expect("visibility finish applied");
+    assert_eq!(result.revision, 3);
+    let current = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load new committed snapshot");
+    assert_eq!(
+        current.coverage.paid_intervals[0].coverage_id,
+        "visibility-new"
+    );
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(
+        &fixture,
+        "rollback-visibility-source",
+        "rollback-visibility-allocation",
+    );
+    register(&fixture, &source, "rollback-visibility-registration").await;
+    let first_ticket = begin(&fixture, &attempt_id(&fixture, "rollback-visibility-first")).await;
+    let old_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "rollback-old-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "rollback-old".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut first_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin rollback initial finish");
+    finish_collection(
+        &mut first_tx,
+        &first_ticket,
+        "rollback-old-aggregate",
+        std::slice::from_ref(&old_observation),
+    )
+    .await
+    .expect("finish rollback initial collection");
+    first_tx
+        .commit()
+        .await
+        .expect("commit rollback initial collection");
+
+    let second_ticket = begin(
+        &fixture,
+        &attempt_id(&fixture, "rollback-visibility-second"),
+    )
+    .await;
+    let new_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "rollback-new-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "rollback-new".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 100,
+            paid_until: 200,
+            failed_renewal_id: None,
+        }],
+    };
+    let release = Arc::new(Notify::new());
+    let (ready, ready_rx) = oneshot::channel();
+    let holder_pool = fixture.pool.clone();
+    let holder_ticket = second_ticket.clone();
+    let holder_observation = new_observation.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool.begin().await.expect("begin rollback holder");
+        let pid = transaction_pid(&mut tx).await;
+        let result = finish_collection(
+            &mut tx,
+            &holder_ticket,
+            "rollback-new-aggregate",
+            &[holder_observation],
+        )
+        .await;
+        ready.send(pid).expect("signal rollback holder");
+        holder_release.notified().await;
+        tx.rollback().await.expect("rollback visibility holder");
+        result
+    });
+    let _holder_pid = ready_rx.await.expect("receive rollback holder pid");
+    let visible = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load snapshot before rollback");
+    assert_eq!(visible.revision, 2);
+    assert_eq!(
+        visible.coverage.paid_intervals[0].coverage_id,
+        "rollback-old"
+    );
+    release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("rollback holder finished")
+        .expect("join rollback holder");
+    assert!(result.is_ok());
+    assert_eq!(
+        load(&fixture.pool, &fixture.beneficiary_id)
+            .await
+            .expect("load snapshot after rollback")
+            .revision,
+        2
+    );
+
+    let mut retry_tx = fixture.pool.begin().await.expect("begin visibility retry");
+    let retry = finish_collection(
+        &mut retry_tx,
+        &second_ticket,
+        "rollback-new-aggregate",
+        std::slice::from_ref(&new_observation),
+    )
+    .await
+    .expect("retry rolled back visibility finish");
+    retry_tx.commit().await.expect("commit visibility retry");
+    assert_eq!(retry.revision, 3);
+    let mut replay_tx = fixture.pool.begin().await.expect("begin visibility replay");
+    let replay = finish_collection(
+        &mut replay_tx,
+        &second_ticket,
+        "rollback-new-aggregate",
+        std::slice::from_ref(&new_observation),
+    )
+    .await
+    .expect("replay visibility retry");
+    replay_tx.commit().await.expect("commit visibility replay");
+    assert_eq!(replay.revision, retry.revision);
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
 async fn identical_concurrent_completions_apply_once_and_replay_once() {
     let Some(fixture) = Fixture::create().await else {
         return;
