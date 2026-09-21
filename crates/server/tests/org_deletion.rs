@@ -19,6 +19,11 @@ use sotto_server::billing::{
     ProviderError, ProviderErrorKind, ProviderResult, SubscriptionObservation,
     SubscriptionProvider, SubscriptionSnapshot, SubscriptionStatus,
 };
+use sotto_server::cloud_coverage::ConfirmedPaidInterval;
+use sotto_server::cloud_coverage_reconciliation::{
+    begin_collection, finish_collection, register_source, SourceBinding, SourceObservation,
+};
+use sotto_server::cloud_coverage_store::PublicationOutcome;
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -149,12 +154,11 @@ fn current(subscription_id: &str, status: SubscriptionStatus) -> SubscriptionObs
 }
 
 async fn pool_or_skip() -> Option<PgPool> {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        return None;
-    };
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
         return None;
     }
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
     let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
     assert!(
         matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
@@ -195,10 +199,27 @@ async fn clean_abandoned_fixtures(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("delete abandoned deletion organisations");
-    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-owner-%' OR id LIKE 'deletion-api-%'")
-        .execute(pool)
-        .await
-        .expect("delete abandoned deletion users");
+    let abandoned_beneficiaries: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM users \
+         WHERE id LIKE 'deletion-owner-%' \
+            OR id LIKE 'deletion-api-%' \
+            OR id LIKE 'deletion-unrelated-%'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("list abandoned coverage beneficiaries");
+    for beneficiary_id in abandoned_beneficiaries {
+        cleanup_coverage(pool, &beneficiary_id).await;
+    }
+    sqlx::query(
+        "DELETE FROM users \
+         WHERE id LIKE 'deletion-owner-%' \
+            OR id LIKE 'deletion-api-%' \
+            OR id LIKE 'deletion-unrelated-%'",
+    )
+    .execute(pool)
+    .await
+    .expect("delete abandoned deletion users");
 }
 
 async fn seed_owner(pool: &PgPool) -> (String, String) {
@@ -378,6 +399,7 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .execute(pool)
         .await
         .expect("delete operation history");
+    cleanup_coverage(pool, user_id).await;
     sqlx::query("DELETE FROM organizations WHERE id = $1")
         .bind(org_id)
         .execute(pool)
@@ -388,6 +410,63 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .execute(pool)
         .await
         .expect("delete owner fixture");
+}
+
+async fn coverage_snapshot(pool: &PgPool, beneficiary_id: &str) -> Vec<Vec<serde_json::Value>> {
+    let queries = [
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_coordinators WHERE beneficiary_id = $1) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY attempt_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 ORDER BY revision, coverage_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_heads WHERE beneficiary_id = $1) t",
+    ];
+    let mut snapshots = Vec::with_capacity(queries.len());
+    for query in queries {
+        snapshots.push(
+            sqlx::query(query)
+                .bind(beneficiary_id)
+                .fetch_all(pool)
+                .await
+                .expect("read coverage snapshot")
+                .into_iter()
+                .map(|row| sqlx::Row::try_get(&row, "value").expect("decode coverage snapshot"))
+                .collect(),
+        );
+    }
+    snapshots
+}
+
+async fn cleanup_coverage(pool: &PgPool, beneficiary_id: &str) {
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage head");
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage facts");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("clear coverage current attempt");
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_revisions",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(beneficiary_id)
+            .execute(pool)
+            .await
+            .expect("delete coverage fixture");
+    }
 }
 
 fn metric_value(
@@ -998,6 +1077,231 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
     );
     assert_eq!(after.purge_duration.count, before.purge_duration.count + 1);
 
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let source = SourceBinding {
+        beneficiary_id: owner_id.clone(),
+        source_id: format!("{owner_id}:source"),
+        provider_namespace: "deletion-test".into(),
+        external_allocation_reference: format!("allocation-{owner_id}"),
+        ownership_evidence_reference: format!("ownership-{owner_id}"),
+    };
+    let mut tx = pool.begin().await.expect("begin coverage registration");
+    register_source(&mut tx, "deletion-coverage-registration", &source)
+        .await
+        .expect("register deletion coverage source");
+    tx.commit().await.expect("commit coverage registration");
+
+    let mut tx = pool.begin().await.expect("begin coverage collection");
+    let ticket = begin_collection(&mut tx, &owner_id, "deletion-coverage-complete")
+        .await
+        .expect("begin deletion coverage collection");
+    tx.commit().await.expect("commit coverage collection");
+    let observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "deletion-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 10,
+            paid_until: 20,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut tx = pool.begin().await.expect("begin coverage finish");
+    finish_collection(
+        &mut tx,
+        &ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("finish deletion coverage collection");
+    tx.commit().await.expect("commit coverage finish");
+    let mut tx = pool.begin().await.expect("begin pending deletion coverage");
+    let pending_ticket = begin_collection(&mut tx, &owner_id, "deletion-coverage-pending")
+        .await
+        .expect("begin pending deletion coverage");
+    tx.commit().await.expect("commit pending deletion coverage");
+    let before = coverage_snapshot(&pool, &owner_id).await;
+
+    let unrelated_user = format!("deletion-unrelated-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'deletion-test', $1)",
+    )
+    .bind(&unrelated_user)
+    .execute(&pool)
+    .await
+    .expect("insert unrelated coverage beneficiary");
+    let unrelated_source = SourceBinding {
+        beneficiary_id: unrelated_user.clone(),
+        source_id: format!("{unrelated_user}:source"),
+        provider_namespace: "deletion-test".into(),
+        external_allocation_reference: format!("allocation-{unrelated_user}"),
+        ownership_evidence_reference: format!("ownership-{unrelated_user}"),
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin unrelated coverage registration");
+    register_source(
+        &mut tx,
+        "deletion-unrelated-registration",
+        &unrelated_source,
+    )
+    .await
+    .expect("register unrelated coverage source");
+    tx.commit()
+        .await
+        .expect("commit unrelated coverage registration");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin unrelated coverage collection");
+    let unrelated_ticket =
+        begin_collection(&mut tx, &unrelated_user, "deletion-unrelated-collection")
+            .await
+            .expect("begin unrelated coverage collection");
+    tx.commit()
+        .await
+        .expect("commit unrelated coverage collection");
+    let mut tx = pool.begin().await.expect("begin unrelated coverage finish");
+    finish_collection(
+        &mut tx,
+        &unrelated_ticket,
+        "unrelated-aggregate-evidence",
+        &[SourceObservation::Complete {
+            source_id: unrelated_source.source_id.clone(),
+            evidence_reference: "unrelated-source-evidence".into(),
+            paid_intervals: vec![],
+        }],
+    )
+    .await
+    .expect("finish unrelated coverage collection");
+    tx.commit()
+        .await
+        .expect("commit unrelated coverage collection");
+    let unrelated_before = coverage_snapshot(&pool, &unrelated_user).await;
+
+    let tree = seed_project_tree(&pool, &org_id, &owner_id).await;
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request organisation deletion with coverage");
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let requested_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim requested deletion")
+        .expect("requested deletion is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start deletion billing phase")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim billing deletion")
+        .expect("billing deletion is due");
+    advance(&pool, &billing_lease, None)
+        .await
+        .expect("enter deletion retention")
+        .expect("retention transition");
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let operation_id = requested.id;
+    age_deletion_for_purge(&pool, &operation_id).await;
+    let retention_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim retention work")
+        .expect("retention work is due");
+    advance(&pool, &retention_lease, None)
+        .await
+        .expect("enter coverage purge")
+        .expect("purge transition");
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let purge_lease = claim_due(&pool, "coverage-deletion-worker")
+        .await
+        .expect("claim purge work")
+        .expect("purge work is due");
+    advance(&pool, &purge_lease, None)
+        .await
+        .expect("purge organisation with coverage")
+        .expect("completed purge transition");
+
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin coverage replay after purge");
+    let replay = finish_collection(
+        &mut tx,
+        &ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("replay coverage after organisation purge");
+    tx.commit()
+        .await
+        .expect("commit coverage replay after purge");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay.revision, 2);
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM environment_grants WHERE env_id = $1)",
+        )
+        .bind(&tree.environment)
+        .fetch_one(&pool)
+        .await
+        .expect("read purged organisation grant"),
+        "coverage replay must not recreate purged grants"
+    );
+    assert_eq!(
+        coverage_snapshot(&pool, &unrelated_user).await,
+        unrelated_before,
+        "organisation purge must not change unrelated beneficiary coverage"
+    );
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
+            .bind(&tree.project)
+            .fetch_one(&pool)
+            .await
+            .expect("read purged organisation project");
+    assert!(
+        !project_exists,
+        "organisation purge must remove its project tree"
+    );
+    let pending_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&owner_id)
+    .bind(&pending_ticket.attempt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read preserved pending coverage attempt");
+    assert_eq!(pending_status, "pending");
+    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+        .bind(&owner_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read preserved coverage owner");
+    assert!(
+        user_exists,
+        "organisation purge must not remove the beneficiary"
+    );
+
+    cleanup_coverage(&pool, &unrelated_user).await;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&unrelated_user)
+        .execute(&pool)
+        .await
+        .expect("delete unrelated coverage beneficiary");
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

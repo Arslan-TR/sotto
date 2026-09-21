@@ -8,19 +8,94 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{PgPool, Row};
+use std::str::FromStr;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use sotto_server::auth::session;
+use sotto_server::cloud_coverage::ConfirmedPaidInterval;
+use sotto_server::cloud_coverage_reconciliation::{
+    begin_collection, finish_collection, register_source, SourceBinding, SourceObservation,
+};
+use sotto_server::cloud_coverage_store::PublicationOutcome;
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::state::AppState;
 
 async fn pool_or_skip() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        return None;
+    }
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing destructive recovery tests against non-local host: {}",
+        options.get_host()
+    );
     let pool = db::connect(&url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
     Some(pool)
+}
+
+async fn coverage_snapshot(pool: &PgPool, beneficiary_id: &str) -> Vec<Vec<serde_json::Value>> {
+    let queries = [
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_coordinators WHERE beneficiary_id = $1) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY attempt_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 ORDER BY revision, coverage_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_heads WHERE beneficiary_id = $1) t",
+    ];
+    let mut snapshots = Vec::with_capacity(queries.len());
+    for query in queries {
+        snapshots.push(
+            sqlx::query(query)
+                .bind(beneficiary_id)
+                .fetch_all(pool)
+                .await
+                .expect("read coverage snapshot")
+                .into_iter()
+                .map(|row| row.try_get("value").expect("decode coverage snapshot"))
+                .collect(),
+        );
+    }
+    snapshots
+}
+
+async fn cleanup_coverage(pool: &PgPool, beneficiary_id: &str) {
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage head");
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete coverage facts");
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("clear coverage current attempt");
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_revisions",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(beneficiary_id)
+            .execute(pool)
+            .await
+            .expect("delete coverage fixture");
+    }
 }
 
 fn app(pool: PgPool) -> Router {
@@ -106,7 +181,7 @@ fn bundle_body(tag: &str) -> String {
 #[tokio::test]
 async fn reset_replaces_material_and_deletes_grants() {
     let Some(pool) = pool_or_skip().await else {
-        eprintln!("skipping: DATABASE_URL not set");
+        eprintln!("skipping: SOTTO_RUN_DB_TESTS=1 and DATABASE_URL required");
         return;
     };
     sqlx::query("DELETE FROM organizations WHERE id = 'rec-o'")
@@ -277,4 +352,224 @@ async fn reset_requires_an_initialized_account() {
         .0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: SOTTO_RUN_DB_TESTS=1 and DATABASE_URL required");
+        return;
+    };
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("rec-coverage-{suffix}");
+    let token = fresh_session(&pool, &user_id, &format!("{user_id}-subject")).await;
+    let (status, body) = send(&pool, "PUT", "/account", &token, Some(bundle_body("old"))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let org_id = format!("rec-coverage-org-{suffix}");
+    let project_id = format!("rec-coverage-project-{suffix}");
+    let environment_id = format!("rec-coverage-environment-{suffix}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        "/orgs",
+        &token,
+        Some(format!(
+            r#"{{"id":"{org_id}","enc_name":"{}","enc_org_key":"{}"}}"#,
+            b64(b"coverage-org"),
+            b64(b"coverage-org-key")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        "/projects",
+        &token,
+        Some(format!(
+            r#"{{"id":"{project_id}","enc_name":"{}","org_id":"{org_id}"}}"#,
+            b64(b"coverage-project")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        &format!("/projects/{project_id}/environments"),
+        &token,
+        Some(format!(
+            r#"{{"id":"{environment_id}","enc_name":"{}","enc_vault_key":"{}"}}"#,
+            b64(b"coverage-environment"),
+            b64(b"coverage-vault-key")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &pool,
+        "POST",
+        &format!("/environments/{environment_id}/grants"),
+        &token,
+        Some(format!(
+            r#"{{"user_id":"{user_id}","enc_vault_key":"{}"}}"#,
+            b64(b"coverage-grant")
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let source = SourceBinding {
+        beneficiary_id: user_id.clone(),
+        source_id: format!("{user_id}:source"),
+        provider_namespace: "recovery-test".into(),
+        external_allocation_reference: format!("allocation-{suffix}"),
+        ownership_evidence_reference: format!("ownership-{suffix}"),
+    };
+    let mut tx = pool.begin().await.expect("begin coverage registration");
+    register_source(&mut tx, "recovery-registration", &source)
+        .await
+        .expect("register coverage source");
+    tx.commit().await.expect("commit coverage registration");
+
+    let mut tx = pool.begin().await.expect("begin completed coverage");
+    let completed_ticket = begin_collection(&mut tx, &user_id, "recovery-completed")
+        .await
+        .expect("begin completed coverage");
+    tx.commit().await.expect("commit completed begin");
+    let completed_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "recovery-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 10,
+            paid_until: 20,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut tx = pool.begin().await.expect("begin completed finish");
+    finish_collection(
+        &mut tx,
+        &completed_ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&completed_observation),
+    )
+    .await
+    .expect("finish completed coverage");
+    tx.commit().await.expect("commit completed coverage");
+
+    let mut tx = pool.begin().await.expect("begin pending coverage");
+    let pending_ticket = begin_collection(&mut tx, &user_id, "recovery-pending")
+        .await
+        .expect("begin pending coverage");
+    tx.commit().await.expect("commit pending begin");
+    let before_reset = coverage_snapshot(&pool, &user_id).await;
+
+    let (status, body) = send(
+        &pool,
+        "POST",
+        "/account/reset",
+        &token,
+        Some(bundle_body("new")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(coverage_snapshot(&pool, &user_id).await, before_reset);
+    let (status, body) = send(&pool, "GET", "/account", &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&b64(b"new-priv")),
+        "reset must replace key material"
+    );
+    assert!(!body.contains(&b64(b"old-priv")));
+    assert_eq!(
+        send(
+            &pool,
+            "GET",
+            &format!("/environments/{environment_id}/grant"),
+            &token,
+            None,
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "reset must remove the grant before coverage replay"
+    );
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin completed replay after reset");
+    let replay = finish_collection(
+        &mut tx,
+        &completed_ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&completed_observation),
+    )
+    .await
+    .expect("replay completed coverage after reset");
+    tx.commit()
+        .await
+        .expect("commit completed replay after reset");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay.revision, 2);
+    assert_eq!(
+        send(
+            &pool,
+            "GET",
+            &format!("/environments/{environment_id}/grant"),
+            &token,
+            None,
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "coverage replay must not restore a deleted grant"
+    );
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin pending finish after reset");
+    finish_collection(
+        &mut tx,
+        &pending_ticket,
+        "aggregate-evidence-after-reset",
+        &[SourceObservation::Unavailable {
+            source_id: source.source_id.clone(),
+            evidence_reference: "source-evidence-after-reset".into(),
+            reason: sotto_server::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
+        }],
+    )
+    .await
+    .expect("finish pending coverage after reset");
+    tx.commit()
+        .await
+        .expect("commit pending finish after reset");
+    assert_eq!(
+        send(
+            &pool,
+            "GET",
+            &format!("/environments/{environment_id}/grant"),
+            &token,
+            None,
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "coverage completion must not restore a deleted grant"
+    );
+
+    cleanup_coverage(&pool, &user_id).await;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("delete recovery coverage organisation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("delete recovery coverage user");
 }
