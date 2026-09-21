@@ -6,8 +6,9 @@ use sotto_server::cloud_coverage_store::{
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::PgPool;
-use tokio::sync::Barrier;
+use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::{oneshot, Barrier, Notify};
+use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
 const DAY: i64 = 24 * 60 * 60;
@@ -112,6 +113,38 @@ async fn committed_publish(
     .await?;
     tx.commit().await.expect("commit publication");
     Ok(receipt)
+}
+
+async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read store transaction backend pid")
+}
+
+async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE pid = $1 AND $2 = ANY(pg_blocking_pids(pid))
+             )",
+        )
+        .bind(waiter_pid)
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .expect("inspect store transaction blocking");
+        if blocked {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for store backend {waiter_pid} to block on {holder_pid}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]
@@ -297,6 +330,138 @@ async fn operation_conflict_and_stale_replay_cannot_rewind_head() {
             .revision,
         2
     );
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    committed_publish(
+        &fixture,
+        None,
+        "correction-base",
+        "correction-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![paid("correction-base-fact", "personal", 0, 30 * DAY)],
+        },
+    )
+    .await
+    .expect("publish correction base");
+
+    let winning_projection = CoverageProjection::Complete {
+        paid_intervals: vec![paid(
+            "correction-winner-fact",
+            "personal",
+            30 * DAY,
+            60 * DAY,
+        )],
+    };
+    let losing_projection = CoverageProjection::Complete {
+        paid_intervals: vec![paid(
+            "correction-loser-fact",
+            "personal",
+            60 * DAY,
+            90 * DAY,
+        )],
+    };
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder_pool = fixture.pool.clone();
+    let holder_beneficiary = fixture.beneficiary_id.clone();
+    let holder_projection = winning_projection.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool.begin().await.expect("begin held correction");
+        let pid = transaction_pid(&mut tx).await;
+        let result = publish(
+            &mut tx,
+            &holder_beneficiary,
+            Some(1),
+            "correction-winner",
+            "correction-winner-evidence",
+            &holder_projection,
+        )
+        .await;
+        holder_ready.send(pid).expect("signal held correction");
+        holder_release.notified().await;
+        match result {
+            Ok(receipt) => {
+                tx.commit().await.expect("commit held correction");
+                Ok(receipt)
+            }
+            Err(error) => {
+                tx.rollback().await.expect("rollback held correction");
+                Err(error)
+            }
+        }
+    });
+    let holder_pid = holder_ready_rx
+        .await
+        .expect("receive correction holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_beneficiary = fixture.beneficiary_id.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.expect("begin waiting correction");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready.send(pid).expect("signal waiting correction");
+        let result = publish(
+            &mut tx,
+            &waiter_beneficiary,
+            Some(1),
+            "correction-loser",
+            "correction-loser-evidence",
+            &losing_projection,
+        )
+        .await;
+        tx.rollback().await.expect("rollback waiting correction");
+        result
+    });
+    let waiter_pid = waiter_ready_rx
+        .await
+        .expect("receive correction waiter pid");
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let winner = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("held correction finished")
+        .expect("join held correction")
+        .expect("winning correction applied");
+    let loser = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("waiting correction finished")
+        .expect("join waiting correction");
+    assert_eq!(winner.outcome, PublicationOutcome::Applied);
+    assert_eq!(winner.revision, 2);
+    assert!(matches!(
+        loser,
+        Err(StoreError::RevisionConflict {
+            expected: Some(1),
+            actual: Some(2),
+        })
+    ));
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load winning correction");
+    assert_eq!(loaded.revision, 2);
+    assert_eq!(loaded.coverage.paid_intervals.len(), 1);
+    assert_eq!(
+        loaded.coverage.paid_intervals[0].coverage_id,
+        "correction-winner-fact"
+    );
+    let loser_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 AND operation_id = 'correction-loser'",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count losing correction");
+    assert_eq!(loser_count, 0);
     cleanup(&fixture).await;
 }
 
