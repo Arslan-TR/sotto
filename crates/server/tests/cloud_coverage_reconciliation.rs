@@ -18,7 +18,7 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block,
+    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskGuard,
 };
 
 struct Fixture {
@@ -948,6 +948,8 @@ async fn publication_before_coordinator_lock(
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive bootstrap coordinator pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -969,6 +971,7 @@ async fn publication_before_coordinator_lock(
             .expect("rollback bootstrap registration");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive bootstrap registration pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
 
@@ -1112,6 +1115,8 @@ async fn publication_after_revision_anchor(
         publisher_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&publisher);
     let publisher_pid = receive_pid(publisher_ready_rx, "receive bootstrap publisher pid").await;
 
     let source = binding(
@@ -1137,6 +1142,7 @@ async fn publication_after_revision_anchor(
             .expect("rollback anchored bootstrap registration");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(
         waiter_ready_rx,
         "receive anchored bootstrap registration pid",
@@ -1515,6 +1521,8 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive allocation holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1528,6 +1536,7 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         tx.rollback().await.expect("rollback allocation waiter");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive allocation waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -1578,6 +1587,8 @@ async fn competing_source_claims_preserve_global_source_identity() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive identity holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1591,6 +1602,7 @@ async fn competing_source_claims_preserve_global_source_identity() {
         tx.rollback().await.expect("rollback identity waiter");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive identity waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -1654,6 +1666,8 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive registration holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1673,6 +1687,7 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         tx.rollback().await.expect("rollback superseded finish");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -1813,6 +1828,8 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
             }
         }
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive completion holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1840,6 +1857,7 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
             }
         }
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive registration waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -1958,6 +1976,8 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive pending replacement pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -1985,6 +2005,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
             .expect("rollback superseded pending finish");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded pending finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -2211,6 +2232,8 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         holder_ready,
         release.clone(),
     ));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive completing replacement pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2238,6 +2261,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
             .expect("rollback superseded completing finish");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded completing finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -2441,6 +2465,8 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
             .expect("rollback independent held finish");
         result
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let _holder_pid = receive_pid(holder_ready_rx, "receive independent holder pid").await;
 
     let mut second_tx = second.pool.begin().await.expect("begin independent finish");
@@ -2572,6 +2598,8 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
         tx.commit().await.expect("commit visibility holder");
         result
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let _holder_pid = receive_pid(ready_rx, "receive visibility holder pid").await;
 
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
@@ -2697,6 +2725,8 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         tx.rollback().await.expect("rollback visibility holder");
         result
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let _holder_pid = receive_pid(ready_rx, "receive rollback holder pid").await;
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
         .await
@@ -2805,6 +2835,8 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
             }
         }
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2833,6 +2865,7 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
             }
         }
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
@@ -2973,6 +3006,8 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
             }
         }
     });
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(&holder);
     let holder_pid = receive_pid(holder_ready_rx, "receive winning holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -2992,6 +3027,7 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
         tx.rollback().await.expect("rollback losing completion");
         result
     });
+    tasks.watch(&waiter);
     let waiter_pid = receive_pid(waiter_ready_rx, "receive losing waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();

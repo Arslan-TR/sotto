@@ -1,10 +1,39 @@
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::oneshot;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// The race tests deliberately use a finite budget. A blocked backend must never
 /// leave an integration test waiting indefinitely when a scenario fails.
 pub const RACE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Owns cancellation for every task in a race scenario. The guard is installed
+/// before readiness or lock observation starts, so an early panic cancels
+/// siblings instead of detaching them during unwinding. Successful scenarios
+/// still drain their typed handles with `join_with_timeout`.
+pub struct RaceTaskGuard {
+    handles: Vec<AbortHandle>,
+}
+
+impl RaceTaskGuard {
+    pub fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    pub fn watch<T>(&mut self, handle: &JoinHandle<T>) {
+        self.handles.push(handle.abort_handle());
+    }
+}
+
+impl Drop for RaceTaskGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
 
 pub async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
     timeout(
@@ -99,7 +128,7 @@ pub async fn abort_and_join<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::abort_and_join;
+    use super::{abort_and_join, RaceTaskGuard, RACE_TIMEOUT};
 
     #[tokio::test]
     async fn abort_and_join_drains_an_owned_task() {
@@ -108,5 +137,18 @@ mod tests {
         }));
         abort_and_join(&mut task, "pending test task").await;
         assert!(task.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_guard_aborts_siblings_on_unwind() {
+        let mut task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        {
+            let mut guard = RaceTaskGuard::new();
+            guard.watch(&task);
+        }
+        let result = tokio::time::timeout(RACE_TIMEOUT, &mut task).await;
+        assert!(matches!(result, Ok(Err(error)) if error.is_cancelled()));
     }
 }

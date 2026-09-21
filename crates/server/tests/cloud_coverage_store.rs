@@ -14,6 +14,7 @@ mod support;
 
 use support::coverage_concurrency::{
     abort_and_join, join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block,
+    RaceTaskGuard,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -372,6 +373,8 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
             }
         }
     }));
+    let mut tasks = RaceTaskGuard::new();
+    tasks.watch(holder.as_ref().expect("holder task is registered"));
     let holder_pid = receive_pid(holder_ready_rx, "receive correction holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
@@ -393,6 +396,7 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         tx.rollback().await.expect("rollback waiting correction");
         result
     }));
+    tasks.watch(waiter.as_ref().expect("waiter task is registered"));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
