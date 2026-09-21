@@ -199,10 +199,27 @@ async fn clean_abandoned_fixtures(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("delete abandoned deletion organisations");
-    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-owner-%' OR id LIKE 'deletion-api-%'")
-        .execute(pool)
-        .await
-        .expect("delete abandoned deletion users");
+    let abandoned_beneficiaries: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM users \
+         WHERE id LIKE 'deletion-owner-%' \
+            OR id LIKE 'deletion-api-%' \
+            OR id LIKE 'deletion-unrelated-%'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("list abandoned coverage beneficiaries");
+    for beneficiary_id in abandoned_beneficiaries {
+        cleanup_coverage(pool, &beneficiary_id).await;
+    }
+    sqlx::query(
+        "DELETE FROM users \
+         WHERE id LIKE 'deletion-owner-%' \
+            OR id LIKE 'deletion-api-%' \
+            OR id LIKE 'deletion-unrelated-%'",
+    )
+    .execute(pool)
+    .await
+    .expect("delete abandoned deletion users");
 }
 
 async fn seed_owner(pool: &PgPool) -> (String, String) {
