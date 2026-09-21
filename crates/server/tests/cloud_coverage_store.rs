@@ -453,6 +453,24 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         loaded.coverage.paid_intervals[0].coverage_id,
         "correction-winner-fact"
     );
+    let historical: (String, i64) = sqlx::query_as(
+        "SELECT operation_id, fact_count FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 AND revision = 1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read preserved correction history");
+    assert_eq!(historical, ("correction-base".into(), 1));
+    let historical_fact: String = sqlx::query_scalar(
+        "SELECT coverage_id FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read preserved correction fact");
+    assert_eq!(historical_fact, "correction-base-fact");
     let loser_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_revisions \
          WHERE beneficiary_id = $1 AND operation_id = 'correction-loser'",

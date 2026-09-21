@@ -217,6 +217,16 @@ async fn projection_snapshot(
     Option<i64>,
     Vec<(i64, String, String, String, Option<String>, i64)>,
     Vec<(i64, String, String, i64, i64, Option<String>)>,
+    Vec<(
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    )>,
 ) {
     let head = sqlx::query_scalar(
         "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
@@ -242,7 +252,16 @@ async fn projection_snapshot(
     .fetch_all(&fixture.pool)
     .await
     .expect("read coverage snapshot facts");
-    (head, revisions, facts)
+    let attempts = sqlx::query_as(
+        "SELECT attempt_id, collection_epoch, source_set_generation, expected_projection_revision, \
+                status, aggregate_evidence_reference, canonical_result::text, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read coverage snapshot attempts");
+    (head, revisions, facts, attempts)
 }
 
 async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
@@ -1948,6 +1967,42 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
     assert_eq!(applied.outcome, PublicationOutcome::Applied);
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
     assert_eq!(head_revision(&fixture).await, applied.revision);
+    let winner_evidence: String = sqlx::query_scalar(
+        "SELECT evidence_reference FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 AND revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(applied.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read winning completion evidence");
+    assert_eq!(winner_evidence, "serialised-aggregate-evidence");
+    let winner_fact: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT coverage_id, source_id, starts_at, paid_until \
+         FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 AND revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(applied.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read winning completion fact");
+    assert_eq!(
+        winner_fact,
+        (
+            "serialised-coverage".into(),
+            source.source_id.clone(),
+            0,
+            100
+        )
+    );
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read cleared completion attempt");
+    assert_eq!(current_attempt, None);
     let revision_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
     )
@@ -2061,6 +2116,34 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert!(matches!(loser, Err(ReconciliationError::OperationConflict)));
     assert_eq!(head_revision(&fixture).await, winner.revision);
+    let winner_evidence: String = sqlx::query_scalar(
+        "SELECT evidence_reference FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 AND revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(winner.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read conflicting winner evidence");
+    assert_eq!(winner_evidence, "winning-aggregate-evidence");
+    let winner_fact: String = sqlx::query_scalar(
+        "SELECT coverage_id FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(winner.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read conflicting winner fact");
+    assert_eq!(winner_fact, "winning-coverage");
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read cleared conflicting attempt");
+    assert_eq!(current_attempt, None);
     let loser_fact_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_revision_facts \
          WHERE beneficiary_id = $1 AND coverage_id = 'losing-coverage'",
