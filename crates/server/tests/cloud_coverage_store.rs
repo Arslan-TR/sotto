@@ -147,6 +147,13 @@ async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32
     }
 }
 
+async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) -> i32 {
+    tokio::time::timeout(Duration::from_secs(10), receiver)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+        .unwrap_or_else(|_| panic!("{label} task exited before reporting its backend pid"))
+}
+
 #[tokio::test]
 async fn missing_and_complete_empty_projection_are_distinct() {
     let Some(fixture) = Fixture::create().await else {
@@ -397,9 +404,7 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
             }
         }
     });
-    let holder_pid = holder_ready_rx
-        .await
-        .expect("receive correction holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive correction holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
@@ -420,9 +425,7 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         tx.rollback().await.expect("rollback waiting correction");
         result
     });
-    let waiter_pid = waiter_ready_rx
-        .await
-        .expect("receive correction waiter pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 

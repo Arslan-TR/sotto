@@ -296,6 +296,13 @@ async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32
     }
 }
 
+async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) -> i32 {
+    tokio::time::timeout(Duration::from_secs(10), receiver)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+        .unwrap_or_else(|_| panic!("{label} task exited before reporting its backend pid"))
+}
+
 async fn held_registration(
     pool: PgPool,
     operation_id: String,
@@ -1060,9 +1067,7 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         holder_ready,
         release.clone(),
     ));
-    let holder_pid = holder_ready_rx
-        .await
-        .expect("receive allocation holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive allocation holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = second.pool.clone();
@@ -1075,9 +1080,7 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         tx.rollback().await.expect("rollback allocation waiter");
         result
     });
-    let waiter_pid = waiter_ready_rx
-        .await
-        .expect("receive allocation waiter pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive allocation waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
@@ -1130,7 +1133,7 @@ async fn competing_source_claims_preserve_global_source_identity() {
         holder_ready,
         release.clone(),
     ));
-    let holder_pid = holder_ready_rx.await.expect("receive identity holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive identity holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = second.pool.clone();
@@ -1143,7 +1146,7 @@ async fn competing_source_claims_preserve_global_source_identity() {
         tx.rollback().await.expect("rollback identity waiter");
         result
     });
-    let waiter_pid = waiter_ready_rx.await.expect("receive identity waiter pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive identity waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
@@ -1209,9 +1212,7 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         holder_ready,
         release.clone(),
     ));
-    let holder_pid = holder_ready_rx
-        .await
-        .expect("receive registration holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive registration holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
@@ -1230,9 +1231,7 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         tx.rollback().await.expect("rollback superseded finish");
         result
     });
-    let waiter_pid = waiter_ready_rx
-        .await
-        .expect("receive superseded finish pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
@@ -1375,9 +1374,7 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
             }
         }
     });
-    let holder_pid = holder_ready_rx
-        .await
-        .expect("receive completion holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive completion holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
@@ -1404,9 +1401,7 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
             }
         }
     });
-    let waiter_pid = waiter_ready_rx
-        .await
-        .expect("receive registration waiter pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive registration waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
@@ -1554,9 +1549,7 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
             .expect("rollback independent held finish");
         result
     });
-    let _holder_pid = holder_ready_rx
-        .await
-        .expect("receive independent holder pid");
+    let _holder_pid = receive_pid(holder_ready_rx, "receive independent holder pid").await;
 
     let mut second_tx = second.pool.begin().await.expect("begin independent finish");
     let second_receipt = tokio::time::timeout(
@@ -1689,7 +1682,7 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
         tx.commit().await.expect("commit visibility holder");
         result
     });
-    let _holder_pid = ready_rx.await.expect("receive visibility holder pid");
+    let _holder_pid = receive_pid(ready_rx, "receive visibility holder pid").await;
 
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
         .await
@@ -1815,7 +1808,7 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         tx.rollback().await.expect("rollback visibility holder");
         result
     });
-    let _holder_pid = ready_rx.await.expect("receive rollback holder pid");
+    let _holder_pid = receive_pid(ready_rx, "receive rollback holder pid").await;
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
         .await
         .expect("load snapshot before rollback");
@@ -1925,7 +1918,7 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
             }
         }
     });
-    let holder_pid = holder_ready_rx.await.expect("receive holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
@@ -1953,7 +1946,7 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
             }
         }
     });
-    let waiter_pid = waiter_ready_rx.await.expect("receive waiter pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
@@ -2095,7 +2088,7 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
             }
         }
     });
-    let holder_pid = holder_ready_rx.await.expect("receive winning holder pid");
+    let holder_pid = receive_pid(holder_ready_rx, "receive winning holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
@@ -2114,7 +2107,7 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
         tx.rollback().await.expect("rollback losing completion");
         result
     });
-    let waiter_pid = waiter_ready_rx.await.expect("receive losing waiter pid");
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive losing waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
