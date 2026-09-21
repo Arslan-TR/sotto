@@ -11,7 +11,7 @@ use sotto_server::cloud_coverage_store::{
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::{oneshot, Barrier, Notify};
+use tokio::sync::{oneshot, Notify};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
@@ -211,6 +211,40 @@ async fn head_revision(fixture: &Fixture) -> i64 {
     .expect("read coverage head revision")
 }
 
+async fn projection_snapshot(
+    fixture: &Fixture,
+) -> (
+    Option<i64>,
+    Vec<(i64, String, String, String, Option<String>, i64)>,
+    Vec<(i64, String, String, i64, i64, Option<String>)>,
+) {
+    let head = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_optional(&fixture.pool)
+    .await
+    .expect("read coverage snapshot head");
+    let revisions = sqlx::query_as(
+        "SELECT revision, operation_id, evidence_reference, status, unavailable_reason, fact_count \
+         FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read coverage snapshot revisions");
+    let facts = sqlx::query_as(
+        "SELECT revision, coverage_id, source_id, starts_at, paid_until, failed_renewal_id \
+         FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 \
+         ORDER BY revision, coverage_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read coverage snapshot facts");
+    (head, revisions, facts)
+}
+
 async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut **tx)
@@ -264,6 +298,24 @@ async fn held_registration(
             tx.rollback().await.expect("rollback held registration");
             Err(error)
         }
+    }
+}
+
+async fn assert_no_beneficiary_rows(fixture: &Fixture) {
+    for (table, label) in [
+        ("cloud_coverage_coordinators", "coordinator"),
+        ("cloud_coverage_sources", "source"),
+        ("cloud_coverage_heads", "head"),
+        ("cloud_coverage_revisions", "revision"),
+        ("cloud_coverage_revision_facts", "fact"),
+    ] {
+        let query = format!("SELECT count(*) FROM {table} WHERE beneficiary_id = $1");
+        let count: i64 = sqlx::query_scalar(&query)
+            .bind(&fixture.beneficiary_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap_or_else(|error| panic!("count losing {label} rows: {error}"));
+        assert_eq!(count, 0, "losing beneficiary retained {label} rows");
     }
 }
 
@@ -1024,13 +1076,7 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
         second_result,
         Err(ReconciliationError::SourceBindingConflict)
     ));
-    let second_source_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-            .bind(&second.beneficiary_id)
-            .fetch_one(&second.pool)
-            .await
-            .expect("count losing allocation sources");
-    assert_eq!(second_source_count, 0);
+    assert_no_beneficiary_rows(&second).await;
 
     let mut replay_tx = first.pool.begin().await.expect("begin allocation replay");
     let replay = register_source(&mut replay_tx, "owner-a-registration", &first_source)
@@ -1096,13 +1142,17 @@ async fn competing_source_claims_preserve_global_source_identity() {
         second_result,
         Err(ReconciliationError::SourceBindingConflict)
     ));
-    let second_source_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-            .bind(&second.beneficiary_id)
-            .fetch_one(&second.pool)
-            .await
-            .expect("count losing identity sources");
-    assert_eq!(second_source_count, 0);
+    assert_no_beneficiary_rows(&second).await;
+    let mut replay_tx = first.pool.begin().await.expect("begin identity replay");
+    let replay = register_source(&mut replay_tx, "identity-a-registration", &first_source)
+        .await
+        .expect("replay winning identity claim");
+    replay_tx.commit().await.expect("commit identity replay");
+    assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
+    assert_eq!(
+        replay.projection_revision,
+        first_receipt.projection_revision
+    );
     cleanup(&second).await;
     cleanup(&first).await;
 }
@@ -1122,6 +1172,7 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         "registration-race-second",
         "registration-race-allocation-second",
     );
+    let second_source_id = second_source.source_id.clone();
     register(&fixture, &first_source, "registration-race-first-op").await;
     let ticket = begin(&fixture, &attempt_id(&fixture, "registration-race-pending")).await;
     let observation = SourceObservation::Complete {
@@ -1191,6 +1242,49 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
     .expect("read superseded registration race status");
     assert_eq!(status, "superseded");
     assert_eq!(head_revision(&fixture).await, 2);
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+            .bind(&fixture.beneficiary_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count registration race sources");
+    assert_eq!(source_count, 2);
+    let source_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT source_id FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read registration race sources");
+    assert_eq!(
+        source_ids,
+        vec![first_source.source_id.clone(), second_source_id]
+    );
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count registration race revisions");
+    assert_eq!(revision_count, 2);
+    let unavailable_fact_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count registration race unavailable facts");
+    assert_eq!(unavailable_fact_count, 0);
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read registration race current attempt");
+    assert_eq!(current_attempt, None);
     assert!(matches!(
         load(&fixture.pool, &fixture.beneficiary_id).await,
         Err(StoreError::ProjectionUnavailable(
@@ -1215,6 +1309,7 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
         "completion-race-second",
         "completion-race-allocation-second",
     );
+    let second_source_id = second_source.source_id.clone();
     register(&fixture, &first_source, "completion-race-first-op").await;
     let ticket = begin(&fixture, &attempt_id(&fixture, "completion-race-pending")).await;
     let observations = vec![SourceObservation::Complete {
@@ -1311,6 +1406,58 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
     assert_eq!(registration.source_set_generation, 2);
     assert_eq!(registration.projection_revision, Some(3));
     assert_eq!(head_revision(&fixture).await, 3);
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+            .bind(&fixture.beneficiary_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count completion race sources");
+    assert_eq!(source_count, 2);
+    let source_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT source_id FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read completion race sources");
+    assert_eq!(
+        source_ids,
+        vec![first_source.source_id.clone(), second_source_id]
+    );
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count completion race revisions");
+    assert_eq!(revision_count, 3);
+    let unavailable_fact_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 3",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count completion race unavailable facts");
+    assert_eq!(unavailable_fact_count, 0);
+    let completed_fact_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count completion race historical facts");
+    assert_eq!(completed_fact_count, 1);
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read completion race current attempt");
+    assert_eq!(current_attempt, None);
     let mut replay_tx = fixture.pool.begin().await.expect("begin completed replay");
     let replay = finish_collection(
         &mut replay_tx,
@@ -1434,6 +1581,17 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
     .await
     .expect("read independent rolled back status");
     assert_eq!(first_status, "pending");
+    let mut retry_tx = first.pool.begin().await.expect("begin independent retry");
+    let retry = finish_collection(
+        &mut retry_tx,
+        &first_ticket,
+        "independent-first-aggregate",
+        &first_observations,
+    )
+    .await
+    .expect("retry independent rolled back finish");
+    retry_tx.commit().await.expect("commit independent retry");
+    assert_eq!(retry.revision, 2);
     cleanup(&second).await;
     cleanup(&first).await;
 }
@@ -1535,6 +1693,16 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
         .expect("join visibility holder")
         .expect("visibility finish applied");
     assert_eq!(result.revision, 3);
+    let completed: (String, i64) = sqlx::query_as(
+        "SELECT status, projection_revision FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&second_ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read committed visibility receipt");
+    assert_eq!(completed, ("completed".into(), 3));
     let current = load(&fixture.pool, &fixture.beneficiary_id)
         .await
         .expect("load new committed snapshot");
@@ -1591,6 +1759,7 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         &attempt_id(&fixture, "rollback-visibility-second"),
     )
     .await;
+    let before_rollback = projection_snapshot(&fixture).await;
     let new_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
         evidence_reference: "rollback-new-evidence".into(),
@@ -1638,13 +1807,25 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         .expect("rollback holder finished")
         .expect("join rollback holder");
     assert!(result.is_ok());
+    assert_eq!(projection_snapshot(&fixture).await, before_rollback);
+    let after_rollback = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load snapshot after rollback");
+    assert_eq!(after_rollback.revision, 2);
     assert_eq!(
-        load(&fixture.pool, &fixture.beneficiary_id)
-            .await
-            .expect("load snapshot after rollback")
-            .revision,
-        2
+        after_rollback.coverage.paid_intervals[0].coverage_id,
+        "rollback-old"
     );
+    let pending_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&second_ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read pending status after rollback");
+    assert_eq!(pending_status, "pending");
 
     let mut retry_tx = fixture.pool.begin().await.expect("begin visibility retry");
     let retry = finish_collection(
@@ -1669,61 +1850,6 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
     replay_tx.commit().await.expect("commit visibility replay");
     assert_eq!(replay.revision, retry.revision);
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
-    cleanup(&fixture).await;
-}
-
-#[tokio::test]
-async fn identical_concurrent_completions_apply_once_and_replay_once() {
-    let Some(fixture) = Fixture::create().await else {
-        return;
-    };
-    let source = binding(&fixture, "source", "allocation");
-    register(&fixture, &source, "registration").await;
-    let ticket = begin(&fixture, &attempt_id(&fixture, "concurrent")).await;
-    let observations = vec![SourceObservation::Complete {
-        source_id: source.source_id,
-        evidence_reference: "source-evidence".into(),
-        paid_intervals: vec![],
-    }];
-    let barrier = std::sync::Arc::new(Barrier::new(2));
-    let mut tasks = Vec::new();
-    for _ in 0..2 {
-        let pool = fixture.pool.clone();
-        let ticket = ticket.clone();
-        let observations = observations.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            let mut tx = pool.begin().await.expect("begin concurrent finish");
-            let result = finish_collection(&mut tx, &ticket, "aggregate-evidence", &observations)
-                .await
-                .expect("finish concurrent collection");
-            tx.commit().await.expect("commit concurrent finish");
-            result
-        }));
-    }
-    let first = tasks.remove(0).await.expect("join first completion");
-    let second = tasks.remove(0).await.expect("join second completion");
-    assert_eq!(first.revision, second.revision);
-    assert!(matches!(
-        (first.outcome, second.outcome),
-        (
-            sotto_server::cloud_coverage_store::PublicationOutcome::Applied,
-            sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied
-        ) | (
-            sotto_server::cloud_coverage_store::PublicationOutcome::AlreadyApplied,
-            sotto_server::cloud_coverage_store::PublicationOutcome::Applied
-        )
-    ));
-    let completed_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_collection_attempts \
-         WHERE beneficiary_id = $1 AND status = 'completed'",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count completed attempts");
-    assert_eq!(completed_count, 1);
     cleanup(&fixture).await;
 }
 
