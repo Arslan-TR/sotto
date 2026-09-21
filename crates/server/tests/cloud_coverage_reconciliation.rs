@@ -334,6 +334,7 @@ async fn assert_no_beneficiary_rows(fixture: &Fixture) {
         ("cloud_coverage_heads", "head"),
         ("cloud_coverage_revisions", "revision"),
         ("cloud_coverage_revision_facts", "fact"),
+        ("cloud_coverage_collection_attempts", "collection attempt"),
     ] {
         let query = format!("SELECT count(*) FROM {table} WHERE beneficiary_id = $1");
         let count: i64 = sqlx::query_scalar(&query)
