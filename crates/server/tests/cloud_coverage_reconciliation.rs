@@ -10,10 +10,14 @@ use sotto_server::cloud_coverage_store::{
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use tokio::sync::{oneshot, Notify};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::Duration;
 use uuid::Uuid;
+
+mod support;
+
+use support::coverage_concurrency::{receive_pid, transaction_pid, wait_for_specific_block};
 
 struct Fixture {
     pool: PgPool,
@@ -301,45 +305,6 @@ async fn assert_projection_state(
             assert!(facts.is_empty());
         }
     }
-}
-
-async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
-    sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut **tx)
-        .await
-        .expect("read transaction backend pid")
-}
-
-async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let blocked: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM pg_stat_activity
-                 WHERE pid = $1 AND $2 = ANY(pg_blocking_pids(pid))
-             )",
-        )
-        .bind(waiter_pid)
-        .bind(holder_pid)
-        .fetch_one(pool)
-        .await
-        .expect("inspect coverage transaction blocking");
-        if blocked {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for backend {waiter_pid} to block on {holder_pid}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) -> i32 {
-    tokio::time::timeout(Duration::from_secs(10), receiver)
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
-        .unwrap_or_else(|_| panic!("{label} task exited before reporting its backend pid"))
 }
 
 async fn held_registration(
