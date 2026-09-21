@@ -48,6 +48,13 @@ def validate_database(env: dict[str, str]) -> None:
 
 def run(args: list[str], env: dict[str, str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(args), flush=True)
+
+    def emit(value: str | bytes | None, stream: object) -> None:
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode(errors="replace")
+            print(value, end="", file=stream)
+
     try:
         result = subprocess.run(
             args,
@@ -59,17 +66,15 @@ def run(args: list[str], env: dict[str, str], timeout_seconds: int) -> subproces
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as error:
+        emit(error.stdout, sys.stdout)
+        emit(error.stderr, sys.stderr)
         raise RuntimeError(f"timed out after {timeout_seconds}s: {' '.join(args)}") from error
     if result.returncode:
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
+        emit(result.stdout, sys.stdout)
+        emit(result.stderr, sys.stderr)
         raise RuntimeError(f"command exited {result.returncode}: {' '.join(args)}")
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
+    emit(result.stdout, sys.stdout)
+    emit(result.stderr, sys.stderr)
     return result
 
 
@@ -130,8 +135,16 @@ def main() -> int:
                     executor.submit(run, command, env, parsed.timeout)
                     for command in commands
                 ]
+                failures = []
                 for future in futures:
-                    future.result()
+                    try:
+                        future.result()
+                    except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
+                        failures.append(str(error))
+                if failures:
+                    raise RuntimeError(
+                        "parallel target failures:\n" + "\n".join(f"- {failure}" for failure in failures)
+                    )
     except (OSError, ValueError, RuntimeError) as error:
         print(f"cloud coverage race checks failed: {error}", file=sys.stderr)
         return 1
