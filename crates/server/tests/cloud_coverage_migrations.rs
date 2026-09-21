@@ -179,13 +179,13 @@ async fn seed_legacy_database(pool: &PgPool) -> (String, String, SourceBinding, 
 
     let first_json = serde_json::to_string(&[&first_binding]).expect("encode first bindings");
     let second_json = serde_json::to_string(&[&second_binding]).expect("encode second bindings");
-    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status) VALUES ('legacy-pending-a', $1, 1, 1, 2, $2::jsonb, 'pending'), ('legacy-superseded-a', $1, 2, 1, 2, $2::jsonb, 'superseded')")
+    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status) VALUES ('legacy-pending-a', $1, 3, 1, 2, $2::jsonb, 'pending'), ('legacy-superseded-a', $1, 1, 1, 2, $2::jsonb, 'superseded')")
         .bind(first)
         .bind(&first_json)
         .execute(pool)
         .await
         .expect("insert legacy incomplete attempts");
-    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status, aggregate_evidence_reference, canonical_result, projection_revision, completed_at) VALUES ('legacy-completed-a', $1, 3, 1, 1, $2::jsonb, 'completed', 'legacy-aggregate-a', $3::jsonb, 1, now()), ('legacy-completed-b', $4, 1, 1, 1, $5::jsonb, 'completed', 'legacy-aggregate-b', $6::jsonb, 1, now())")
+    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status, aggregate_evidence_reference, canonical_result, projection_revision, completed_at) VALUES ('legacy-completed-a', $1, 2, 1, 1, $2::jsonb, 'completed', 'legacy-aggregate-a', $3::jsonb, 1, now()), ('legacy-completed-b', $4, 1, 1, 1, $5::jsonb, 'completed', 'legacy-aggregate-b', $6::jsonb, 1, now())")
         .bind(first)
         .bind(&first_json)
         .bind(canonical_result(&first_binding, "legacy-aggregate-a", "legacy-evidence-a"))
