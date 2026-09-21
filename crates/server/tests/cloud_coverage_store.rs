@@ -26,9 +26,11 @@ struct Fixture {
 impl Fixture {
     async fn create() -> Option<Self> {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping cloud coverage store test: set SOTTO_RUN_DB_TESTS=1");
             return None;
         }
-        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
         let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
         assert!(
             matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),

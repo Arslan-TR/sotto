@@ -29,6 +29,7 @@ struct Fixture {
 impl Fixture {
     async fn create() -> Option<Self> {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping cloud coverage reconciliation test: set SOTTO_RUN_DB_TESTS=1");
             return None;
         }
         let database_url = std::env::var("DATABASE_URL")
@@ -1939,7 +1940,13 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     let first_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
         evidence_reference: "superseded-pending-first-evidence".into(),
-        paid_intervals: vec![],
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-pending-first-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 50,
+            failed_renewal_id: None,
+        }],
     };
     let second_attempt_id = attempt_id(&fixture, "superseded-pending-second");
     let release = Arc::new(Notify::new());
@@ -2089,6 +2096,31 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[1].4, "completed");
     assert_eq!(attempts[1].7, Some(second_receipt.revision));
+    let canonical: serde_json::Value = serde_json::from_str(
+        attempts[1]
+            .6
+            .as_deref()
+            .expect("pending replacement canonical result"),
+    )
+    .expect("decode pending replacement canonical result");
+    assert_eq!(
+        canonical,
+        serde_json::json!({
+            "aggregate_evidence_reference": "superseded-pending-second-aggregate",
+            "sources": [{
+                "source_id": source.source_id.clone(),
+                "evidence_reference": "superseded-pending-second-evidence",
+                "status": "complete",
+                "paid_intervals": [{
+                    "coverage_id": "superseded-pending-coverage",
+                    "source_id": source.source_id.clone(),
+                    "starts_at": 0,
+                    "paid_until": 100,
+                    "failed_renewal_id": null
+                }]
+            }]
+        })
+    );
     assert_eq!(
         revisions[1].1,
         format!("collection:{}", second_ticket.attempt_id)
@@ -2103,6 +2135,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         "superseded-pending-coverage"
     );
 
+    let before_stale = projection_snapshot(&fixture).await;
     let mut stale_tx = fixture
         .pool
         .begin()
@@ -2120,6 +2153,7 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
         .await
         .expect("rollback superseded pending retry");
     assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(projection_snapshot(&fixture).await, before_stale);
     assert_eq!(head_revision(&fixture).await, second_receipt.revision);
     cleanup(&fixture).await;
 }
@@ -2148,7 +2182,13 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
     let first_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
         evidence_reference: "superseded-completing-first-evidence".into(),
-        paid_intervals: vec![],
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-completing-first-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 50,
+            failed_renewal_id: None,
+        }],
     };
     let second_observation = SourceObservation::Complete {
         source_id: source.source_id.clone(),
@@ -2263,10 +2303,31 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         Some("superseded-completing-second-aggregate".into())
     );
     assert_eq!(attempts[1].7, Some(second_result.revision));
-    assert!(attempts[1]
-        .6
-        .as_deref()
-        .is_some_and(|result| result.contains("superseded-completing-coverage")));
+    let canonical: serde_json::Value = serde_json::from_str(
+        attempts[1]
+            .6
+            .as_deref()
+            .expect("completing replacement canonical result"),
+    )
+    .expect("decode completing replacement canonical result");
+    assert_eq!(
+        canonical,
+        serde_json::json!({
+            "aggregate_evidence_reference": "superseded-completing-second-aggregate",
+            "sources": [{
+                "source_id": source.source_id.clone(),
+                "evidence_reference": "superseded-completing-second-evidence",
+                "status": "complete",
+                "paid_intervals": [{
+                    "coverage_id": "superseded-completing-coverage",
+                    "source_id": source.source_id.clone(),
+                    "starts_at": 0,
+                    "paid_until": 100,
+                    "failed_renewal_id": null
+                }]
+            }]
+        })
+    );
     let loaded = load(&fixture.pool, &fixture.beneficiary_id)
         .await
         .expect("load completing replacement projection");
@@ -2296,6 +2357,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         .expect("commit completing replacement replay");
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
     assert_eq!(projection_snapshot(&fixture).await, before_replay);
+    let before_stale = projection_snapshot(&fixture).await;
     let mut stale_tx = fixture
         .pool
         .begin()
@@ -2313,6 +2375,7 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
         .await
         .expect("rollback superseded completing retry");
     assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(projection_snapshot(&fixture).await, before_stale);
     assert_eq!(head_revision(&fixture).await, second_result.revision);
     cleanup(&fixture).await;
 }
