@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 mod support;
 
-use support::coverage_concurrency::{receive_pid, transaction_pid, wait_for_specific_block};
+use support::coverage_concurrency::{
+    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block,
+};
 
 struct Fixture {
     pool: PgPool,
@@ -990,14 +992,10 @@ async fn publication_before_coordinator_lock(
         .expect("commit bootstrap projection");
     release.notify_one();
 
-    tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("bootstrap coordinator holder finished")
-        .expect("join bootstrap coordinator holder");
-    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("bootstrap registration finished")
-        .expect("join bootstrap registration");
+    let mut holder = Some(holder);
+    join_with_timeout(&mut holder, "bootstrap coordinator holder").await;
+    let mut waiter = Some(waiter);
+    let registration = join_with_timeout(&mut waiter, "bootstrap registration").await;
     assert!(matches!(
         registration,
         Err(ReconciliationError::BootstrapConflict)
@@ -1146,15 +1144,12 @@ async fn publication_after_revision_anchor(
     wait_for_specific_block(&fixture.pool, waiter_pid, publisher_pid).await;
     release.notify_one();
 
-    let publication = tokio::time::timeout(Duration::from_secs(10), publisher)
+    let mut publisher = Some(publisher);
+    let publication = join_with_timeout(&mut publisher, "bootstrap publisher")
         .await
-        .expect("bootstrap publisher finished")
-        .expect("join bootstrap publisher")
         .expect("bootstrap publication applied");
-    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("anchored bootstrap registration finished")
-        .expect("join anchored bootstrap registration");
+    let mut waiter = Some(waiter);
+    let registration = join_with_timeout(&mut waiter, "anchored bootstrap registration").await;
     assert!(matches!(
         registration,
         Err(ReconciliationError::Store(StoreError::RevisionConflict {
@@ -1536,15 +1531,12 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let first_receipt = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let first_receipt = join_with_timeout(&mut holder, "allocation holder")
         .await
-        .expect("allocation holder finished")
-        .expect("join allocation holder")
         .expect("first allocation claim applied");
-    let second_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("allocation waiter finished")
-        .expect("join allocation waiter");
+    let mut waiter = Some(waiter);
+    let second_result = join_with_timeout(&mut waiter, "allocation waiter").await;
     assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
     assert!(matches!(
         second_result,
@@ -1602,15 +1594,12 @@ async fn competing_source_claims_preserve_global_source_identity() {
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let first_receipt = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let first_receipt = join_with_timeout(&mut holder, "identity holder")
         .await
-        .expect("identity holder finished")
-        .expect("join identity holder")
         .expect("first identity claim applied");
-    let second_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("identity waiter finished")
-        .expect("join identity waiter");
+    let mut waiter = Some(waiter);
+    let second_result = join_with_timeout(&mut waiter, "identity waiter").await;
     assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
     assert!(matches!(
         second_result,
@@ -1687,15 +1676,12 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let registration = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let registration = join_with_timeout(&mut holder, "registration holder")
         .await
-        .expect("registration holder finished")
-        .expect("join registration holder")
         .expect("second registration applied");
-    let finish = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("superseded finish finished")
-        .expect("join superseded finish");
+    let mut waiter = Some(waiter);
+    let finish = join_with_timeout(&mut waiter, "superseded finish").await;
     assert_eq!(registration.source_set_generation, 2);
     assert!(matches!(
         finish,
@@ -1857,15 +1843,13 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let completion = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let completion = join_with_timeout(&mut holder, "held completion race")
         .await
-        .expect("held completion race finished")
-        .expect("join held completion race")
         .expect("completion race applied");
-    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
+    let mut waiter = Some(waiter);
+    let registration = join_with_timeout(&mut waiter, "registration race")
         .await
-        .expect("registration race finished")
-        .expect("join registration race")
         .expect("registration race applied");
     assert_eq!(completion.revision, 2);
     assert_eq!(completion.outcome, PublicationOutcome::Applied);
@@ -1998,14 +1982,10 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let second_ticket = tokio::time::timeout(Duration::from_secs(10), holder)
-        .await
-        .expect("pending replacement finished")
-        .expect("join pending replacement");
-    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("superseded pending finish finished")
-        .expect("join superseded pending finish");
+    let mut holder = Some(holder);
+    let second_ticket = join_with_timeout(&mut holder, "pending replacement").await;
+    let mut waiter = Some(waiter);
+    let first_result = join_with_timeout(&mut waiter, "superseded pending finish").await;
     assert!(matches!(
         first_result,
         Err(ReconciliationError::AttemptSuperseded)
@@ -2222,15 +2202,12 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let second_result = tokio::time::timeout(Duration::from_secs(10), holder)
+    let mut holder = Some(holder);
+    let second_result = join_with_timeout(&mut holder, "completing replacement")
         .await
-        .expect("completing replacement finished")
-        .expect("join completing replacement")
         .expect("completing replacement applied");
-    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
-        .await
-        .expect("superseded completing finish finished")
-        .expect("join superseded completing finish");
+    let mut waiter = Some(waiter);
+    let first_result = join_with_timeout(&mut waiter, "superseded completing finish").await;
     assert!(matches!(
         first_result,
         Err(ReconciliationError::AttemptSuperseded)
