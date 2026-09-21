@@ -18,7 +18,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskGuard,
+    join_with_timeout, receive_owned, receive_pid, transaction_pid, wait_for_specific_block,
+    RaceTaskGuard, RaceTaskOwner,
 };
 
 struct Fixture {
@@ -942,20 +943,19 @@ async fn publication_before_coordinator_lock(
     );
     let release = Arc::new(Notify::new());
     let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder = tokio::spawn(held_coordinator_insert(
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(held_coordinator_insert(
         fixture.pool.clone(),
         fixture.beneficiary_id.clone(),
         holder_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    )));
     let holder_pid = receive_pid(holder_ready_rx, "receive bootstrap coordinator pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_source = source.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool
             .begin()
             .await
@@ -970,8 +970,7 @@ async fn publication_before_coordinator_lock(
             .await
             .expect("rollback bootstrap registration");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive bootstrap registration pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
 
@@ -996,10 +995,13 @@ async fn publication_before_coordinator_lock(
         .expect("commit bootstrap projection");
     release.notify_one();
 
-    let mut holder = Some(holder);
-    join_with_timeout(&mut holder, "bootstrap coordinator holder").await;
-    let mut waiter = Some(waiter);
-    let registration = join_with_timeout(&mut waiter, "bootstrap registration").await;
+    receive_owned(&mut holder, "bootstrap coordinator holder")
+        .await
+        .expect("bootstrap coordinator holder completed");
+    let registration = receive_owned(&mut waiter, "bootstrap registration")
+        .await
+        .expect("bootstrap registration task completed");
+    owner.join_all().await.expect("join bootstrap race tasks");
     assert!(matches!(
         registration,
         Err(ReconciliationError::BootstrapConflict)
