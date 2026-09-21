@@ -2101,6 +2101,19 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[1].4, "completed");
     assert_eq!(attempts[1].7, Some(second_receipt.revision));
+    assert_eq!(
+        revisions[1].1,
+        format!("collection:{}", second_ticket.attempt_id)
+    );
+    assert_eq!(revisions[1].2, "superseded-pending-second-aggregate");
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load pending replacement projection");
+    assert_eq!(loaded.revision, second_receipt.revision);
+    assert_eq!(
+        loaded.coverage.paid_intervals[0].coverage_id,
+        "superseded-pending-coverage"
+    );
 
     let mut stale_tx = fixture
         .pool
