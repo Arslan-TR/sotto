@@ -13,8 +13,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    abort_and_join, join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block,
-    RaceTaskGuard,
+    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskGuard,
+    RaceTaskOwner,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -476,7 +476,8 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
     let (ready, ready_rx) = oneshot::channel();
     let pool = fixture.pool.clone();
     let beneficiary_id = fixture.beneficiary_id.clone();
-    let mut task = Some(tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let _task = owner.spawn(async move {
         let mut tx = pool.begin().await.expect("begin owned publication");
         publish(
             &mut tx,
@@ -492,12 +493,15 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
         .expect("publish owned publication");
         ready.send(()).expect("signal owned publication");
         std::future::pending::<()>().await;
-    }));
+    });
     tokio::time::timeout(support::coverage_concurrency::RACE_TIMEOUT, ready_rx)
         .await
         .expect("owned publication became ready")
         .expect("owned publication task exited before readiness");
-    abort_and_join(&mut task, "owned publication").await;
+    owner
+        .abort_and_join()
+        .await
+        .expect("drain owned publication task");
 
     let receipt = tokio::time::timeout(
         support::coverage_concurrency::RACE_TIMEOUT,

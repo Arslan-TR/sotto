@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -6,6 +8,79 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 /// The race tests deliberately use a finite budget. A blocked backend must never
 /// leave an integration test waiting indefinitely when a scenario fails.
 pub const RACE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct OwnedTask<T> {
+    receiver: oneshot::Receiver<T>,
+}
+
+pub struct RaceTaskOwner {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl RaceTaskOwner {
+    pub fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    pub fn spawn<T, F>(&mut self, future: F) -> OwnedTask<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (sender, receiver) = oneshot::channel();
+        self.handles.push(tokio::spawn(async move {
+            let output = future.await;
+            let _ = sender.send(output);
+        }));
+        OwnedTask { receiver }
+    }
+
+    pub async fn abort_and_join(&mut self) -> Result<(), String> {
+        for handle in &self.handles {
+            handle.abort();
+        }
+        self.join_all().await
+    }
+
+    pub async fn join_all(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for handle in self.handles.drain(..) {
+            match timeout(RACE_TIMEOUT, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error.to_string()),
+                Err(_) => failures.push("timed out joining owned race task".into()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+impl Drop for RaceTaskOwner {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+pub async fn receive_owned<T>(
+    task: &mut Option<OwnedTask<T>>,
+    label: &'static str,
+) -> Result<T, String> {
+    let task = task
+        .take()
+        .ok_or_else(|| format!("{label} task was already consumed"))?;
+    timeout(RACE_TIMEOUT, task.receiver)
+        .await
+        .map_err(|_| format!("timed out waiting for {label}"))?
+        .map_err(|_| format!("{label} task exited before reporting its result"))
+}
 
 /// Owns cancellation for every task in a race scenario. The guard is installed
 /// before readiness or lock observation starts, so an early panic cancels
@@ -129,7 +204,7 @@ pub async fn abort_and_join<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{abort_and_join, RaceTaskGuard, RACE_TIMEOUT};
+    use super::{abort_and_join, receive_owned, RaceTaskGuard, RaceTaskOwner, RACE_TIMEOUT};
 
     #[tokio::test]
     async fn abort_and_join_drains_an_owned_task() {
@@ -151,5 +226,21 @@ mod tests {
         }
         let result = tokio::time::timeout(RACE_TIMEOUT, &mut task).await;
         assert!(matches!(result, Ok(Err(error)) if error.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn owner_drains_a_panicking_child_and_a_parked_sibling() {
+        let mut owner = RaceTaskOwner::new();
+        let mut failed = Some(owner.spawn(async {
+            panic!("intentional child failure");
+        }));
+        let mut sibling = Some(owner.spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        let failed_result = receive_owned(&mut failed, "failed child").await;
+        assert!(failed_result.is_err());
+        let teardown = owner.abort_and_join().await;
+        assert!(teardown.is_err());
+        assert!(receive_owned(&mut sibling, "parked sibling").await.is_err());
     }
 }
