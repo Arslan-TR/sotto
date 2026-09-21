@@ -181,7 +181,7 @@ fn bundle_body(tag: &str) -> String {
 #[tokio::test]
 async fn reset_replaces_material_and_deletes_grants() {
     let Some(pool) = pool_or_skip().await else {
-        eprintln!("skipping: DATABASE_URL not set");
+        eprintln!("skipping: SOTTO_RUN_DB_TESTS=1 and DATABASE_URL required");
         return;
     };
     sqlx::query("DELETE FROM organizations WHERE id = 'rec-o'")
@@ -357,7 +357,7 @@ async fn reset_requires_an_initialized_account() {
 #[tokio::test]
 async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
     let Some(pool) = pool_or_skip().await else {
-        eprintln!("skipping: DATABASE_URL not set");
+        eprintln!("skipping: SOTTO_RUN_DB_TESTS=1 and DATABASE_URL required");
         return;
     };
     let suffix = Uuid::new_v4().simple().to_string();
