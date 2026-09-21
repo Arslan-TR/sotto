@@ -499,10 +499,29 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
         .expect("owned publication task exited before readiness");
     abort_and_join(&mut task, "owned publication").await;
 
-    assert!(matches!(
-        load(&fixture.pool, &fixture.beneficiary_id).await,
-        Err(StoreError::ProjectionMissing)
-    ));
+    let receipt = tokio::time::timeout(
+        support::coverage_concurrency::RACE_TIMEOUT,
+        committed_publish(
+            &fixture,
+            None,
+            "aborted-publication",
+            "aborted-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        ),
+    )
+    .await
+    .expect("replacement publication was not unblocked by task cleanup")
+    .expect("replacement publication after task cleanup");
+    assert_eq!(receipt.revision, 1);
+    assert_eq!(
+        load(&fixture.pool, &fixture.beneficiary_id)
+            .await
+            .expect("load replacement publication")
+            .revision,
+        receipt.revision
+    );
     let unrelated_loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
         .await
         .expect("load unrelated fixture after cleanup");
