@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -117,15 +118,20 @@ def main() -> int:
             )
         for round_number in range(1, parsed.rounds + 1):
             print(f"race repetition round {round_number}/{parsed.rounds}", flush=True)
-            for target in sorted(targets):
-                run(
-                    [
-                        "cargo", "test", "-p", "sotto-server", "--test", target,
-                        "--", "--test-threads=4",
-                    ],
-                    env,
-                    parsed.timeout,
-                )
+            commands = [
+                [
+                    "cargo", "test", "-p", "sotto-server", "--test", target,
+                    "--", "--test-threads=4",
+                ]
+                for target in sorted(targets)
+            ]
+            with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+                futures = [
+                    executor.submit(run, command, env, parsed.timeout)
+                    for command in commands
+                ]
+                for future in futures:
+                    future.result()
     except (OSError, ValueError, RuntimeError) as error:
         print(f"cloud coverage race checks failed: {error}", file=sys.stderr)
         return 1
