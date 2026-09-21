@@ -13,8 +13,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskGuard,
-    RaceTaskOwner,
+    join_with_timeout, receive_pid, run_with_teardown, transaction_pid, wait_for_specific_block,
+    RaceTaskGuard, RaceTaskOwner, RACE_TIMEOUT,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -57,26 +57,33 @@ impl Fixture {
 }
 
 async fn cleanup(fixture: &Fixture) {
+    cleanup_result(fixture)
+        .await
+        .expect("delete coverage test fixture");
+}
+
+async fn cleanup_result(fixture: &Fixture) -> Result<(), String> {
     sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage head");
+        .map_err(|error| format!("delete coverage head: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage facts");
+        .map_err(|error| format!("delete coverage facts: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage revisions");
+        .map_err(|error| format!("delete coverage revisions: {error}"))?;
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage test user");
+        .map_err(|error| format!("delete coverage test user: {error}"))?;
+    Ok(())
 }
 
 fn paid(id: &str, source: &str, starts_at: i64, paid_until: i64) -> ConfirmedPaidInterval {
@@ -531,6 +538,80 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
         .expect("load unrelated fixture after cleanup");
     assert_eq!(unrelated_loaded.revision, 1);
     cleanup(&fixture).await;
+    cleanup(&unrelated).await;
+}
+
+#[tokio::test]
+async fn scenario_panic_cleans_owned_publication_fixture() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let unrelated = Fixture::create()
+        .await
+        .expect("create unrelated cleanup fixture");
+    committed_publish(
+        &unrelated,
+        None,
+        "unrelated-publication",
+        "unrelated-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish unrelated fixture");
+
+    let (ready, ready_rx) = oneshot::channel();
+    let pool = fixture.pool.clone();
+    let beneficiary_id = fixture.beneficiary_id.clone();
+    let mut owner = RaceTaskOwner::new();
+    let _task = owner.spawn(async move {
+        let mut tx = pool.begin().await.expect("begin panic fixture publication");
+        publish(
+            &mut tx,
+            &beneficiary_id,
+            None,
+            "panic-publication",
+            "panic-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await
+        .expect("publish panic fixture");
+        ready.send(()).expect("signal panic fixture readiness");
+        std::future::pending::<()>().await;
+    });
+
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            tokio::time::timeout(RACE_TIMEOUT, ready_rx)
+                .await
+                .map_err(|_| "timed out waiting for panic fixture".to_string())
+                .and_then(|result| {
+                    result.map_err(|_| "panic fixture task exited before readiness".to_string())
+                })?;
+            panic!("intentional scenario failure");
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        },
+        || async { cleanup_result(&fixture).await },
+    )
+    .await;
+    assert_eq!(result, Err("scenario: scenario panicked".into()));
+
+    let remaining_user: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&fixture.beneficiary_id)
+        .fetch_optional(&fixture.pool)
+        .await
+        .expect("check panic fixture cleanup");
+    assert!(remaining_user.is_none());
+    let unrelated_loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
+        .await
+        .expect("load unrelated fixture after panic cleanup");
+    assert_eq!(unrelated_loaded.revision, 1);
+
     cleanup(&unrelated).await;
 }
 

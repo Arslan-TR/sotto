@@ -23,6 +23,7 @@ SCENARIOS = (
     ("cloud_coverage_reconciliation", "superseded_finish_waits_for_a_completing_replacement"),
     ("cloud_coverage_store", "competing_corrections_serialize_on_the_head_and_reject_the_loser"),
     ("cloud_coverage_store", "simultaneous_first_publications_have_one_winner"),
+    ("cloud_coverage_store", "scenario_panic_cleans_owned_publication_fixture"),
 )
 
 

@@ -42,7 +42,20 @@ impl RaceTaskOwner {
         for handle in &self.handles {
             handle.abort();
         }
-        self.join_all().await
+        let mut failures = Vec::new();
+        for handle in self.handles.drain(..) {
+            match timeout(RACE_TIMEOUT, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => failures.push(error.to_string()),
+                Err(_) => failures.push("timed out joining aborted owned race task".into()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     pub async fn join_all(&mut self) -> Result<(), String> {
@@ -89,7 +102,7 @@ pub async fn run_with_teardown<T, F, C, CF>(
     cleanup: C,
 ) -> Result<T, String>
 where
-    F: Future<Output = Result<T, String>> + std::panic::UnwindSafe,
+    F: Future<Output = Result<T, String>>,
     C: FnOnce() -> CF,
     CF: Future<Output = Result<(), String>>,
 {
