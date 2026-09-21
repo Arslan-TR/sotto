@@ -1559,13 +1559,17 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
         .expect("receive independent holder pid");
 
     let mut second_tx = second.pool.begin().await.expect("begin independent finish");
-    let second_receipt = finish_collection(
-        &mut second_tx,
-        &second_ticket,
-        "independent-second-aggregate",
-        &second_observations,
+    let second_receipt = tokio::time::timeout(
+        Duration::from_secs(10),
+        finish_collection(
+            &mut second_tx,
+            &second_ticket,
+            "independent-second-aggregate",
+            &second_observations,
+        ),
     )
     .await
+    .expect("independent beneficiary finish did not complete while A was held")
     .expect("finish independent beneficiary");
     second_tx
         .commit()
@@ -2011,6 +2015,16 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
     .await
     .expect("count serialised revisions");
     assert_eq!(revision_count, 2);
+    let completed_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND status = 'completed' AND projection_revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(applied.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count serialised completion receipts");
+    assert_eq!(completed_count, 1);
     cleanup(&fixture).await;
 }
 
@@ -2161,6 +2175,16 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
     .await
     .expect("count conflicting revisions");
     assert_eq!(revision_count, 2);
+    let completed_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND status = 'completed' AND projection_revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(winner.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count conflicting completion receipts");
+    assert_eq!(completed_count, 1);
     cleanup(&fixture).await;
 }
 
