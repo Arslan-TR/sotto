@@ -1,5 +1,6 @@
 use std::future::Future;
 
+use futures_util::FutureExt;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -80,6 +81,51 @@ pub async fn receive_owned<T>(
         .await
         .map_err(|_| format!("timed out waiting for {label}"))?
         .map_err(|_| format!("{label} task exited before reporting its result"))
+}
+
+pub async fn run_with_teardown<T, F, C, CF>(
+    owner: &mut RaceTaskOwner,
+    scenario: F,
+    cleanup: C,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>> + std::panic::UnwindSafe,
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<(), String>>,
+{
+    let outcome = std::panic::AssertUnwindSafe(scenario).catch_unwind().await;
+    let scenario_result = match outcome {
+        Ok(result) => result,
+        Err(_) => Err("scenario panicked".into()),
+    };
+    let task_result = if scenario_result.is_ok() {
+        owner.join_all().await
+    } else {
+        owner.abort_and_join().await
+    };
+    let cleanup_result = cleanup().await;
+    match (scenario_result, task_result, cleanup_result) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (scenario, tasks, cleanup) => Err(format_failure(scenario, tasks, cleanup)),
+    }
+}
+
+fn format_failure<T>(
+    scenario: Result<T, String>,
+    tasks: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> String {
+    let mut failures = Vec::new();
+    if let Err(error) = scenario {
+        failures.push(format!("scenario: {error}"));
+    }
+    if let Err(error) = tasks {
+        failures.push(format!("tasks: {error}"));
+    }
+    if let Err(error) = cleanup {
+        failures.push(format!("cleanup: {error}"));
+    }
+    failures.join("; ")
 }
 
 /// Owns cancellation for every task in a race scenario. The guard is installed
@@ -204,7 +250,10 @@ pub async fn abort_and_join<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{abort_and_join, receive_owned, RaceTaskGuard, RaceTaskOwner, RACE_TIMEOUT};
+    use super::{
+        abort_and_join, receive_owned, run_with_teardown, RaceTaskGuard, RaceTaskOwner,
+        RACE_TIMEOUT,
+    };
 
     #[tokio::test]
     async fn abort_and_join_drains_an_owned_task() {
@@ -242,5 +291,24 @@ mod tests {
         let teardown = owner.abort_and_join().await;
         assert!(teardown.is_err());
         assert!(receive_owned(&mut sibling, "parked sibling").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn scenario_teardown_reports_panic_and_cleanup_failure_together() {
+        let mut owner = RaceTaskOwner::new();
+        let result = run_with_teardown(
+            &mut owner,
+            async {
+                panic!("intentional scenario failure");
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            },
+            || async { Err::<(), _>("intentional cleanup failure".into()) },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("scenario: scenario panicked; cleanup: intentional cleanup failure".into())
+        );
     }
 }
