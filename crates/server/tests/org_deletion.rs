@@ -23,6 +23,7 @@ use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
     begin_collection, finish_collection, register_source, SourceBinding, SourceObservation,
 };
+use sotto_server::cloud_coverage_store::PublicationOutcome;
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -153,12 +154,11 @@ fn current(subscription_id: &str, status: SubscriptionStatus) -> SubscriptionObs
 }
 
 async fn pool_or_skip() -> Option<PgPool> {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        return None;
-    };
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
         return None;
     }
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
     let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
     assert!(
         matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
@@ -1116,6 +1116,64 @@ async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
     tx.commit().await.expect("commit pending deletion coverage");
     let before = coverage_snapshot(&pool, &owner_id).await;
 
+    let unrelated_user = format!("deletion-unrelated-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'deletion-test', $1)",
+    )
+    .bind(&unrelated_user)
+    .execute(&pool)
+    .await
+    .expect("insert unrelated coverage beneficiary");
+    let unrelated_source = SourceBinding {
+        beneficiary_id: unrelated_user.clone(),
+        source_id: format!("{unrelated_user}:source"),
+        provider_namespace: "deletion-test".into(),
+        external_allocation_reference: format!("allocation-{unrelated_user}"),
+        ownership_evidence_reference: format!("ownership-{unrelated_user}"),
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin unrelated coverage registration");
+    register_source(
+        &mut tx,
+        "deletion-unrelated-registration",
+        &unrelated_source,
+    )
+    .await
+    .expect("register unrelated coverage source");
+    tx.commit()
+        .await
+        .expect("commit unrelated coverage registration");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin unrelated coverage collection");
+    let unrelated_ticket =
+        begin_collection(&mut tx, &unrelated_user, "deletion-unrelated-collection")
+            .await
+            .expect("begin unrelated coverage collection");
+    tx.commit()
+        .await
+        .expect("commit unrelated coverage collection");
+    let mut tx = pool.begin().await.expect("begin unrelated coverage finish");
+    finish_collection(
+        &mut tx,
+        &unrelated_ticket,
+        "unrelated-aggregate-evidence",
+        &[SourceObservation::Complete {
+            source_id: unrelated_source.source_id.clone(),
+            evidence_reference: "unrelated-source-evidence".into(),
+            paid_intervals: vec![],
+        }],
+    )
+    .await
+    .expect("finish unrelated coverage collection");
+    tx.commit()
+        .await
+        .expect("commit unrelated coverage collection");
+    let unrelated_before = coverage_snapshot(&pool, &unrelated_user).await;
+
     let tree = seed_project_tree(&pool, &org_id, &owner_id).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
@@ -1159,6 +1217,39 @@ async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
         .expect("completed purge transition");
 
     assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin coverage replay after purge");
+    let replay = finish_collection(
+        &mut tx,
+        &ticket,
+        "aggregate-evidence",
+        std::slice::from_ref(&observation),
+    )
+    .await
+    .expect("replay coverage after organisation purge");
+    tx.commit()
+        .await
+        .expect("commit coverage replay after purge");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay.revision, 2);
+    assert_eq!(coverage_snapshot(&pool, &owner_id).await, before);
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM environment_grants WHERE env_id = $1)",
+        )
+        .bind(&tree.environment)
+        .fetch_one(&pool)
+        .await
+        .expect("read purged organisation grant"),
+        "coverage replay must not recreate purged grants"
+    );
+    assert_eq!(
+        coverage_snapshot(&pool, &unrelated_user).await,
+        unrelated_before,
+        "organisation purge must not change unrelated beneficiary coverage"
+    );
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
             .bind(&tree.project)
@@ -1188,6 +1279,12 @@ async fn organisation_purge_preserves_owner_cloud_coverage_evidence() {
         "organisation purge must not remove the beneficiary"
     );
 
+    cleanup_coverage(&pool, &unrelated_user).await;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&unrelated_user)
+        .execute(&pool)
+        .await
+        .expect("delete unrelated coverage beneficiary");
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
