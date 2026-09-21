@@ -8,7 +8,9 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Row};
+use std::str::FromStr;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -17,12 +19,23 @@ use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
     begin_collection, finish_collection, register_source, SourceBinding, SourceObservation,
 };
+use sotto_server::cloud_coverage_store::PublicationOutcome;
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::state::AppState;
 
 async fn pool_or_skip() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        return None;
+    }
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing destructive recovery tests against non-local host: {}",
+        options.get_host()
+    );
     let pool = db::connect(&url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
     Some(pool)
@@ -488,7 +501,7 @@ async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
         .begin()
         .await
         .expect("begin completed replay after reset");
-    finish_collection(
+    let replay = finish_collection(
         &mut tx,
         &completed_ticket,
         "aggregate-evidence",
@@ -499,6 +512,8 @@ async fn reset_preserves_cloud_coverage_evidence_and_ticket_lifecycle() {
     tx.commit()
         .await
         .expect("commit completed replay after reset");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay.revision, 2);
     assert_eq!(
         send(
             &pool,
