@@ -13,8 +13,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    join_with_timeout, receive_pid, run_with_teardown, transaction_pid, wait_for_specific_block,
-    RaceTaskGuard, RaceTaskOwner, RACE_TIMEOUT,
+    receive_owned, receive_pid, run_with_teardown, transaction_pid, wait_for_specific_block,
+    RaceTaskOwner, RACE_TIMEOUT,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -355,7 +355,8 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
     let holder_beneficiary = fixture.beneficiary_id.clone();
     let holder_projection = winning_projection.clone();
     let holder_release = release.clone();
-    let mut holder = Some(tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool.begin().await.expect("begin held correction");
         let pid = transaction_pid(&mut tx).await;
         let result = publish(
@@ -380,14 +381,12 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
             }
         }
     }));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(holder.as_ref().expect("holder task is registered"));
     let holder_pid = receive_pid(holder_ready_rx, "receive correction holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_beneficiary = fixture.beneficiary_id.clone();
-    let mut waiter = Some(tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin waiting correction");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal waiting correction");
@@ -403,15 +402,18 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         tx.rollback().await.expect("rollback waiting correction");
         result
     }));
-    tasks.watch(waiter.as_ref().expect("waiter task is registered"));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let winner = join_with_timeout(&mut holder, "held correction")
+    let winner = receive_owned(&mut holder, "held correction")
         .await
+        .expect("held correction task completed")
         .expect("winning correction applied");
-    let loser = join_with_timeout(&mut waiter, "waiting correction").await;
+    let loser = receive_owned(&mut waiter, "waiting correction")
+        .await
+        .expect("waiting correction task completed");
+    owner.join_all().await.expect("join correction tasks");
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert_eq!(winner.revision, 2);
     assert!(matches!(

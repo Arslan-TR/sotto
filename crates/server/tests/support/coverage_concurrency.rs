@@ -218,6 +218,7 @@ pub async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) 
 /// Wait for a spawned race task without losing ownership when the deadline is
 /// exceeded. The surrounding `RaceTaskGuard` cancels sibling tasks if this
 /// operation or a later assertion unwinds the scenario.
+#[allow(dead_code)]
 pub async fn join_with_timeout<T>(
     handle: &mut Option<tokio::task::JoinHandle<T>>,
     label: &'static str,
