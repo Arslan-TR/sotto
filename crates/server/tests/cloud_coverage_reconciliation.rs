@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
@@ -6,12 +6,13 @@ use sotto_server::cloud_coverage_reconciliation::{
     ReconciliationError, RegistrationOutcome, SourceBinding, SourceObservation,
 };
 use sotto_server::cloud_coverage_store::{
-    load, publish, CoverageProjection, StoreError, UnavailableReason,
+    load, publish, CoverageProjection, PublicationOutcome, StoreError, UnavailableReason,
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::PgPool;
-use tokio::sync::Barrier;
+use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::{oneshot, Barrier, Notify};
+use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
 struct Fixture {
@@ -208,6 +209,38 @@ async fn head_revision(fixture: &Fixture) -> i64 {
     .fetch_one(&fixture.pool)
     .await
     .expect("read coverage head revision")
+}
+
+async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read transaction backend pid")
+}
+
+async fn wait_for_specific_block(pool: &PgPool, waiter_pid: i32, holder_pid: i32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE pid = $1 AND $2 = ANY(pg_blocking_pids(pid))
+             )",
+        )
+        .bind(waiter_pid)
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .expect("inspect coverage transaction blocking");
+        if blocked {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for backend {waiter_pid} to block on {holder_pid}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]
@@ -965,6 +998,234 @@ async fn identical_concurrent_completions_apply_once_and_replay_once() {
     .await
     .expect("count completed attempts");
     assert_eq!(completed_count, 1);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "serialised-source", "serialised-allocation");
+    register(&fixture, &source, "serialised-registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "serialised-completion")).await;
+    let observations = vec![SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "serialised-source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "serialised-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    }];
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder_pool = fixture.pool.clone();
+    let holder_ticket = ticket.clone();
+    let holder_observations = observations.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool.begin().await.expect("begin held completion");
+        let pid = transaction_pid(&mut tx).await;
+        let result = finish_collection(
+            &mut tx,
+            &holder_ticket,
+            "serialised-aggregate-evidence",
+            &holder_observations,
+        )
+        .await;
+        holder_ready.send(pid).expect("signal held completion");
+        holder_release.notified().await;
+        match result {
+            Ok(receipt) => {
+                tx.commit().await.expect("commit held completion");
+                Ok(receipt)
+            }
+            Err(error) => {
+                tx.rollback().await.expect("rollback held completion");
+                Err(error)
+            }
+        }
+    });
+    let holder_pid = holder_ready_rx.await.expect("receive holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = ticket.clone();
+    let waiter_observations = observations.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.expect("begin waiting completion");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready.send(pid).expect("signal waiting completion");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "serialised-aggregate-evidence",
+            &waiter_observations,
+        )
+        .await;
+        match result {
+            Ok(receipt) => {
+                tx.commit().await.expect("commit waiting completion");
+                Ok(receipt)
+            }
+            Err(error) => {
+                tx.rollback().await.expect("rollback waiting completion");
+                Err(error)
+            }
+        }
+    });
+    let waiter_pid = waiter_ready_rx.await.expect("receive waiter pid");
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let applied = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("held completion finished")
+        .expect("join held completion")
+        .expect("held completion applied");
+    let replay = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("waiting completion finished")
+        .expect("join waiting completion")
+        .expect("waiting completion replayed");
+    assert_eq!(applied.revision, replay.revision);
+    assert_eq!(applied.outcome, PublicationOutcome::Applied);
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(head_revision(&fixture).await, applied.revision);
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count serialised revisions");
+    assert_eq!(revision_count, 2);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(&fixture, "conflicting-source", "conflicting-allocation");
+    register(&fixture, &source, "conflicting-registration").await;
+    let ticket = begin(&fixture, &attempt_id(&fixture, "conflicting-completion")).await;
+    let winning_observations = vec![SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "winning-source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "winning-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    }];
+    let losing_observations = vec![SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "losing-source-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "losing-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 200,
+            failed_renewal_id: None,
+        }],
+    }];
+
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder_pool = fixture.pool.clone();
+    let holder_ticket = ticket.clone();
+    let holder_observations = winning_observations.clone();
+    let holder_release = release.clone();
+    let holder = tokio::spawn(async move {
+        let mut tx = holder_pool
+            .begin()
+            .await
+            .expect("begin held winning completion");
+        let pid = transaction_pid(&mut tx).await;
+        let result = finish_collection(
+            &mut tx,
+            &holder_ticket,
+            "winning-aggregate-evidence",
+            &holder_observations,
+        )
+        .await;
+        holder_ready
+            .send(pid)
+            .expect("signal held winning completion");
+        holder_release.notified().await;
+        match result {
+            Ok(receipt) => {
+                tx.commit().await.expect("commit held winning completion");
+                Ok(receipt)
+            }
+            Err(error) => {
+                tx.rollback()
+                    .await
+                    .expect("rollback held winning completion");
+                Err(error)
+            }
+        }
+    });
+    let holder_pid = holder_ready_rx.await.expect("receive winning holder pid");
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = ticket.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.expect("begin losing completion");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready.send(pid).expect("signal losing completion");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "losing-aggregate-evidence",
+            &losing_observations,
+        )
+        .await;
+        tx.rollback().await.expect("rollback losing completion");
+        result
+    });
+    let waiter_pid = waiter_ready_rx.await.expect("receive losing waiter pid");
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let winner = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("winning completion finished")
+        .expect("join winning completion")
+        .expect("winning completion applied");
+    let loser = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("losing completion finished")
+        .expect("join losing completion");
+    assert_eq!(winner.outcome, PublicationOutcome::Applied);
+    assert!(matches!(loser, Err(ReconciliationError::OperationConflict)));
+    assert_eq!(head_revision(&fixture).await, winner.revision);
+    let loser_fact_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND coverage_id = 'losing-coverage'",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count losing facts");
+    assert_eq!(loser_fact_count, 0);
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count conflicting revisions");
+    assert_eq!(revision_count, 2);
     cleanup(&fixture).await;
 }
 
