@@ -61,6 +61,8 @@ jobs:
           set -euo pipefail
           cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
           grep -Eq '^SERVER_ASSURANCE_DONE 7$' server-assurance.log
+      - name: Cloud coverage race repetitions
+        run: scripts/check-cloud-coverage-races
       - name: Publish coverage summary
         run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Retain reports and run status
