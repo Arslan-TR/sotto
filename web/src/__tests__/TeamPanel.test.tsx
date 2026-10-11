@@ -8,6 +8,7 @@ import { TeamPanel } from "../TeamPanel";
 import * as vault from "../vault";
 
 vi.mock("../api", () => ({
+  organisationDeletionEnabled: false,
   createCheckout: vi.fn(),
   createPortal: vi.fn(),
   fetchAudit: vi.fn(),
@@ -50,6 +51,7 @@ const freePlan: Entitlements = {
   trialEndsAt: null,
   limits: { maxMembers: 3, maxOrgProjects: 1 },
   billingEnabled: false,
+  purchasesEnabled: false,
 };
 
 describe("TeamPanel organisation loading", () => {
@@ -151,6 +153,83 @@ describe("TeamPanel organisation loading", () => {
   });
 });
 
+describe("TeamPanel organisation names", () => {
+  const master = new Uint8Array([1]);
+  const encPrivateKeys = new Uint8Array([2]);
+  const encOrgKey = new Uint8Array([3]);
+  const orgKey = new Uint8Array([4]);
+  const encName = new Uint8Array([5]);
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
+  });
+
+  it("uses the id without a key while keeping a decryptable organisation", async () => {
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      org("org-without-key"),
+      { ...org("org-with-key"), encOrgKey, encName },
+    ]);
+    vi.mocked(vault.openOrgKey).mockReturnValue(orgKey);
+    vi.mocked(vault.decryptOrgName).mockReturnValue("Friendly name");
+
+    render(<TeamPanel master={master} encPrivateKeys={encPrivateKeys} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-without-key/ }));
+    expect(screen.getByRole("heading", { name: "Members of org-without-key" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledWith("org-without-key");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Friendly name/ }));
+    expect(screen.getByRole("heading", { name: "Members of Friendly name" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenLastCalledWith("org-with-key");
+    expect(vault.openOrgKey).toHaveBeenCalledExactlyOnceWith(master, encPrivateKeys, encOrgKey);
+    expect(vault.decryptOrgName).toHaveBeenCalledExactlyOnceWith(orgKey, "org-with-key", encName);
+  });
+
+  it("keeps an organisation selectable when its key cannot be opened", async () => {
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), encOrgKey }]);
+    vi.mocked(vault.openOrgKey).mockImplementation(() => {
+      throw new Error("key unavailable");
+    });
+
+    render(<TeamPanel master={master} encPrivateKeys={encPrivateKeys} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    expect(screen.getByRole("heading", { name: "Members of org-a" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledExactlyOnceWith("org-a");
+    expect(vault.decryptOrgName).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps an organisation selectable when its name cannot be decrypted", async () => {
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { ...org("org-a"), encOrgKey, encName },
+      { ...org("org-b"), encOrgKey, encName },
+    ]);
+    vi.mocked(vault.openOrgKey).mockReturnValue(orgKey);
+    vi.mocked(vault.decryptOrgName).mockImplementation((_key, orgId) => {
+      if (orgId === "org-a") throw new Error("name unavailable");
+      return "Healthy org";
+    });
+
+    render(<TeamPanel master={master} encPrivateKeys={encPrivateKeys} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    expect(screen.getByRole("heading", { name: "Members of org-a" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledWith("org-a");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Healthy org/ }));
+    expect(screen.getByRole("heading", { name: "Members of Healthy org" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenLastCalledWith("org-b");
+    expect(vault.decryptOrgName).toHaveBeenNthCalledWith(1, orgKey, "org-a", encName);
+    expect(vault.decryptOrgName).toHaveBeenNthCalledWith(2, orgKey, "org-b", encName);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
 describe("TeamPanel invitations", () => {
   const adminOrg: Org = {
     id: "org-a",
@@ -180,6 +259,7 @@ describe("TeamPanel invitations", () => {
     fireEvent.submit(input.closest("form")!);
 
     expect(input).toBeDisabled();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
     expect(screen.getByRole("button", { name: "Inviting…" })).toBeDisabled();
     fireEvent.submit(input.closest("form")!);
     expect(api.inviteMember).toHaveBeenCalledOnce();
@@ -188,7 +268,7 @@ describe("TeamPanel invitations", () => {
     await act(async () => {
       pending.resolve({ userId: "user-b", publicKey: null });
     });
-    expect(screen.getByText("invited teammate@example.com (user-b)")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("invited teammate@example.com (user-b)");
     expect(input).toHaveValue("");
     expect(input).not.toBeDisabled();
     expect(api.fetchMembers).toHaveBeenCalledTimes(2);
@@ -285,4 +365,164 @@ describe("TeamPanel invitations", () => {
       expect(input).toBeEnabled();
     },
   );
+});
+
+
+describe("TeamPanel billing request ownership", () => {
+  const admin = (id: string): Org => ({
+    id, encName: new Uint8Array(), role: "admin", encOrgKey: null,
+  });
+  const billablePlan: Entitlements = { ...freePlan, billingEnabled: true, purchasesEnabled: true };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([admin("org-a"), admin("org-b")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
+  });
+
+  it("hides upgrades while sales are paused but keeps the existing billing portal", async () => {
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...billablePlan,
+      tier: "team",
+      effectiveTier: "team",
+      limits: null,
+      purchasesEnabled: false,
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+
+    expect(await screen.findByRole("button", { name: "Manage billing" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Upgrade to Team" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer a new upgrade when sales are paused", async () => {
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...billablePlan,
+      purchasesEnabled: false,
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+
+    await screen.findByText(/Plan:/);
+    expect(screen.queryByRole("button", { name: "Upgrade to Team" })).not.toBeInTheDocument();
+  });
+
+  it.each(["success", "failure"] as const)(
+    "ignores a stale checkout %s after switching organisations",
+    async (outcome) => {
+      const pending = deferred<string>();
+      vi.mocked(api.createCheckout).mockReturnValueOnce(pending.promise).mockResolvedValueOnce("/checkout-b");
+      const assign = vi.spyOn(window.location, "assign").mockImplementation(() => {});
+      render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+      fireEvent.click(await screen.findByRole("button", { name: "Upgrade to Team" }));
+      expect(screen.getByRole("button", { name: "Opening checkout…" })).toBeDisabled();
+
+      fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+      expect(await screen.findByRole("button", { name: "Upgrade to Team" })).toBeEnabled();
+
+      await act(async () => {
+        if (outcome === "success") pending.resolve("/checkout-a");
+        else pending.reject(new Error("stale checkout failure"));
+      });
+      expect(assign).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Upgrade to Team" }));
+      await act(async () => {});
+      expect(api.createCheckout).toHaveBeenLastCalledWith("org-b");
+      expect(assign).toHaveBeenCalledWith("/checkout-b");
+      assign.mockRestore();
+    },
+  );
+});
+
+describe("TeamPanel organisation-list recovery", () => {
+  it("retries a failed organisation-list request", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs)
+      .mockRejectedValueOnce(new Error("organisations unavailable"))
+      .mockResolvedValueOnce([org("org-recovered")]);
+
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("organisations unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry organisations" }));
+    expect(await screen.findByRole("button", { name: /org-recovered/ })).toBeInTheDocument();
+    expect(api.fetchOrgs).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("TeamPanel audit visibility", () => {
+  it.each([
+    ["owner", "free", false],
+    ["admin", "free", false],
+    ["member", "free", false],
+    ["owner", "team", true],
+    ["admin", "team", true],
+    ["member", "team", false],
+  ] as const)("gates audit for %s with effective %s", async (role, effectiveTier, allowed) => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role }]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...freePlan,
+      tier: "free",
+      effectiveTier,
+    });
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
+
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Members of org-a" });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(api.fetchAudit).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    if (allowed) expect(await screen.findByText("No events yet.")).toBeInTheDocument();
+    else expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
+  });
+});
+
+it("renders a populated audit response for an allowed organisation", async () => {
+  vi.resetAllMocks();
+  vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "owner" }]);
+  vi.mocked(api.fetchMembers).mockResolvedValue([]);
+  vi.mocked(api.fetchEntitlements).mockResolvedValue({ ...freePlan, effectiveTier: "team" });
+  vi.mocked(api.fetchAudit).mockResolvedValue([{ id: 1, actor: "user-a", action: "secret.read", target: "secret-a", envId: "env-a", detail: "ok", at: "2026-09-30T00:00:00Z" }]);
+
+  render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+  fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+
+  expect(await screen.findByText(/secret\.read/)).toBeInTheDocument();
+  expect(api.fetchAudit).toHaveBeenCalledWith("org-a");
+});
+
+it("clears an old audit log when switching to a gated organisation", async () => {
+  vi.resetAllMocks();
+  vi.mocked(api.fetchOrgs).mockResolvedValue([
+    { ...org("org-a"), role: "owner" },
+    { ...org("org-b"), role: "member" },
+  ]);
+  vi.mocked(api.fetchMembers).mockResolvedValue([]);
+  vi.mocked(api.fetchEntitlements).mockImplementation(async (orgId) => ({
+    ...freePlan,
+    effectiveTier: orgId === "org-a" ? "team" : "free",
+  }));
+  vi.mocked(api.fetchAudit).mockResolvedValue([{ id: 1, actor: "user-a", action: "secret.read", target: null, envId: null, detail: null, at: "2026-09-30T00:00:00Z" }]);
+
+  render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+  fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+  expect(await screen.findByText(/secret\.read/)).toBeInTheDocument();
+  expect(api.fetchAudit).toHaveBeenCalledWith("org-a");
+
+  fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+  expect(await screen.findByRole("heading", { name: "Members of org-b" })).toBeInTheDocument();
+  await act(async () => { await Promise.resolve(); });
+  expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
+  expect(api.fetchAudit).toHaveBeenCalledTimes(1);
 });

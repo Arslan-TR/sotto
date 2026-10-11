@@ -50,6 +50,7 @@ serde_json = "1"
 [dev-dependencies]
 # Drive the router in-process (ServiceExt::oneshot) for handler tests.
 tower = { version = "0.5", features = ["util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [features]
 # Compiles in a mock OAuthProvider that `main.rs` wires up instead of GithubOAuth, so an external

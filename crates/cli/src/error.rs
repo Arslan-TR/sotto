@@ -80,18 +80,44 @@ pub enum Error {
     /// Invalid user input (bad arguments, mismatched passwords, or unsafe output).
     #[error("{0}")]
     Input(String),
+
+    /// The server requires hosted Cloud eligibility for this action.
+    #[error("cloud eligibility required: {0}")]
+    CloudEligibility(String),
+
+    /// The server's quota or feature gate rejected this action.
+    #[error("quota: {0}")]
+    Quota(String),
+
+    /// The server asked the caller to retry later.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+
+    /// The optional server capability is currently unavailable.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+
+    /// A missing required command-line argument in non-interactive mode.
+    #[error("{0}")]
+    MissingArgument(String),
 }
 
 impl Error {
     /// The process exit code for this error (CLI spec §8).
     pub fn exit_code(&self) -> i32 {
         match self {
+            Error::MissingArgument(_) => 2,
             Error::NotFound(_) | Error::NoConfig(_) => 3,
             Error::Locked | Error::Crypto | Error::NoIdentity => 4,
             Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
-            Error::Network(_) | Error::Server(_) | Error::Forbidden(_) | Error::LegacyServer => 5,
+            Error::Network(_)
+            | Error::Server(_)
+            | Error::Forbidden(_)
+            | Error::LegacyServer
+            | Error::Unavailable(_) => 5,
             Error::Conflict(_) => 6,
-            Error::Config(_) | Error::AlreadyInitialized | Error::Input(_) => 1,
+            Error::CloudEligibility(_) | Error::RateLimited(_) => 7,
+            Error::Config(_) | Error::AlreadyInitialized | Error::Input(_) | Error::Quota(_) => 1,
         }
     }
 }
@@ -99,6 +125,12 @@ impl Error {
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Error::Store(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e.to_string())
     }
 }
 

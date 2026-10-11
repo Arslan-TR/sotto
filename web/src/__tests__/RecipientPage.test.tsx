@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -10,25 +11,29 @@ vi.mock("../api", () => ({
   fetchShare: vi.fn(),
   ShareUnavailable: class ShareUnavailable extends Error {},
 }));
-vi.mock("../base64", () => ({
-  urlSafeB64ToBytes: vi.fn(() => new Uint8Array([1])),
-}));
 vi.mock("../wasm", () => ({
   loadWasm: vi.fn(),
   share_open: vi.fn(),
   share_passphrase_key: vi.fn(),
 }));
 
-afterEach(cleanup);
+const originalUrl = window.location.href;
+
+afterEach(() => {
+  cleanup();
+  window.history.replaceState(null, "", originalUrl);
+});
 
 const secret = "  synthetic first line\nsecond line  ";
 
 function deferred() {
   let resolve!: () => void;
-  const promise = new Promise<void>((res) => {
+  let reject!: (err?: unknown) => void;
+  const promise = new Promise<void>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function revealSecret() {
@@ -37,16 +42,90 @@ async function revealSecret() {
   return await screen.findByRole("textbox", { name: "Shared secret" });
 }
 
-describe("RecipientPage copy", () => {
+describe("RecipientPage", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    window.location.hash = "#synthetic-key";
+    window.location.hash = "#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     vi.mocked(api.fetchShare).mockResolvedValue({
       encBlob: new Uint8Array([2]),
       passphraseSalt: null,
     });
     vi.mocked(wasm.loadWasm).mockResolvedValue(undefined);
     vi.mocked(wasm.share_open).mockReturnValue(new TextEncoder().encode(secret));
+  });
+
+  it("waits for an explicit reveal before fetching the share", async () => {
+    render(
+      <StrictMode>
+        <RecipientPage token="share-token" />
+      </StrictMode>,
+    );
+    await act(async () => {});
+
+    expect(screen.getByRole("heading", { name: "You’ve received a secret" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    expect(wasm.loadWasm).not.toHaveBeenCalled();
+    expect(api.fetchShare).not.toHaveBeenCalled();
+  });
+
+  it("focuses the revealed heading after a successful reveal", async () => {
+    render(<RecipientPage token="share-token" />);
+    const reveal = screen.getByRole("button", { name: "Reveal secret" });
+    reveal.focus();
+    expect(reveal).toHaveFocus();
+    fireEvent.click(reveal);
+    expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
+    expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+  });
+
+  it("reports a missing fragment without fetching the share", async () => {
+    window.location.hash = "";
+    render(<RecipientPage token="share-token" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("this link is missing its decryption key");
+    expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    expect(api.fetchShare).not.toHaveBeenCalled();
+  });
+
+  it("reports an invalid base64 fragment without fetching the share", async () => {
+    window.location.hash = "#%%%";
+    render(<RecipientPage token="share-token" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't reveal the secret:");
+    expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    expect(screen.queryByRole("textbox", { name: "Shared secret" })).not.toBeInTheDocument();
+    expect(wasm.loadWasm).not.toHaveBeenCalled();
+    expect(api.fetchShare).not.toHaveBeenCalled();
+  });
+
+  it("allows retry after wasm initialization fails without consuming the share", async () => {
+    const initialization = deferred();
+    vi.mocked(wasm.loadWasm)
+      .mockImplementationOnce(() => initialization.promise)
+      .mockResolvedValueOnce(undefined);
+    render(<RecipientPage token="share-token" />);
+
+    expect(api.fetchShare).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect(screen.getByRole("button", { name: "Revealing…" })).toBeDisabled();
+    expect(api.fetchShare).not.toHaveBeenCalled();
+    await act(async () => initialization.reject(new Error("wasm unavailable")));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("wasm unavailable");
+    expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    expect(api.fetchShare).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith("share-token");
+    expect(wasm.share_open).toHaveBeenCalledWith(new Uint8Array(32), new Uint8Array([2]));
   });
 
   it("copies the exact revealed value and announces success after the write completes", async () => {
@@ -61,12 +140,16 @@ describe("RecipientPage copy", () => {
     expect(textarea).toHaveValue(secret);
     expect(writeText).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    const copy = screen.getByRole("button", { name: "Copy secret" });
+    copy.focus();
+    fireEvent.click(copy);
     expect(writeText).toHaveBeenCalledWith(secret);
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Shared secret" })).not.toHaveFocus();
 
     await act(async () => write.resolve());
     expect(await screen.findByRole("status")).toHaveTextContent("Copied to clipboard.");
+    expect(copy).toHaveFocus();
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });
 
@@ -78,9 +161,12 @@ describe("RecipientPage copy", () => {
     });
 
     const textarea = await revealSecret();
-    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    const copy = screen.getByRole("button", { name: "Copy secret" });
+    copy.focus();
+    fireEvent.click(copy);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
+    expect(copy).toHaveFocus();
     expect(textarea).toHaveValue(secret);
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });
@@ -96,6 +182,72 @@ describe("RecipientPage copy", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
     expect(textarea).toHaveValue(secret);
+    expect(api.fetchShare).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents overlapping clipboard writes during repeated activation and indicates copying state", async () => {
+    const write = deferred();
+    const writeText = vi.fn(() => write.promise);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    await revealSecret();
+
+    const copyBtn = screen.getByRole("button", { name: "Copy secret" });
+    fireEvent.click(copyBtn);
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(secret);
+
+    // Repeated clicks while in flight do not trigger additional clipboard writes
+    const copyingBtn = screen.getByRole("button", { name: "Copying…" });
+    expect(copyingBtn).toBeDisabled();
+    fireEvent.click(copyingBtn);
+    expect(writeText).toHaveBeenCalledTimes(1);
+
+    await act(async () => write.resolve());
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Copied to clipboard.");
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
+    expect(api.fetchShare).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears previous failure feedback on retry and announces the successful result", async () => {
+    const firstWrite = deferred();
+    const secondWrite = deferred();
+    const writeText = vi
+      .fn()
+      .mockImplementationOnce(() => firstWrite.promise)
+      .mockImplementationOnce(() => secondWrite.promise);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    await revealSecret();
+
+    // First attempt fails
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    await act(async () => firstWrite.reject(new Error("write failed")));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
+    const retryBtn = screen.getByRole("button", { name: "Copy secret" });
+    expect(retryBtn).toBeEnabled();
+
+    // Retry attempt clears failure alert and shows copying state
+    fireEvent.click(retryBtn);
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copying…" })).toBeDisabled();
+
+    // Successful completion announces success and re-enables control
+    await act(async () => secondWrite.resolve());
+    expect(await screen.findByRole("status")).toHaveTextContent("Copied to clipboard.");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });
 });

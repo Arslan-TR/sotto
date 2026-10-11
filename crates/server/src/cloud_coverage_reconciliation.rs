@@ -59,6 +59,9 @@ pub struct CollectionTicket {
     pub attempt_id: String,
     pub collection_epoch: i64,
     pub source_set_generation: i64,
+    /// The accepted provider-event generation captured for this attempt, if fenced.
+    /// Legacy attempts remain readable with no fence and cannot be completed as new reads.
+    pub provider_invalidation_generation: Option<i64>,
     pub expected_projection_revision: Option<i64>,
     pub source_bindings: Vec<SourceBinding>,
     pub status: CollectionStatus,
@@ -256,13 +259,33 @@ pub async fn register_source(
         return Err(ReconciliationError::RegistrationConflict);
     }
 
-    let source_id_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_sources WHERE source_id = $1)",
+    if let Some(row) = sqlx::query(
+        "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference, registration_source_set_generation, \
+                registration_projection_revision \
+         FROM cloud_coverage_sources WHERE source_id = $1",
     )
     .bind(&binding.source_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
-    .map_err(ReconciliationError::Database)?;
+    .map_err(ReconciliationError::Database)?
+    {
+        let stored = source_binding_from_row(&row)?;
+        if &stored != binding {
+            return Err(ReconciliationError::SourceBindingConflict);
+        }
+        let projection_revision: Option<i64> = row.try_get("registration_projection_revision")?;
+        let Some(projection_revision) = projection_revision else {
+            return Err(ReconciliationError::CorruptRegistration);
+        };
+        return Ok(RegistrationReceipt {
+            source_id: stored.source_id,
+            source_set_generation: row.try_get("registration_source_set_generation")?,
+            projection_revision: Some(projection_revision),
+            outcome: RegistrationOutcome::AlreadyApplied,
+        });
+    }
+
     let external_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM cloud_coverage_sources \
                         WHERE provider_namespace = $1 AND external_allocation_reference = $2)",
@@ -272,7 +295,7 @@ pub async fn register_source(
     .fetch_one(&mut **tx)
     .await
     .map_err(ReconciliationError::Database)?;
-    if source_id_exists || external_exists {
+    if external_exists {
         return Err(ReconciliationError::SourceBindingConflict);
     }
 
@@ -360,7 +383,8 @@ pub async fn begin_collection(
     validate_attempt_id(attempt_id)?;
 
     let coordinator = sqlx::query(
-        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+        "SELECT source_set_generation, collection_epoch, current_attempt_id, \
+                provider_invalidation_generation \
          FROM cloud_coverage_coordinators WHERE beneficiary_id = $1 FOR UPDATE",
     )
     .bind(beneficiary_id)
@@ -372,10 +396,12 @@ pub async fn begin_collection(
     let generation: i64 = coordinator.try_get("source_set_generation")?;
     let epoch: i64 = coordinator.try_get("collection_epoch")?;
     let current_attempt_id: Option<String> = coordinator.try_get("current_attempt_id")?;
+    let invalidation_generation: i64 = coordinator.try_get("provider_invalidation_generation")?;
 
     if let Some(existing) = sqlx::query(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
-                expected_projection_revision, source_bindings::text AS source_bindings, status, \
+                provider_invalidation_generation, expected_projection_revision, \
+                source_bindings::text AS source_bindings, status, \
                 aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
          FROM cloud_coverage_collection_attempts \
@@ -388,6 +414,11 @@ pub async fn begin_collection(
     {
         let ticket = collection_ticket_from_row(&existing)?;
         validate_stored_attempt(tx, &ticket, &existing).await?;
+        if ticket.status == CollectionStatus::Pending
+            && ticket.provider_invalidation_generation.is_none()
+        {
+            return Err(ReconciliationError::CollectionConflict);
+        }
         return Ok(ticket);
     }
 
@@ -426,13 +457,14 @@ pub async fn begin_collection(
     sqlx::query(
         "INSERT INTO cloud_coverage_collection_attempts \
          (attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
-          expected_projection_revision, source_bindings, status) \
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'pending')",
+          provider_invalidation_generation, expected_projection_revision, source_bindings, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'pending')",
     )
     .bind(attempt_id)
     .bind(beneficiary_id)
     .bind(next_epoch)
     .bind(generation)
+    .bind(invalidation_generation)
     .bind(expected_projection_revision)
     .bind(source_bindings_json)
     .execute(&mut **tx)
@@ -452,6 +484,7 @@ pub async fn begin_collection(
         attempt_id: attempt_id.into(),
         collection_epoch: next_epoch,
         source_set_generation: generation,
+        provider_invalidation_generation: Some(invalidation_generation),
         expected_projection_revision,
         source_bindings,
         status: CollectionStatus::Pending,
@@ -473,7 +506,8 @@ pub async fn finish_collection(
     validate_attempt_id(&ticket.attempt_id)?;
 
     let coordinator = sqlx::query(
-        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+        "SELECT source_set_generation, collection_epoch, current_attempt_id, \
+                provider_invalidation_generation \
          FROM cloud_coverage_coordinators WHERE beneficiary_id = $1 FOR UPDATE",
     )
     .bind(&ticket.beneficiary_id)
@@ -482,11 +516,14 @@ pub async fn finish_collection(
     .ok_or(ReconciliationError::NoSources)?;
     let current_generation: i64 = coordinator.try_get("source_set_generation")?;
     let current_epoch: i64 = coordinator.try_get("collection_epoch")?;
+    let current_invalidation_generation: i64 =
+        coordinator.try_get("provider_invalidation_generation")?;
     let current_attempt: Option<String> = coordinator.try_get("current_attempt_id")?;
 
     let attempt = sqlx::query(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
-                expected_projection_revision, source_bindings::text AS source_bindings, status, \
+                provider_invalidation_generation, expected_projection_revision, \
+                source_bindings::text AS source_bindings, status, \
                 aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
          FROM cloud_coverage_collection_attempts \
@@ -503,6 +540,7 @@ pub async fn finish_collection(
         || stored_ticket.collection_epoch != ticket.collection_epoch
         || stored_ticket.source_set_generation != ticket.source_set_generation
         || stored_ticket.expected_projection_revision != ticket.expected_projection_revision
+        || stored_ticket.provider_invalidation_generation != ticket.provider_invalidation_generation
         || stored_ticket.source_bindings != ticket.source_bindings
     {
         return Err(ReconciliationError::CollectionConflict);
@@ -545,6 +583,7 @@ pub async fn finish_collection(
     if current_attempt.as_deref() != Some(ticket.attempt_id.as_str())
         || current_generation != ticket.source_set_generation
         || current_epoch != ticket.collection_epoch
+        || ticket.provider_invalidation_generation != Some(current_invalidation_generation)
     {
         return Err(ReconciliationError::CollectionConflict);
     }
@@ -764,6 +803,7 @@ fn collection_ticket_from_row(
         attempt_id: row.try_get("attempt_id")?,
         collection_epoch: row.try_get("collection_epoch")?,
         source_set_generation: row.try_get("source_set_generation")?,
+        provider_invalidation_generation: row.try_get("provider_invalidation_generation")?,
         expected_projection_revision: row.try_get("expected_projection_revision")?,
         source_bindings,
         status,
@@ -1151,50 +1191,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completion_receipts_require_all_fields_for_completed_attempts() {
-        let valid = stored_completion_receipt(
+    fn completion_receipt_matrix_covers_every_nullable_combination() {
+        for status in [
+            CollectionStatus::Pending,
+            CollectionStatus::Superseded,
             CollectionStatus::Completed,
-            Some("aggregate-evidence".into()),
-            Some("{}".into()),
-            Some(1),
-        )
-        .expect("accept complete receipt")
-        .expect("return complete receipt");
-        assert_eq!(valid, ("aggregate-evidence".into(), "{}".into(), 1));
-
-        for (evidence, result, revision) in [
-            (None, Some("{}".into()), Some(1)),
-            (Some("aggregate-evidence".into()), None, Some(1)),
-            (Some("aggregate-evidence".into()), Some("{}".into()), None),
         ] {
-            assert!(matches!(
-                stored_completion_receipt(CollectionStatus::Completed, evidence, result, revision),
-                Err(ReconciliationError::CorruptAttempt(
-                    CorruptAttemptReason::CompletionReceipt
-                ))
-            ));
+            for present in 0..8u8 {
+                let evidence = (present & 0b100 != 0).then(|| "aggregate-evidence".to_string());
+                let result = (present & 0b010 != 0).then(|| "{}".to_string());
+                let revision = (present & 0b001 != 0).then_some(1);
+                let receipt = stored_completion_receipt(status, evidence, result, revision);
+                let complete = status == CollectionStatus::Completed;
+                if complete && present == 0b111 {
+                    assert_eq!(
+                        receipt
+                            .expect("accept complete receipt")
+                            .expect("return complete receipt"),
+                        ("aggregate-evidence".to_string(), "{}".to_string(), 1)
+                    );
+                } else if !complete && present == 0 {
+                    assert_eq!(receipt.expect("accept empty incomplete receipt"), None);
+                } else {
+                    assert!(
+                        matches!(
+                            receipt,
+                            Err(ReconciliationError::CorruptAttempt(
+                                CorruptAttemptReason::CompletionReceipt
+                            ))
+                        ),
+                        "status {status:?} with fields {present:03b} must be a receipt corruption"
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn pending_and_superseded_attempts_reject_completion_receipts() {
-        for status in [CollectionStatus::Pending, CollectionStatus::Superseded] {
-            assert_eq!(
-                stored_completion_receipt(status, None, None, None)
-                    .expect("accept empty incomplete receipt"),
-                None
-            );
-            assert!(matches!(
-                stored_completion_receipt(
-                    status,
-                    Some("aggregate-evidence".into()),
-                    Some("{}".into()),
-                    Some(1),
+    fn stored_bindings_reject_unparseable_and_non_array_json() {
+        for raw in [
+            "not json{{",
+            "{}",
+            "\"bindings\"",
+            "42",
+            "null",
+            "true",
+            "[]",
+            "[42]",
+        ] {
+            assert!(
+                matches!(
+                    parse_stored_bindings(raw, "beneficiary"),
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
                 ),
-                Err(ReconciliationError::CorruptAttempt(
-                    CorruptAttemptReason::CompletionReceipt
-                ))
-            ));
+                "stored bindings {raw} must be a shape corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_result_rejects_blank_evidence_and_non_object_json() {
+        let ticket = CollectionTicket {
+            beneficiary_id: "beneficiary".into(),
+            attempt_id: "attempt".into(),
+            collection_epoch: 1,
+            source_set_generation: 1,
+            provider_invalidation_generation: None,
+            expected_projection_revision: None,
+            source_bindings: Vec::new(),
+            status: CollectionStatus::Completed,
+            completed_revision: Some(1),
+        };
+        assert!(matches!(
+            validate_stored_result(&ticket, "  ", "{}"),
+            Err(ReconciliationError::CorruptAttempt(
+                CorruptAttemptReason::ResultEvidence
+            ))
+        ));
+        for raw in ["[]", "\"result\"", "42", "null", "not json{{"] {
+            assert!(
+                matches!(
+                    validate_stored_result(&ticket, "aggregate-evidence", raw),
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ),
+                "stored result {raw} must be a shape corruption"
+            );
         }
     }
 }

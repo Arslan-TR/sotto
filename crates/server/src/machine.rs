@@ -22,6 +22,7 @@ use crate::auth::session;
 use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
+use crate::person_eligibility::{self, EligibilityState};
 use crate::state::AppState;
 use crate::sync::access::env_access;
 use crate::sync::{validate_id, MAX_ENC_KEY};
@@ -35,6 +36,35 @@ const TOKEN_PREFIX: &str = "smt_";
 const PUBLIC_KEY_LEN: usize = 32;
 /// Cap on a token's human label.
 const MAX_NAME: usize = 128;
+/// Lifetime of a new token, in days. Long enough to cover a quarterly release cycle and act on
+/// the expiry warning, short enough that a forgotten token dies within a quarter.
+const DEFAULT_LIFETIME_DAYS: i64 = 90;
+/// Longest lifetime a creator may choose, in days. There is no "never": a token that outlives
+/// everyone's memory of it is the problem expiry exists to solve.
+const MAX_LIFETIME_DAYS: i64 = 365;
+
+/// SQL: the token can still authenticate, meaning not revoked and not yet past its end date.
+/// Every query that means "active" splices in this one fragment (auth, the grant re-read, the
+/// listing, rotation coverage), so they cannot drift apart: a listing that kept an expired token
+/// would make rotation re-seal a dead grant, and one that dropped a live token would strand its
+/// CI on the old key. Columns are unqualified, so a query using it must not join another table
+/// that has a `revoked_at` or `expires_at` column.
+macro_rules! active_token_sql {
+    () => {
+        "revoked_at IS NULL AND expires_at > now()"
+    };
+}
+pub(crate) use active_token_sql;
+
+/// SQL: a token's end date as `(expires_at, expires_in_days)`. The timestamp is UTC in the audit
+/// log's format; the days left are whole days rounded down, computed here so that no client does
+/// date arithmetic against its own clock (a CI runner's is the least trustworthy one involved).
+macro_rules! expiry_columns_sql {
+    () => {
+        "to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+         floor(extract(epoch FROM expires_at - now()) / 86400)::bigint"
+    };
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -60,6 +90,10 @@ struct CreateToken {
     public_key: String,
     /// The env vault key sealed to that public key (base64) - the machine's grant.
     enc_vault_key: String,
+    /// Lifetime in days, 1 to `MAX_LIFETIME_DAYS`; `DEFAULT_LIFETIME_DAYS` when omitted, so older
+    /// clients that never send it still get tokens that expire.
+    #[serde(default)]
+    expires_in_days: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -67,6 +101,8 @@ struct CreatedToken {
     token_id: String,
     /// The raw API token, shown exactly once. Only its hash is stored.
     token: String,
+    /// When the token stops authenticating (UTC, RFC 3339).
+    expires_at: String,
 }
 
 #[derive(Serialize)]
@@ -77,7 +113,29 @@ struct TokenView {
     public_key: String,
     /// The user who created the token, if still known (`NULL` once their account is gone).
     created_by: Option<String>,
+    /// The human account whose hosted eligibility is accountable for this token, when known.
+    beneficiary_id: Option<String>,
+    /// `verified` for newly created or safely backfilled tokens; `ambiguous` for legacy rows that
+    /// have no surviving provenance and must be recreated before hosted enforcement.
+    beneficiary_status: String,
+    /// When the token stops authenticating (UTC, RFC 3339).
+    expires_at: String,
+    /// Whole days until then, rounded down.
+    expires_in_days: i64,
 }
+
+/// Listing row: `(id, name, public_key, created_by, beneficiary_id, beneficiary_status,
+/// expires_at, expires_in_days)`.
+type TokenRow = (
+    String,
+    String,
+    Vec<u8>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+);
 
 #[derive(Deserialize, Default)]
 struct TokenListParams {
@@ -94,6 +152,9 @@ async fn create_token(
     Path(env_id): Path<String>,
     Json(body): Json<CreateToken>,
 ) -> Result<(StatusCode, Json<CreatedToken>)> {
+    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
+    access.require_manage_structure("must be an admin or owner to create a machine token")?;
+    enforce_creator_eligibility(&state, &user.user_id).await?;
     if body.name.is_empty() || body.name.len() > MAX_NAME {
         return Err(Error::BadRequest(format!(
             "name must be between 1 and {MAX_NAME} characters"
@@ -106,9 +167,13 @@ async fn create_token(
         )));
     }
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
+    let lifetime_days = body.expires_in_days.unwrap_or(DEFAULT_LIFETIME_DAYS);
+    if !(1..=MAX_LIFETIME_DAYS).contains(&lifetime_days) {
+        return Err(Error::BadRequest(format!(
+            "expires_in_days must be between 1 and {MAX_LIFETIME_DAYS}"
+        )));
+    }
 
-    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    access.require_manage_structure("must be an admin or owner to create a machine token")?;
     let audit_org = access.org_id().map(str::to_string);
 
     let token_id = uuid::Uuid::new_v4().to_string();
@@ -121,9 +186,14 @@ async fn create_token(
             "must be an admin or owner to create a machine token",
         )
         .await?;
-    sqlx::query(
-        "INSERT INTO machine_tokens (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    // The end date comes from the database clock, the same one every expiry check reads.
+    let expires_at: String = sqlx::query_scalar(
+        "INSERT INTO machine_tokens \
+         (id, env_id, name, token_hash, public_key, enc_vault_key, created_by, \
+          beneficiary_id, beneficiary_status, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'verified', \
+                 now() + make_interval(days => $8::int)) \
+         RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
     )
     .bind(&token_id)
     .bind(&env_id)
@@ -132,7 +202,8 @@ async fn create_token(
     .bind(&public_key)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
-    .execute(&mut *tx)
+    .bind(lifetime_days)
+    .fetch_one(&mut *tx)
     .await?;
     // Personal environments have no org, hence no audit log to write to.
     if let Some(org) = &audit_org {
@@ -151,12 +222,19 @@ async fn create_token(
     }
     tx.commit().await?;
 
-    Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedToken {
+            token_id,
+            token,
+            expires_at,
+        }),
+    ))
 }
 
-/// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+). A
-/// rotation uses these public keys to re-seal every machine's grant. `?created_by=` narrows the
-/// listing to one creator's tokens.
+/// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+), so
+/// revoked and expired ones are left out. A rotation uses these public keys to re-seal every
+/// machine's grant. `?created_by=` narrows the listing to one creator's tokens.
 async fn list_tokens(
     State(state): State<AppState>,
     user: AuthUser,
@@ -169,35 +247,40 @@ async fn list_tokens(
             "must be an admin or owner to list machine tokens".into(),
         ));
     }
-    let rows: Vec<(String, String, Vec<u8>, Option<String>)> = match &params.created_by {
-        Some(creator) => {
-            sqlx::query_as(
-                "SELECT id, name, public_key, created_by FROM machine_tokens \
-                 WHERE env_id = $1 AND revoked_at IS NULL AND created_by = $2 ORDER BY id",
-            )
-            .bind(&env_id)
-            .bind(creator)
-            .fetch_all(&state.pool)
-            .await?
-        }
-        None => {
-            sqlx::query_as(
-                "SELECT id, name, public_key, created_by FROM machine_tokens \
-                 WHERE env_id = $1 AND revoked_at IS NULL ORDER BY id",
-            )
-            .bind(&env_id)
-            .fetch_all(&state.pool)
-            .await?
-        }
-    };
+    let rows: Vec<TokenRow> = sqlx::query_as(concat!(
+        "SELECT id, name, public_key, created_by, beneficiary_id, beneficiary_status, ",
+        expiry_columns_sql!(),
+        " FROM machine_tokens WHERE env_id = $1 AND ",
+        active_token_sql!(),
+        " AND ($2::text IS NULL OR created_by = $2) ORDER BY id",
+    ))
+    .bind(&env_id)
+    .bind(&params.created_by)
+    .fetch_all(&state.pool)
+    .await?;
     Ok(Json(
         rows.into_iter()
-            .map(|(token_id, name, public_key, created_by)| TokenView {
-                token_id,
-                name,
-                public_key: encoding::encode(&public_key),
-                created_by,
-            })
+            .map(
+                |(
+                    token_id,
+                    name,
+                    public_key,
+                    created_by,
+                    beneficiary_id,
+                    beneficiary_status,
+                    expires_at,
+                    expires_in_days,
+                )| TokenView {
+                    token_id,
+                    name,
+                    public_key: encoding::encode(&public_key),
+                    created_by,
+                    beneficiary_id,
+                    beneficiary_status,
+                    expires_at,
+                    expires_in_days,
+                },
+            )
             .collect(),
     ))
 }
@@ -220,6 +303,8 @@ async fn revoke_token(
             "must be an admin or owner to revoke a machine token",
         )
         .await?;
+    // Not the active predicate: an expired token can still be tombstoned, so an admin who can see
+    // it was real is not told it does not exist.
     let revoked = sqlx::query(
         "UPDATE machine_tokens SET revoked_at = now() \
          WHERE id = $1 AND env_id = $2 AND revoked_at IS NULL",
@@ -255,6 +340,8 @@ async fn revoke_token(
 struct MachineAuth {
     token_id: String,
     env_id: String,
+    beneficiary_id: Option<String>,
+    beneficiary_status: String,
 }
 
 impl FromRequestParts<AppState> for MachineAuth {
@@ -265,19 +352,27 @@ impl FromRequestParts<AppState> for MachineAuth {
         if !token.starts_with(TOKEN_PREFIX) {
             return Err(Error::Unauthorized);
         }
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT mt.id, mt.env_id FROM machine_tokens mt \
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(concat!(
+            "SELECT mt.id, mt.env_id, mt.beneficiary_id, mt.beneficiary_status \
+             FROM machine_tokens mt \
              JOIN environments e ON e.id = mt.env_id \
              JOIN projects p ON p.id = e.project_id \
              LEFT JOIN organizations o ON o.id = p.org_id \
-             WHERE mt.token_hash = $1 AND mt.revoked_at IS NULL \
-               AND (o.id IS NULL OR o.lifecycle_state <> 'deleted')",
-        )
+             WHERE mt.token_hash = $1 AND ",
+            active_token_sql!(),
+            " AND (o.id IS NULL OR o.lifecycle_state <> 'deleted')",
+        ))
         .bind(session::hash_token(&token))
         .fetch_optional(&state.pool)
         .await?;
-        let (token_id, env_id) = row.ok_or(Error::Unauthorized)?;
-        Ok(MachineAuth { token_id, env_id })
+        let (token_id, env_id, beneficiary_id, beneficiary_status) =
+            row.ok_or(Error::Unauthorized)?;
+        Ok(MachineAuth {
+            token_id,
+            env_id,
+            beneficiary_id,
+            beneficiary_status,
+        })
     }
 }
 
@@ -286,6 +381,12 @@ struct MachineGrant {
     env_id: String,
     /// The vault key sealed to this machine's public key (base64).
     enc_vault_key: String,
+    /// The token's human label, so a warning in a CI log names which token to replace.
+    name: String,
+    /// When the token stops authenticating (UTC, RFC 3339).
+    expires_at: String,
+    /// Whole days until then, rounded down.
+    expires_in_days: i64,
 }
 
 /// `GET /machine/grant` - the calling machine's environment id + its own current vault-key grant
@@ -294,18 +395,26 @@ async fn machine_grant(
     State(state): State<AppState>,
     machine: MachineAuth,
 ) -> Result<Json<MachineGrant>> {
-    // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth)
-    // or was revoked, answer 401 rather than letting `RowNotFound` bubble up as a 500.
-    let enc_vault_key: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT enc_vault_key FROM machine_tokens WHERE id = $1 AND revoked_at IS NULL",
-    )
+    enforce_machine_eligibility(&state, &machine).await?;
+    // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth),
+    // was revoked, or expired in between, answer 401 rather than letting `RowNotFound` bubble up
+    // as a 500.
+    let row: Option<(Vec<u8>, String, String, i64)> = sqlx::query_as(concat!(
+        "SELECT enc_vault_key, name, ",
+        expiry_columns_sql!(),
+        " FROM machine_tokens WHERE id = $1 AND ",
+        active_token_sql!(),
+    ))
     .bind(&machine.token_id)
     .fetch_optional(&state.pool)
     .await?;
-    let enc_vault_key = enc_vault_key.ok_or(Error::Unauthorized)?;
+    let (enc_vault_key, name, expires_at, expires_in_days) = row.ok_or(Error::Unauthorized)?;
     Ok(Json(MachineGrant {
         env_id: machine.env_id,
         enc_vault_key: encoding::encode(&enc_vault_key),
+        name,
+        expires_at,
+        expires_in_days,
     }))
 }
 
@@ -334,6 +443,7 @@ async fn machine_secrets(
     State(state): State<AppState>,
     machine: MachineAuth,
 ) -> Result<Json<MachineSnapshot>> {
+    enforce_machine_eligibility(&state, &machine).await?;
     let revision: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1")
             .bind(&machine.env_id)
@@ -371,4 +481,135 @@ fn generate_token() -> String {
     let mut raw = [0u8; TOKEN_BYTES];
     dryoc::rng::copy_randombytes(&mut raw);
     format!("{TOKEN_PREFIX}{}", session::to_hex(&raw))
+}
+
+/// The machine-accountability decision is deliberately independent from the token's cryptographic
+/// validity. A valid grant still stops being usable when its named human loses hosted eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineEligibilityDecision {
+    Allowed,
+    Ineligible,
+    Unavailable,
+}
+
+pub fn machine_eligibility_decision(
+    beneficiary_id: Option<&str>,
+    beneficiary_status: &str,
+    state: EligibilityState,
+) -> MachineEligibilityDecision {
+    if beneficiary_status != "verified" || beneficiary_id.is_none() {
+        return MachineEligibilityDecision::Unavailable;
+    }
+    match state {
+        EligibilityState::Paid | EligibilityState::RenewalRecovery => {
+            MachineEligibilityDecision::Allowed
+        }
+        EligibilityState::Free | EligibilityState::ExportOnly | EligibilityState::Expired => {
+            MachineEligibilityDecision::Ineligible
+        }
+        EligibilityState::Unavailable | EligibilityState::PendingInitialPayment => {
+            MachineEligibilityDecision::Unavailable
+        }
+    }
+}
+
+async fn enforce_creator_eligibility(state: &AppState, user_id: &str) -> Result<()> {
+    if state.deployment_mode == crate::config::DeploymentMode::SelfHosted
+        || !state.machine_eligibility_enforcement_enabled
+    {
+        return Ok(());
+    }
+    let view = person_eligibility::load_view(state, user_id)
+        .await
+        .map_err(|_| Error::CloudEligibility("machine eligibility is unavailable".into()))?;
+    if matches!(
+        view.state,
+        EligibilityState::Paid | EligibilityState::RenewalRecovery
+    ) {
+        Ok(())
+    } else {
+        Err(Error::CloudEligibility(
+            "machine access requires an eligible Cloud account".into(),
+        ))
+    }
+}
+
+async fn enforce_machine_eligibility(state: &AppState, machine: &MachineAuth) -> Result<()> {
+    if state.deployment_mode == crate::config::DeploymentMode::SelfHosted
+        || !state.machine_eligibility_enforcement_enabled
+    {
+        return Ok(());
+    }
+    let Some(beneficiary_id) = machine.beneficiary_id.as_deref() else {
+        return Err(Error::CloudEligibility(
+            "machine token has no verified accountable beneficiary".into(),
+        ));
+    };
+    let view = person_eligibility::load_view(state, beneficiary_id)
+        .await
+        .map_err(|_| Error::CloudEligibility("machine eligibility is unavailable".into()))?;
+    match machine_eligibility_decision(
+        Some(beneficiary_id),
+        &machine.beneficiary_status,
+        view.state,
+    ) {
+        MachineEligibilityDecision::Allowed => Ok(()),
+        MachineEligibilityDecision::Ineligible => Err(Error::CloudEligibility(
+            "machine access requires an eligible Cloud account".into(),
+        )),
+        MachineEligibilityDecision::Unavailable => Err(Error::CloudEligibility(
+            "machine eligibility is unavailable".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{machine_eligibility_decision, MachineEligibilityDecision};
+    use crate::person_eligibility::EligibilityState;
+
+    #[test]
+    fn machine_access_requires_verified_beneficiary_and_eligible_state() {
+        assert_eq!(
+            machine_eligibility_decision(Some("user-1"), "verified", EligibilityState::Paid),
+            MachineEligibilityDecision::Allowed
+        );
+        assert_eq!(
+            machine_eligibility_decision(
+                Some("user-1"),
+                "verified",
+                EligibilityState::RenewalRecovery
+            ),
+            MachineEligibilityDecision::Allowed
+        );
+        for state in [
+            EligibilityState::Free,
+            EligibilityState::ExportOnly,
+            EligibilityState::Expired,
+        ] {
+            assert_eq!(
+                machine_eligibility_decision(Some("user-1"), "verified", state),
+                MachineEligibilityDecision::Ineligible
+            );
+        }
+    }
+
+    #[test]
+    fn machine_access_fails_closed_for_ambiguous_or_unavailable_evidence() {
+        for (beneficiary_id, status) in [(None, "verified"), (Some("user-1"), "ambiguous")] {
+            assert_eq!(
+                machine_eligibility_decision(beneficiary_id, status, EligibilityState::Paid),
+                MachineEligibilityDecision::Unavailable
+            );
+        }
+        for state in [
+            EligibilityState::Unavailable,
+            EligibilityState::PendingInitialPayment,
+        ] {
+            assert_eq!(
+                machine_eligibility_decision(Some("user-1"), "verified", state),
+                MachineEligibilityDecision::Unavailable
+            );
+        }
+    }
 }

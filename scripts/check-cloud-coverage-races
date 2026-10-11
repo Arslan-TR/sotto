@@ -7,13 +7,21 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import threading
+import time
 from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT = 120
+# Bounded wait between SIGTERM and SIGKILL when a command exceeds its timeout.
+KILL_GRACE_SECONDS = 5.0
+KILL_POLL_SECONDS = 0.025
+# Serialises printed blocks so parallel commands never interleave mid-diagnostic.
+PRINT_LOCK = threading.Lock()
 SCENARIOS = (
     ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_before_coordinator_lock"),
     ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_after_revision_anchor"),
@@ -23,6 +31,9 @@ SCENARIOS = (
     ("cloud_coverage_reconciliation", "superseded_finish_waits_for_a_completing_replacement"),
     ("cloud_coverage_store", "competing_corrections_serialize_on_the_head_and_reject_the_loser"),
     ("cloud_coverage_store", "simultaneous_first_publications_have_one_winner"),
+    ("cloud_coverage_store", "scenario_panic_cleans_owned_publication_fixture"),
+    ("cloud_coverage_store", "setup_failure_after_insert_cleans_the_registered_fixture"),
+    ("cloud_coverage_store", "readiness_timeout_cancels_a_parked_publication_before_cleanup"),
 )
 
 
@@ -46,36 +57,245 @@ def validate_database(env: dict[str, str]) -> None:
         )
 
 
-def run(args: list[str], env: dict[str, str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
-    print("+", " ".join(args), flush=True)
+def emit(value: str | bytes | None, stream: object) -> None:
+    if value:
+        if isinstance(value, bytes):
+            value = value.decode(errors="replace")
+        print(value, end="", file=stream)
 
-    def emit(value: str | bytes | None, stream: object) -> None:
-        if value:
-            if isinstance(value, bytes):
-                value = value.decode(errors="replace")
-            print(value, end="", file=stream)
 
-    try:
-        result = subprocess.run(
+def spawn_owned(args: list[str], env: dict[str, str]) -> subprocess.Popen[bytes]:
+    """Start a command in its own process group so timeouts can own the whole tree."""
+    if os.name == "nt":
+        return subprocess.Popen(
             args,
             cwd=ROOT,
             env=env,
-            text=True,
-            check=False,
-            capture_output=True,
-            timeout=timeout_seconds,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+    return subprocess.Popen(
+        args,
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+
+def group_exited(pgid: int) -> bool:
+    """Check whether a POSIX process group has no members left.
+
+    A group whose members are all zombies reports PermissionError on some
+    platforms instead of ProcessLookupError; treat that as still present and
+    let the signal step below tolerate it.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def signal_group(pgid: int, signum: int) -> None:
+    """Signal a private process group, tolerating zombies and races.
+
+    Every member of our own session group runs as our user, so PermissionError
+    can only come from already-dead members that some platforms refuse to
+    signal; they need no further action.
+    """
+    try:
+        os.killpg(pgid, signum)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def wait_for_group_exit(proc: subprocess.Popen[bytes], pgid: int, deadline: float) -> bool:
+    while time.monotonic() < deadline:
+        # Reap the direct child while waiting so its zombie never masks group state.
+        proc.poll()
+        if group_exited(pgid):
+            return True
+        time.sleep(KILL_POLL_SECONDS)
+    proc.poll()
+    return group_exited(pgid)
+
+
+def terminate_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate a timed-out command and all descendants, then escalate to a hard kill."""
+    if os.name == "nt":
+        terminate_tree_windows(proc)
+        return
+    # The child starts its own session, so its pid is the group ID even when the
+    # leader already exited. A descendant can hold the pipes open past the leader's
+    # exit, so cleanup must never be abandoned because the leader is gone.
+    pgid = proc.pid
+    # Reap an already-exited direct child so its zombie does not mask group state.
+    proc.poll()
+    if not group_exited(pgid):
+        signal_group(pgid, signal.SIGTERM)
+    if wait_for_group_exit(proc, pgid, time.monotonic() + KILL_GRACE_SECONDS):
+        return
+    if not group_exited(pgid):
+        signal_group(pgid, signal.SIGKILL)
+    wait_for_group_exit(proc, pgid, time.monotonic() + KILL_GRACE_SECONDS)
+
+
+def terminate_tree_windows(proc: subprocess.Popen[bytes]) -> None:
+    """Best-effort whole-tree termination on Windows without extra dependencies."""
+    try:
+        subprocess.run(
+            ["taskkill", "/pid", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+class CommandFailed(RuntimeError):
+    """A command failure carrying its labelled stdout, stderr and exit state."""
+
+    def __init__(
+        self,
+        label: str,
+        args: list[str],
+        returncode: int | None,
+        timed_out: bool,
+        timeout_seconds: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        # `.args` on BaseException is a tuple-coercing descriptor, so the command
+        # list lives under `.command` instead.
+        super().__init__()
+        self.label = label
+        self.command = args
+        self.returncode = returncode
+        self.timed_out = timed_out
+        self.timeout_seconds = timeout_seconds
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __str__(self) -> str:
+        lines = [f"=== {self.label} ===", f"command: {' '.join(self.command)}"]
+        if self.timed_out:
+            lines.append(f"timed out after {self.timeout_seconds}s")
+        elif self.returncode is None:
+            lines.append("failed to start")
+        else:
+            lines.append(f"exit: {self.returncode}")
+        if self.stdout:
+            lines.extend(["--- stdout ---", self.stdout.rstrip("\n")])
+        if self.stderr:
+            lines.extend(["--- stderr ---", self.stderr.rstrip("\n")])
+        return "\n".join(lines)
+
+
+def run(
+    args: list[str],
+    env: dict[str, str],
+    timeout_seconds: int,
+    label: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one command, owning its process tree, and return captured text output."""
+    tag = label or " ".join(args)
+    with PRINT_LOCK:
+        print("+", " ".join(args), flush=True)
+    try:
+        proc = spawn_owned(args, env)
+    except OSError as error:
+        raise CommandFailed(
+            tag, args, None, False, timeout_seconds, "", str(error)
+        ) from error
+    try:
+        raw_stdout, raw_stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
-        emit(error.stdout, sys.stdout)
-        emit(error.stderr, sys.stderr)
-        raise RuntimeError(f"timed out after {timeout_seconds}s: {' '.join(args)}") from error
-    if result.returncode:
-        emit(result.stdout, sys.stdout)
-        emit(result.stderr, sys.stderr)
-        raise RuntimeError(f"command exited {result.returncode}: {' '.join(args)}")
-    emit(result.stdout, sys.stdout)
-    emit(result.stderr, sys.stderr)
-    return result
+        terminate_tree(proc)
+        raw_stdout, raw_stderr = proc.communicate()
+        stdout = (raw_stdout or b"").decode(errors="replace")
+        stderr = (raw_stderr or b"").decode(errors="replace")
+        with PRINT_LOCK:
+            print(f"=== {tag} (timed out after {timeout_seconds}s) ===", flush=True)
+            emit(stdout, sys.stdout)
+            emit(stderr, sys.stderr)
+        raise CommandFailed(
+            tag, args, None, True, timeout_seconds, stdout, stderr
+        ) from error
+    stdout = (raw_stdout or b"").decode(errors="replace")
+    stderr = (raw_stderr or b"").decode(errors="replace")
+    if proc.returncode:
+        raise CommandFailed(
+            tag, args, proc.returncode, False, timeout_seconds, stdout, stderr
+        )
+    with PRINT_LOCK:
+        emit(stdout, sys.stdout)
+        emit(stderr, sys.stderr)
+    return subprocess.CompletedProcess(args, proc.returncode or 0, stdout, stderr)
+
+
+def run_parallel(
+    commands: list[tuple[str, list[str]]],
+    env: dict[str, str],
+    timeout_seconds: int,
+) -> list[tuple[str, subprocess.CompletedProcess[str]]]:
+    """Run labelled commands concurrently, reporting every failure grouped by label."""
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = [
+            (label, executor.submit(run, args, env, timeout_seconds, label))
+            for label, args in commands
+        ]
+        results = []
+        failures = []
+        for label, future in futures:
+            try:
+                results.append((label, future.result()))
+            except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError(
+                f"parallel target failures ({len(failures)}):\n\n" + "\n\n".join(failures)
+            )
+        return results
+
+
+def assert_tests_selected(stdout: str, label: str) -> None:
+    """Fail closed when a test command reports zero executed tests.
+
+    A misspelled exact filter exits successfully with `ok. 0 passed`; accepting
+    that output would report a skipped database run as successful acceptance.
+    """
+    if "test result:" not in stdout or "test result: ok. 0 passed" in stdout:
+        raise RuntimeError(f"{label}: selected zero tests; refusing to report acceptance")
+
+
+def check_manifest(discovered: dict[str, set[str]]) -> None:
+    """Reject scenario names missing from discovery before running anything."""
+    missing = [
+        f"{target}::{name}"
+        for target, name in SCENARIOS
+        if name not in discovered.get(target, set())
+    ]
+    if missing:
+        raise RuntimeError("scenario discovery failed: " + ", ".join(missing))
 
 
 def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]:
@@ -83,6 +303,7 @@ def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]
         ["cargo", "test", "-p", "sotto-server", "--test", target, "--", "--list"],
         env,
         timeout_seconds,
+        label=f"discover:{target}",
     )
     return {
         line.split(":", 1)[0]
@@ -104,47 +325,38 @@ def main() -> int:
         validate_database(env)
         targets = {target for target, _ in SCENARIOS}
         discovered = {target: discover(target, env, parsed.timeout) for target in targets}
-        missing = [
-            f"{target}::{name}"
-            for target, name in SCENARIOS
-            if name not in discovered[target]
-        ]
-        if missing:
-            raise RuntimeError("scenario discovery failed: " + ", ".join(missing))
+        check_manifest(discovered)
 
         for target, name in SCENARIOS:
-            run(
+            label = f"{target}::{name}"
+            result = run(
                 [
                     "cargo", "test", "-p", "sotto-server", "--test", target,
                     name, "--", "--exact", "--nocapture", "--test-threads=4",
                 ],
                 env,
                 parsed.timeout,
+                label=label,
             )
+            assert_tests_selected(result.stdout, label)
         for round_number in range(1, parsed.rounds + 1):
             print(f"race repetition round {round_number}/{parsed.rounds}", flush=True)
-            commands = [
+            results = run_parallel(
                 [
-                    "cargo", "test", "-p", "sotto-server", "--test", target,
-                    "--", "--test-threads=4",
-                ]
-                for target in sorted(targets)
-            ]
-            with ThreadPoolExecutor(max_workers=len(commands)) as executor:
-                futures = [
-                    executor.submit(run, command, env, parsed.timeout)
-                    for command in commands
-                ]
-                failures = []
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
-                        failures.append(str(error))
-                if failures:
-                    raise RuntimeError(
-                        "parallel target failures:\n" + "\n".join(f"- {failure}" for failure in failures)
+                    (
+                        f"round:{round_number}:{target}",
+                        [
+                            "cargo", "test", "-p", "sotto-server", "--test", target,
+                            "--", "--test-threads=4",
+                        ],
                     )
+                    for target in sorted(targets)
+                ],
+                env,
+                parsed.timeout,
+            )
+            for label, result in results:
+                assert_tests_selected(result.stdout, label)
     except (OSError, ValueError, RuntimeError) as error:
         print(f"cloud coverage race checks failed: {error}", file=sys.stderr)
         return 1
