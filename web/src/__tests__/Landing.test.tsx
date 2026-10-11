@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Landing } from "../Landing";
@@ -21,11 +21,16 @@ async function renderLanding(fetchStub: ReturnType<typeof vi.fn>) {
   return view;
 }
 
-function expectLandingStillUsable() {
+function expectLandingStillUsable(container: HTMLElement) {
   expect(screen.getByRole("link", { name: "Star on GitHub" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Good first issues" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Contributing" })).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+  // Two install blocks now exist (curl + PowerShell); scope to the primary one.
+  const installBlock = container.querySelector(".install");
+  expect(installBlock).not.toBeNull();
+  expect(
+    within(installBlock as HTMLElement).getByRole("button", { name: "Copy" }),
+  ).toBeInTheDocument();
 }
 
 function expectNoStatsAndNoFallbackNoise(container: HTMLElement) {
@@ -58,7 +63,7 @@ describe("Landing community statistics", () => {
     expect(container.querySelector(".community-stats")).toHaveTextContent(
       "12 stars · 3 forks · 4 contributors",
     );
-    expectLandingStillUsable();
+    expectLandingStillUsable(container);
   });
 
   it("omits the statistics when the request is rejected", async () => {
@@ -68,7 +73,7 @@ describe("Landing community statistics", () => {
 
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expectNoStatsAndNoFallbackNoise(container);
-    expectLandingStillUsable();
+    expectLandingStillUsable(container);
   });
 
   it("omits the statistics on an HTTP 503", async () => {
@@ -78,7 +83,7 @@ describe("Landing community statistics", () => {
 
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expectNoStatsAndNoFallbackNoise(container);
-    expectLandingStillUsable();
+    expectLandingStillUsable(container);
   });
 
   it("omits the statistics when the response body is not valid JSON", async () => {
@@ -90,6 +95,6 @@ describe("Landing community statistics", () => {
 
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expectNoStatsAndNoFallbackNoise(container);
-    expectLandingStillUsable();
+    expectLandingStillUsable(container);
   });
 });
